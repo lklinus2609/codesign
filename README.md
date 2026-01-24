@@ -16,8 +16,7 @@ conda activate codesign
 python hybrid_codesign/run_all_tests.py
 
 # 3. Start training
-python hybrid_codesign/train_hybrid.py --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
-                                       --env_config hybrid_codesign/config/hybrid_g1_env.yaml
+python hybrid_codesign/train_hybrid.py --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml --env_config hybrid_codesign/config/hybrid_g1_env.yaml
 ```
 
 ## Installation
@@ -96,12 +95,6 @@ python hybrid_codesign/train_hybrid.py --resume output/hybrid_g1/model.pt
 ### Logging Options
 - `--logger tb` - TensorBoard (default)
 - `--logger wandb` - Weights & Biases
-
-For wandb, ensure you have it installed and logged in:
-```bash
-pip install wandb
-wandb login
-```
 
 ## Configuration
 
