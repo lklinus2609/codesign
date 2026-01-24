@@ -8,6 +8,7 @@
 env_name: "amp"
 
 # Character file (MuJoCo XML format)
+# Path relative to MimicKit/ directory (auto-resolved by train_hybrid.py)
 char_file: "data/assets/g1/g1.xml"
 
 # Camera settings
@@ -39,6 +40,7 @@ key_bodies: ["left_ankle_roll_link", "right_ankle_roll_link", "head_link", "left
 contact_bodies: ["left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
 
 # Motion reference file
+# Path relative to MimicKit/ directory (auto-resolved by train_hybrid.py)
 motion_file: "data/motions/g1/g1_walk.pkl"
 
 # ============================================================================

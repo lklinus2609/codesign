@@ -58,7 +58,7 @@ except ImportError:
 
 # Import hybrid components
 from hybrid_codesign.parametric_g1 import ParametricG1Model
-from hybrid_codesign.hybrid_agent import HybridAMPAgent
+from hybrid_codesign.hybrid_agent import HybridAMPAgent, HybridAMPAgentIntegrated
 from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
 
 
@@ -101,6 +101,11 @@ def parse_args():
     parser.add_argument("--no_cuda", action="store_true",
                         help="Disable CUDA (use CPU)")
 
+    # Logging
+    parser.add_argument("--logger", type=str, default="tb",
+                        choices=["tb", "wandb"],
+                        help="Logger type: 'tb' for TensorBoard, 'wandb' for Weights & Biases")
+
     return parser.parse_args()
 
 
@@ -113,6 +118,49 @@ def load_config(config_path):
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     return config
+
+
+def patch_env_config_paths(env_config_path):
+    """
+    Patch relative paths in env config to absolute paths.
+
+    MimicKit expects paths relative to its own directory, but we run from
+    codesign/. This function creates a temp config with absolute paths.
+
+    Returns:
+        Path to patched temporary config file
+    """
+    import tempfile
+
+    config = load_config(env_config_path)
+
+    # Paths that need to be patched
+    path_keys = ["char_file", "motion_file"]
+
+    for key in path_keys:
+        if key in config:
+            original_path = config[key]
+            # Check if already absolute
+            if os.path.isabs(original_path):
+                continue
+            # Try path as-is first (relative to cwd)
+            if os.path.exists(original_path):
+                config[key] = os.path.abspath(original_path)
+            # Try with MimicKit prefix
+            elif os.path.exists(os.path.join(CODESIGN_DIR, "MimicKit", original_path)):
+                config[key] = os.path.join(CODESIGN_DIR, "MimicKit", original_path)
+            # Try with CODESIGN_DIR prefix
+            elif os.path.exists(os.path.join(CODESIGN_DIR, original_path)):
+                config[key] = os.path.join(CODESIGN_DIR, original_path)
+            else:
+                print(f"Warning: Could not resolve path for {key}: {original_path}")
+
+    # Write patched config to temp file
+    temp_fd, temp_path = tempfile.mkstemp(suffix=".yaml", prefix="env_config_")
+    with os.fdopen(temp_fd, 'w') as f:
+        yaml.dump(config, f)
+
+    return temp_path
 
 
 def create_output_dir(out_dir):
@@ -273,27 +321,52 @@ def train_integrated(args, agent_config, env_config):
 
     # Build environment
     device = "cpu" if args.no_cuda else args.device
+
+    # Initialize MimicKit's multiprocessing utilities (required even for single GPU)
+    mp_util.init(rank=0, num_procs=1, device=device, master_port=12355)
     engine_config = load_config(args.engine_config)
 
-    env = env_builder.build_env(
-        args.env_config,
-        args.engine_config,
-        args.num_envs,
-        device,
-        args.visualize
-    )
+    # Patch env config paths for MimicKit compatibility
+    patched_env_config = patch_env_config_paths(args.env_config)
 
-    # Build hybrid agent
-    agent = HybridAMPAgent(agent_config, env, device)
+    try:
+        env = env_builder.build_env(
+            patched_env_config,
+            args.engine_config,
+            args.num_envs,
+            device,
+            args.visualize
+        )
+    finally:
+        # Clean up temp file
+        if os.path.exists(patched_env_config):
+            os.remove(patched_env_config)
 
-    # Create and attach differentiable model
-    char_file = env_config.get("char_file", "MimicKit/data/assets/g1/g1.xml")
-    char_path = os.path.join(CODESIGN_DIR, char_file)
+    # Build hybrid agent (integrated with MimicKit's AMPAgent)
+    agent = HybridAMPAgentIntegrated(agent_config, env, device)
+
+    # Set up differentiable model for outer loop
+    char_file = env_config.get("char_file", "data/assets/g1/g1.xml")
+    # Try multiple path resolutions
+    char_path = None
+    for prefix in ["", "MimicKit/", os.path.join(CODESIGN_DIR, "MimicKit") + "/"]:
+        candidate = os.path.join(CODESIGN_DIR, prefix, char_file) if prefix else os.path.join(CODESIGN_DIR, char_file)
+        candidate = candidate.replace("//", "/")
+        if os.path.exists(candidate):
+            char_path = candidate
+            break
+
+    if char_path is None:
+        # Fallback to MimicKit path
+        char_path = os.path.join(CODESIGN_DIR, "MimicKit", char_file)
 
     if os.path.exists(char_path):
-        diff_model = create_newton_model_for_diff(char_path, device)
-        if diff_model is not None:
-            agent.attach_newton_model(diff_model)
+        agent.setup_diff_model(char_path, device)
+        # Set inner model reference for sync
+        if hasattr(env, '_engine') and hasattr(env._engine, '_sim_model'):
+            agent.set_inner_model_reference(env._engine._sim_model)
+    else:
+        print(f"Warning: Could not find char file for diff model: {char_path}")
 
     # Create output directory
     create_output_dir(args.out_dir)
@@ -303,40 +376,14 @@ def train_integrated(args, agent_config, env_config):
     if args.resume:
         agent.load(args.resume)
 
-    # Training loop (similar to MimicKit's train function)
-    print("\nStarting integrated training...")
-
-    start_time = time.time()
-    sample_count = 0
-    iter_count = 0
-
-    while sample_count < args.max_samples:
-        # Run one training iteration
-        info = agent.train_iter()
-
-        # Update sample count
-        sample_count += agent_config.get("steps_per_iter", 32) * args.num_envs
-        iter_count += 1
-
-        # Logging
-        if iter_count % agent_config.get("iters_per_output", 100) == 0:
-            elapsed = time.time() - start_time
-            theta = info.get("design_param_theta", 0.0)
-            theta_deg = info.get("design_param_degrees", 0.0)
-
-            print(f"Iter {iter_count:6d} | "
-                  f"Samples: {sample_count:10d} | "
-                  f"Time: {elapsed:8.1f}s | "
-                  f"Theta: {theta:7.4f} rad ({theta_deg:6.2f} deg)")
-
-        # Save checkpoint
-        if iter_count > 0 and iter_count % args.save_interval == 0:
-            checkpoint_path = os.path.join(args.out_dir, f"model_{iter_count:08d}.pt")
-            agent.save(checkpoint_path)
-
-    # Save final model
-    final_path = os.path.join(args.out_dir, "model_final.pt")
-    agent.save(final_path)
+    # Use MimicKit's training infrastructure
+    print(f"\nStarting integrated training with MimicKit (logger: {args.logger})...")
+    agent.train_model(
+        max_samples=args.max_samples,
+        out_dir=args.out_dir,
+        save_int_models=True,
+        logger_type=args.logger
+    )
 
     print("\nIntegrated training complete!")
 
