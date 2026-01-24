@@ -1,0 +1,88 @@
+# Hybrid Co-Design Environment Configuration
+# Based on amp_g1_env.yaml with support for differentiable physics
+#
+# This environment uses Newton physics engine for both:
+# 1. Inner loop: Standard simulation for AMP training
+# 2. Outer loop: Differentiable simulation for gradient computation
+
+env_name: "amp"
+
+# Character file (MuJoCo XML format)
+char_file: "data/assets/g1/g1.xml"
+
+# Camera settings
+camera_mode: "track"
+
+# Episode configuration
+episode_length: 10.0  # seconds
+global_obs: True
+root_height_obs: True
+pose_termination: False
+enable_phase_obs: False
+enable_tar_obs: False
+num_disc_obs_steps: 10
+rand_reset: True
+zero_center_action: True
+
+# Initial pose (joint angles in radians)
+# Format: [root_pos(3), root_rot(4), joint_angles(28)]
+ref_char_offset: [2.0, 0.0, 0.0]  # meters
+init_pose: [0, 0, 0.8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.57, 0, 0, 0, 0, 0, 0, 1.57, 0, 0, 0]
+
+# Termination conditions
+enable_early_termination: True
+
+# Key bodies for observation/reward computation
+key_bodies: ["left_ankle_roll_link", "right_ankle_roll_link", "head_link", "left_wrist_yaw_link", "right_wrist_yaw_link"]
+
+# Contact bodies for ground contact detection
+contact_bodies: ["left_knee_link", "left_ankle_pitch_link", "left_ankle_roll_link", "right_knee_link", "right_ankle_pitch_link", "right_ankle_roll_link"]
+
+# Motion reference file
+motion_file: "data/motions/g1/g1_walk.pkl"
+
+# ============================================================================
+# Reward Weights
+# ============================================================================
+
+reward_pose_w: 0.5
+reward_vel_w: 0.1
+reward_root_pose_w: 0.15
+reward_root_vel_w: 0.1
+reward_key_pos_w: 0.15
+
+reward_pose_scale: 0.25
+reward_vel_scale: 0.01
+reward_root_pose_scale: 5.0
+reward_root_vel_scale: 1.0
+reward_key_pos_scale: 10.0
+
+# ============================================================================
+# Differentiable Physics Configuration (for outer loop)
+# ============================================================================
+
+# Enable differentiable physics support
+# When true, the Newton model is finalized with requires_grad=True
+enable_diff_physics: true
+
+# Solver for differentiable rollout
+# Options: "semi_implicit" (recommended for BPTT), "mujoco"
+diff_solver: "semi_implicit"
+
+# Simulation frequency for differentiable rollout
+diff_sim_freq: 60  # Hz
+diff_control_freq: 60  # Hz
+
+# ============================================================================
+# Design Parameter Joints
+# ============================================================================
+
+# Joints to parameterize for morphology optimization
+# These joints will have their transforms modified during outer loop
+design_joints:
+  - "left_hip_roll_joint"
+  - "right_hip_roll_joint"
+
+# Type of parameterization
+# "x_rotation": Parameterize rotation about X-axis
+design_param_type: "x_rotation"
