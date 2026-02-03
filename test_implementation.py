@@ -44,7 +44,7 @@ def test_parametric_g1():
     print("Testing ParametricG1Model")
     print("="*50)
 
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.parametric_g1 import ParametricG1Model
 
     # Test 1: Quaternion identity
     q_id = ParametricG1Model.angle_to_x_rotation_quat(0.0)
@@ -124,7 +124,7 @@ def test_hybrid_agent():
     print("Testing HybridAMPAgent")
     print("="*50)
 
-    from hybrid_codesign.hybrid_agent import HybridAMPAgent
+    from codesign.hybrid_agent import HybridAMPAgent
 
     # Test configuration
     config = {
@@ -217,7 +217,7 @@ def test_newton_integration():
         print("Warp/Newton not available, skipping integration tests")
         return
 
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.parametric_g1 import ParametricG1Model
 
     # Try to create a simple differentiable model
     try:
@@ -311,7 +311,7 @@ def test_g1_model_loading():
         print(f"G1 model not found at {g1_path}, skipping test")
         return
 
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.parametric_g1 import ParametricG1Model
 
     try:
         # Create builder and load G1

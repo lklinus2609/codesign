@@ -34,8 +34,8 @@ def test_standalone_agent_checkpoint():
     print("Test 1: Standalone Agent Checkpoint")
     print("="*60)
 
-    from hybrid_codesign.hybrid_agent import HybridAMPAgent
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.hybrid_agent import HybridAMPAgent
+    from codesign.parametric_g1 import ParametricG1Model
 
     # Create config
     config = {
@@ -111,7 +111,7 @@ def test_parametric_model_checkpoint():
     print("Test 2: ParametricG1Model Checkpoint")
     print("="*60)
 
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.parametric_g1 import ParametricG1Model
 
     # Create model with specific values
     model = ParametricG1Model(
@@ -173,7 +173,7 @@ def test_checkpoint_with_diff_model():
         print(f"  [SKIP] G1 model not found: {g1_path}")
         return True
 
-    from hybrid_codesign.hybrid_agent import HybridAMPAgent, create_diff_model_from_mjcf
+    from codesign.hybrid_agent import HybridAMPAgent, create_diff_model_from_mjcf
 
     # Create agent
     config = {
@@ -249,7 +249,7 @@ def test_training_resumption():
         print(f"  [SKIP] G1 model not found: {g1_path}")
         return True
 
-    from hybrid_codesign.hybrid_agent import HybridAMPAgent
+    from codesign.hybrid_agent import HybridAMPAgent
 
     # Create agent with low warmup for testing
     config = {

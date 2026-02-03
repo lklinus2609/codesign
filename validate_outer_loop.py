@@ -33,9 +33,9 @@ sys.path.insert(0, CODESIGN_DIR)
 import warp as wp
 import newton
 
-from hybrid_codesign.parametric_g1 import ParametricG1Model
-from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
-from hybrid_codesign.hybrid_agent import create_diff_model_from_mjcf, HybridAMPAgent
+from codesign.parametric_g1 import ParametricG1Model
+from codesign.diff_rollout import SimplifiedDiffRollout
+from codesign.hybrid_agent import create_diff_model_from_mjcf, HybridAMPAgent
 
 
 def validate_diff_model_creation():

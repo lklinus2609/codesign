@@ -57,9 +57,9 @@ except ImportError:
     MIMICKIT_AVAILABLE = False
 
 # Import hybrid components
-from hybrid_codesign.parametric_g1 import ParametricG1Model
-from hybrid_codesign.hybrid_agent import HybridAMPAgent, HybridAMPAgentIntegrated
-from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
+from codesign.parametric_g1 import ParametricG1Model
+from codesign.hybrid_agent import HybridAMPAgent, HybridAMPAgentIntegrated
+from codesign.diff_rollout import SimplifiedDiffRollout
 
 
 def parse_args():
@@ -68,10 +68,10 @@ def parse_args():
 
     # Environment and agent configuration
     parser.add_argument("--agent_config", type=str,
-                        default="hybrid_codesign/config/hybrid_g1_agent.yaml",
+                        default="codesign/config/hybrid_g1_agent.yaml",
                         help="Path to agent configuration file")
     parser.add_argument("--env_config", type=str,
-                        default="hybrid_codesign/config/hybrid_g1_env.yaml",
+                        default="codesign/config/hybrid_g1_env.yaml",
                         help="Path to environment configuration file")
     parser.add_argument("--engine_config", type=str,
                         default="MimicKit/data/engines/newton_engine.yaml",

@@ -879,7 +879,7 @@ if MIMICKIT_AVAILABLE:
 
             if video_interval > 0:
                 try:
-                    from hybrid_codesign.video_recorder import HeadlessVideoRecorder
+                    from codesign.video_recorder import HeadlessVideoRecorder
                     self._video_recorder = HeadlessVideoRecorder(
                         self._env, self, self._device, fps=fps
                     )

@@ -107,7 +107,7 @@ def test_diff_rollout_memory(outer_model):
         print("  [SKIP] No outer model available")
         return False
 
-    from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
+    from codesign.diff_rollout import SimplifiedDiffRollout
 
     torch.cuda.reset_peak_memory_stats()
     print_memory_status("Before rollout")
@@ -148,8 +148,8 @@ def test_multiple_outer_loops(outer_model):
         print("  [SKIP] No outer model available")
         return False
 
-    from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
-    from hybrid_codesign.parametric_g1 import ParametricG1Model
+    from codesign.diff_rollout import SimplifiedDiffRollout
+    from codesign.parametric_g1 import ParametricG1Model
 
     # Attach parametric model
     param_model = ParametricG1Model(device="cuda:0", theta_init=0.0)
@@ -218,8 +218,8 @@ def test_tape_cleanup():
         print(f"  [SKIP] G1 model not found")
         return False
 
-    from hybrid_codesign.hybrid_agent import create_diff_model_from_mjcf
-    from hybrid_codesign.diff_rollout import SimplifiedDiffRollout
+    from codesign.hybrid_agent import create_diff_model_from_mjcf
+    from codesign.diff_rollout import SimplifiedDiffRollout
 
     torch.cuda.reset_peak_memory_stats()
     print_memory_status("Before tape test")

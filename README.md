@@ -13,10 +13,10 @@ This implementation combines:
 conda activate codesign
 
 # 2. Run tests to verify setup
-python hybrid_codesign/run_all_tests.py
+python codesign/run_all_tests.py
 
 # 3. Start training
-python hybrid_codesign/train_hybrid.py --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml --env_config hybrid_codesign/config/hybrid_g1_env.yaml
+python codesign/train_hybrid.py --agent_config codesign/config/hybrid_g1_agent.yaml --env_config codesign/config/hybrid_g1_env.yaml
 ```
 
 ## Installation
@@ -62,7 +62,7 @@ parent_directory/
 │           └── g1/
 │               └── g1.xml     # G1 humanoid robot model
 └── codesign/                  # This repository
-    └── hybrid_codesign/
+    └── codesign/              # (renamed from hybrid_codesign)
         ├── config/            # Configuration files
         ├── parametric_g1.py   # Parametric morphology model
         ├── diff_rollout.py    # Differentiable rollout
@@ -75,21 +75,21 @@ parent_directory/
 
 ```bash
 # Basic training with default settings
-python hybrid_codesign/train_hybrid.py --num_envs 4096 --max_samples 50000000
+python codesign/train_hybrid.py --num_envs 4096 --max_samples 50000000
 
 # Training with custom configs
-python hybrid_codesign/train_hybrid.py \
-    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
-    --env_config hybrid_codesign/config/hybrid_g1_env.yaml
+python codesign/train_hybrid.py \
+    --agent_config codesign/config/hybrid_g1_agent.yaml \
+    --env_config codesign/config/hybrid_g1_env.yaml
 
 # Training with Weights & Biases logging
-python hybrid_codesign/train_hybrid.py \
-    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
+python codesign/train_hybrid.py \
+    --agent_config codesign/config/hybrid_g1_agent.yaml \
     --num_envs 512 \
     --logger wandb
 
 # Resume from checkpoint
-python hybrid_codesign/train_hybrid.py --resume output/hybrid_g1/model.pt
+python codesign/train_hybrid.py --resume output/hybrid_g1/model.pt
 ```
 
 ### Logging Options
@@ -102,14 +102,14 @@ python hybrid_codesign/train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ```bash
 # Record video every 1000 iterations
-python hybrid_codesign/train_hybrid.py \
-    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
+python codesign/train_hybrid.py \
+    --agent_config codesign/config/hybrid_g1_agent.yaml \
     --logger wandb \
     --video_interval 1000
 
 # Disable video recording
-python hybrid_codesign/train_hybrid.py \
-    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
+python codesign/train_hybrid.py \
+    --agent_config codesign/config/hybrid_g1_agent.yaml \
     --logger wandb \
     --video_interval 0
 ```
