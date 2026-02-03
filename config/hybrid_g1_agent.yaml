@@ -30,7 +30,7 @@ test_episodes: 32
 normalizer_samples: 100000000
 
 update_epochs: 5
-batch_size: 4
+batch_size: 256
 td_lambda: 0.95
 ppo_clip_ratio: 0.2
 norm_adv_clip: 4.0
@@ -80,7 +80,7 @@ stability_epsilon: 1.0e-8
 
 # Minimum iterations before stability check can pass
 # Ensures enough data for reliable metric
-min_iters_for_stability: 200
+min_iters_for_stability: 5000
 
 # ============================================================================
 # Legacy Fixed Schedule Parameters (for gating_mode: "fixed")

@@ -78,7 +78,7 @@ def parse_args():
                         help="Path to physics engine configuration file")
 
     # Training parameters
-    parser.add_argument("--num_envs", type=int, default=4096,
+    parser.add_argument("--num_envs", type=int, default=2048,
                         help="Number of parallel environments")
     parser.add_argument("--max_samples", type=int, default=50000000,
                         help="Maximum training samples")
