@@ -7,7 +7,7 @@ Hybrid PPO Control + Differentiable Physics Morphology optimization.
 
 Usage:
     # Basic training
-    python train_hybrid.py --num_envs 4096 --max_samples 50000000
+    python train_hybrid.py --num_envs 2048 --max_iters 100000
 
     # With custom config
     python train_hybrid.py --agent_config config/hybrid_g1_agent.yaml \
@@ -80,8 +80,8 @@ def parse_args():
     # Training parameters
     parser.add_argument("--num_envs", type=int, default=2048,
                         help="Number of parallel environments")
-    parser.add_argument("--max_samples", type=int, default=50000000,
-                        help="Maximum training samples")
+    parser.add_argument("--max_iters", type=int, default=100000,
+                        help="Maximum training iterations")
     parser.add_argument("--device", type=str, default="cuda:0",
                         help="Computation device")
 
@@ -267,9 +267,8 @@ def train_standalone(args, agent_config, env_config):
     print()
 
     start_time = time.time()
-    max_iters = args.max_samples // agent_config.get("steps_per_iter", 32)
 
-    for i in range(max_iters):
+    for i in range(args.max_iters):
         # Run one training iteration
         info = agent.train_iter()
 
@@ -385,9 +384,15 @@ def train_integrated(args, agent_config, env_config):
         agent.setup_video_recording(video_interval=args.video_interval, fps=30)
 
     # Use MimicKit's training infrastructure
+    # Convert max_iters to max_samples for MimicKit API
+    steps_per_iter = agent_config.get("steps_per_iter", 32)
+    samples_per_iter = args.num_envs * steps_per_iter
+    max_samples = args.max_iters * samples_per_iter
+
     print(f"\nStarting integrated training with MimicKit (logger: {args.logger})...")
+    print(f"Max iterations: {args.max_iters}, Max samples: {max_samples}")
     agent.train_model(
-        max_samples=args.max_samples,
+        max_samples=max_samples,
         out_dir=args.out_dir,
         save_int_models=True,
         logger_type=args.logger
@@ -413,7 +418,7 @@ def main():
     print(f"Environment config: {args.env_config}")
     print(f"Output directory: {args.out_dir}")
     print(f"Device: {args.device}")
-    print(f"Max samples: {args.max_samples}")
+    print(f"Max iterations: {args.max_iters}")
 
     # Set random seed
     seed = int(time.time() * 256) % (2**32)
