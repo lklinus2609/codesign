@@ -150,6 +150,9 @@ class HeadlessVideoRecorder:
         """
         Record a single episode.
 
+        Uses the first environment from the batch for recording.
+        The policy runs on all envs but we only track env 0.
+
         Args:
             max_steps: Maximum steps per episode
 
@@ -161,38 +164,64 @@ class HeadlessVideoRecorder:
 
         frames = []
 
-        # Reset environment
-        obs = self._env.reset()
+        # Reset environment (returns batched obs for all envs)
+        obs, info = self._env.reset()
         if isinstance(obs, dict):
             obs = obs.get('obs', obs)
 
+        # Convert to tensor if needed
+        if isinstance(obs, np.ndarray):
+            obs = torch.from_numpy(obs).to(self._device)
+
         for step in range(max_steps):
-            # Get action from policy
+            # Get action from policy (runs on all envs)
             with torch.no_grad():
                 if hasattr(self._agent, '_model'):
-                    obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+                    # Ensure obs is properly batched tensor
+                    if not isinstance(obs, torch.Tensor):
+                        obs_tensor = torch.as_tensor(obs, dtype=torch.float32, device=self._device)
+                    else:
+                        obs_tensor = obs.float()
+
+                    # Handle single obs case
                     if obs_tensor.dim() == 1:
                         obs_tensor = obs_tensor.unsqueeze(0)
+
+                    # Normalize observation like the agent does
+                    if hasattr(self._agent, '_obs_norm'):
+                        obs_tensor = self._agent._obs_norm.normalize(obs_tensor)
+
                     action = self._agent._model.eval_actor(obs_tensor)
                     if isinstance(action, tuple):
                         action = action[0]
-                    action = action.cpu().numpy()
+
+                    # Unnormalize action if needed
+                    if hasattr(self._agent, '_a_norm'):
+                        action = self._agent._a_norm.unnormalize(action)
                 else:
                     # Random action fallback
-                    action = np.zeros(self._env.get_action_size())
+                    num_envs = obs.shape[0] if hasattr(obs, 'shape') and len(obs.shape) > 1 else 1
+                    action = torch.zeros((num_envs, self._env.get_action_size()), device=self._device)
 
-            # Step environment
+            # Step environment (all envs step together)
             obs, reward, done, info = self._env.step(action)
             if isinstance(obs, dict):
                 obs = obs.get('obs', obs)
 
-            # Capture frame from current state
+            # Convert to tensor if needed
+            if isinstance(obs, np.ndarray):
+                obs = torch.from_numpy(obs).to(self._device)
+
+            # Capture frame from current state (renders env 0)
             frame = self._capture_frame()
             if frame is not None:
                 frames.append(frame)
 
-            # Check if episode done (use first env if batched)
-            if isinstance(done, np.ndarray):
+            # Check if first env's episode is done
+            if isinstance(done, torch.Tensor):
+                if done[0].item() != 0:  # DoneFlags.NULL = 0
+                    break
+            elif isinstance(done, np.ndarray):
                 if done[0]:
                     break
             elif done:
