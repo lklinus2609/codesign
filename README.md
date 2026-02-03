@@ -96,6 +96,24 @@ python hybrid_codesign/train_hybrid.py --resume output/hybrid_g1/model.pt
 - `--logger tb` - TensorBoard (default)
 - `--logger wandb` - Weights & Biases
 
+### Video Recording (wandb only, headless)
+- `--video_interval N` - Record video every N iterations (default: 500, 0 to disable)
+- Uses true headless rendering via Newton's `ViewerGL(headless=True)` - no display required
+
+```bash
+# Record video every 1000 iterations
+python hybrid_codesign/train_hybrid.py \
+    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
+    --logger wandb \
+    --video_interval 1000
+
+# Disable video recording
+python hybrid_codesign/train_hybrid.py \
+    --agent_config hybrid_codesign/config/hybrid_g1_agent.yaml \
+    --logger wandb \
+    --video_interval 0
+```
+
 ## Configuration
 
 Key parameters in `config/hybrid_g1_agent.yaml`:

@@ -1,9 +1,11 @@
-# Hybrid Co-Design Environment Configuration
+# PGHC Co-Design Environment Configuration
 # Based on amp_g1_env.yaml with support for differentiable physics
 #
 # This environment uses Newton physics engine for both:
 # 1. Inner loop: Standard simulation for AMP training
 # 2. Outer loop: Differentiable simulation for gradient computation
+#
+# Reference: Masters_Thesis.pdf
 
 env_name: "amp"
 
@@ -64,11 +66,11 @@ reward_key_pos_scale: 10.0
 # ============================================================================
 
 # Enable differentiable physics support
-# When true, the Newton model is finalized with requires_grad=True
 enable_diff_physics: true
 
 # Solver for differentiable rollout
-# Options: "semi_implicit" (recommended for BPTT), "mujoco"
+# "semi_implicit": Recommended for BPTT (SolverSemiImplicit)
+# "mujoco": MuJoCo solver (limited BPTT support)
 diff_solver: "semi_implicit"
 
 # Simulation frequency for differentiable rollout
@@ -76,15 +78,101 @@ diff_sim_freq: 60  # Hz
 diff_control_freq: 60  # Hz
 
 # ============================================================================
-# Design Parameter Joints
+# Design Parameter Joints (Lower Body - 15 DOF)
 # ============================================================================
+# Per thesis Section III.A.1, we parameterize joint oblique angles
+# Starting with lower body joints for walking CoT optimization
 
-# Joints to parameterize for morphology optimization
-# These joints will have their transforms modified during outer loop
+# Lower body joints for morphology optimization (~15 DOF)
+# Each joint pair (left/right) shares a symmetric design parameter
 design_joints:
+  # Hip joints (6 DOF total, 3 per leg)
+  - "left_hip_pitch_joint"
+  - "right_hip_pitch_joint"
   - "left_hip_roll_joint"
   - "right_hip_roll_joint"
+  - "left_hip_yaw_joint"
+  - "right_hip_yaw_joint"
+  # Knee joints (2 DOF total, 1 per leg)
+  - "left_knee_joint"
+  - "right_knee_joint"
+  # Ankle joints (4 DOF total, 2 per leg)
+  - "left_ankle_pitch_joint"
+  - "right_ankle_pitch_joint"
+  - "left_ankle_roll_joint"
+  - "right_ankle_roll_joint"
+
+# Full body joints (30 DOF) - uncomment for full optimization
+# design_joints_full:
+#   # Hip (6)
+#   - "left_hip_pitch_joint"
+#   - "right_hip_pitch_joint"
+#   - "left_hip_roll_joint"
+#   - "right_hip_roll_joint"
+#   - "left_hip_yaw_joint"
+#   - "right_hip_yaw_joint"
+#   # Knee (2)
+#   - "left_knee_joint"
+#   - "right_knee_joint"
+#   # Ankle (4)
+#   - "left_ankle_pitch_joint"
+#   - "right_ankle_pitch_joint"
+#   - "left_ankle_roll_joint"
+#   - "right_ankle_roll_joint"
+#   # Waist (3)
+#   - "waist_yaw_joint"
+#   - "waist_roll_joint"
+#   - "waist_pitch_joint"
+#   # Left shoulder/arm (5)
+#   - "left_shoulder_pitch_joint"
+#   - "left_shoulder_roll_joint"
+#   - "left_shoulder_yaw_joint"
+#   - "left_elbow_pitch_joint"
+#   - "left_wrist_yaw_joint"
+#   # Right shoulder/arm (5)
+#   - "right_shoulder_pitch_joint"
+#   - "right_shoulder_roll_joint"
+#   - "right_shoulder_yaw_joint"
+#   - "right_elbow_pitch_joint"
+#   - "right_wrist_yaw_joint"
+#   # Head (2)
+#   - "head_yaw_joint"
+#   - "head_pitch_joint"
 
 # Type of parameterization
-# "x_rotation": Parameterize rotation about X-axis
+# "x_rotation": Parameterize rotation about X-axis (oblique angles)
+# "all_axes": Parameterize all rotation axes (more DOF per joint)
 design_param_type: "x_rotation"
+
+# Symmetric pairs - joints that share the same design parameter magnitude
+# (with opposite signs for left/right)
+symmetric_pairs:
+  - ["left_hip_pitch_joint", "right_hip_pitch_joint"]
+  - ["left_hip_roll_joint", "right_hip_roll_joint"]
+  - ["left_hip_yaw_joint", "right_hip_yaw_joint"]
+  - ["left_knee_joint", "right_knee_joint"]
+  - ["left_ankle_pitch_joint", "right_ankle_pitch_joint"]
+  - ["left_ankle_roll_joint", "right_ankle_roll_joint"]
+
+# ============================================================================
+# Cost of Transport Configuration (Thesis Section III.C)
+# ============================================================================
+
+# Primary objective for walking task
+# CoT = E_total / (m * g * d)
+objective_type: "cost_of_transport"
+
+# Robot mass (kg) - used for CoT normalization
+robot_mass: 40.0
+
+# Gravity (m/s^2)
+gravity: 9.81
+
+# Auxiliary objectives (weighted combination)
+objective_weights:
+  cost_of_transport: 1.0
+  upright_bonus: 0.1
+  velocity_tracking: 0.2
+
+# Target velocity for walking (m/s)
+target_velocity: [0.5, 0.0, 0.0]

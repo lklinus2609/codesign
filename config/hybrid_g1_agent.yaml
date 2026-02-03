@@ -1,10 +1,9 @@
-# Hybrid Co-Design Agent Configuration
-# Based on amp_g1_agent.yaml with outer loop parameters for morphology optimization
+# PGHC (Performance-Gated Hybrid Co-Design) Agent Configuration
+# Implements Algorithm 1 from the thesis
 #
-# Algorithm 1: Hybrid PPO Control + Diff-Phys Morphology
-# Reference: algorithm1.pdf
+# Reference: Masters_Thesis.pdf, Section II.D
 
-agent_name: "HybridAMP"
+agent_name: "PGHC_AMP"
 
 # ============================================================================
 # Base AMP/PPO Configuration (Inner Loop)
@@ -54,32 +53,81 @@ task_reward_weight: 0.0
 disc_reward_weight: 1.0
 
 # ============================================================================
-# Outer Loop Configuration (Morphology Optimization)
-# Algorithm 1, Lines 19-24
+# PGHC Outer Loop Gating Mode
+# ============================================================================
+# "stability": Performance-gated triggering (Algorithm 1, recommended)
+#   - Outer loop triggers when policy converges (delta_rel < delta_conv)
+#   - Enforces Envelope Theorem approximation validity
+# "fixed": Legacy warmup + frequency schedule
+#   - Uses warmup_iters and outer_loop_freq parameters
+gating_mode: "stability"
+
+# ============================================================================
+# Stability Gating Parameters (Algorithm 1, Lines 12-18)
+# ============================================================================
+
+# Window W for moving average returns (default: 100 episodes)
+# Larger window = more stable metric but slower detection
+stability_window: 100
+
+# Convergence threshold delta_conv (default: 5% relative change)
+# Lower = stricter convergence requirement
+# delta_rel = |R_t - R_{t-W}| / (|R_{t-W}| + epsilon)
+stability_threshold: 0.05
+
+# Small epsilon to prevent division by zero
+stability_epsilon: 1.0e-8
+
+# Minimum iterations before stability check can pass
+# Ensures enough data for reliable metric
+min_iters_for_stability: 200
+
+# ============================================================================
+# Legacy Fixed Schedule Parameters (for gating_mode: "fixed")
 # ============================================================================
 
 # Number of inner loop iterations before outer loop activates
-# This warmup period allows AMP to learn basic locomotion before morphology changes
-# Recommendation: ~10000 iterations for stable walking
 warmup_iters: 10000
 
 # Frequency of outer loop updates (every N inner iterations)
-# Lower values = more frequent morphology updates (may destabilize policy)
-# Higher values = less frequent updates (slower design exploration)
 outer_loop_freq: 200
 
-# Learning rate for design parameter (beta in Algorithm 1, Line 24)
-# phi_{k+1} = proj_C(phi_k - beta * grad_phi L)
+# ============================================================================
+# Adaptive Trust Region Parameters (Algorithm 1, Lines 24-35)
+# ============================================================================
+
+# Initial design learning rate (beta_init)
 design_learning_rate: 0.01
 
-# Horizon for differentiable rollout (H in Algorithm 1, Line 21)
-# Note: Keep this SHORT (<=5) to avoid contact force explosion in SolverSemiImplicit
-# The robot falls and hits ground around step 3-4, causing instability
-# Future work: Implement contact-stable differentiable solver or use finite differences
+# Learning rate bounds
+design_lr_min: 1.0e-5
+design_lr_max: 0.1
+
+# Trust region threshold xi (10% performance degradation allowed)
+# D <= xi * |J(phi_k)| for acceptance
+trust_region_threshold: 0.1
+
+# Learning rate adaptation factors
+lr_decay_factor: 0.5    # Shrink on trust region violation
+lr_growth_factor: 1.5   # Grow on small improvement
+
+# Maximum trust region iterations before giving up
+max_trust_region_iters: 10
+
+# Threshold for "small improvement" (triggers LR growth)
+small_improvement_threshold: 0.01
+
+# ============================================================================
+# Differentiable Rollout Parameters
+# ============================================================================
+
+# Horizon for differentiable rollout (H in Algorithm 1)
+# Note: Keep SHORT (<=5) due to contact force instability in SolverSemiImplicit
+# The robot falls and contacts ground around step 3-4, causing gradient issues
 diff_horizon: 3
 
 # ============================================================================
-# Design Parameter Configuration
+# Design Parameter Configuration (Morphology)
 # ============================================================================
 
 # Initial design parameter value (radians)
@@ -87,13 +135,9 @@ diff_horizon: 3
 design_param_init: 0.0
 
 # Bounds for design parameter (radians)
-# ±10 degrees = ±0.1745 radians
-design_param_min: -0.1745
-design_param_max: 0.1745
-
-# Use simplified differentiable rollout (no policy, just physics stability)
-# Set to true for initial testing/debugging
-use_simplified_diff: false
+# Thesis uses +/- 30 degrees = +/- 0.5236 radians
+design_param_min: -0.5236
+design_param_max: 0.5236
 
 # ============================================================================
 # Logging and Checkpointing
