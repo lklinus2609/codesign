@@ -43,7 +43,6 @@ dependencies:
       - mujoco>=3.0.0
       - mujoco-warp==0.0.2
       - networkx==3.4.2
-      - newton==0.2.0
       - numpy>=2.0.0
       - packaging
       - pillow
