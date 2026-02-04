@@ -88,12 +88,20 @@ class HeadlessVideoRecorder:
         # Get the engine and model from environment
         engine = getattr(self._env, '_engine', None)
         if engine is None:
-            print("[HeadlessVideoRecorder] No engine in environment")
+            # Try to find engine in env.env if it's wrapped
+            inner_env = getattr(self._env, 'env', None)
+            if inner_env:
+                engine = getattr(inner_env, '_engine', None)
+        
+        if engine is None:
+            print(f"[HeadlessVideoRecorder] No _engine in environment (type: {type(self._env)})")
+            # List available attributes to help debugging
+            print(f"[HeadlessVideoRecorder] Available env attributes: {[a for a in dir(self._env) if not a.startswith('__')]}")
             return False
 
         sim_model = getattr(engine, '_sim_model', None)
         if sim_model is None:
-            print("[HeadlessVideoRecorder] No sim_model in engine")
+            print(f"[HeadlessVideoRecorder] No _sim_model in engine (type: {type(engine)})")
             return False
 
         try:
@@ -119,13 +127,24 @@ class HeadlessVideoRecorder:
         """Get the current simulation state from training environment."""
         engine = getattr(self._env, '_engine', None)
         if engine is None:
+            inner_env = getattr(self._env, 'env', None)
+            if inner_env:
+                engine = getattr(inner_env, '_engine', None)
+        
+        if engine is None:
             return None
 
         sim_state = getattr(engine, '_sim_state', None)
         if sim_state is None:
             return None
 
-        return getattr(sim_state, 'raw_state', None)
+        # raw_state is a Newton convention
+        state = getattr(sim_state, 'raw_state', None)
+        if state is None:
+            # Fallback for some environment versions
+            state = getattr(sim_state, 'state', None)
+            
+        return state
 
     def _capture_frame(self):
         """Capture a single frame from current state."""
@@ -134,6 +153,10 @@ class HeadlessVideoRecorder:
 
         state = self._get_state()
         if state is None:
+            # Only print once to avoid spamming
+            if not hasattr(self, '_state_error_printed'):
+                print("[HeadlessVideoRecorder] State is None in _capture_frame")
+                self._state_error_printed = True
             return None
 
         try:
@@ -144,12 +167,17 @@ class HeadlessVideoRecorder:
 
             # Get frame as numpy array
             frame_wp = self._viewer.get_frame()
+            if frame_wp is None:
+                return None
+                
             frame_np = frame_wp.numpy()
-
             return frame_np.copy()
 
         except Exception as e:
-            # Silent fail on frame capture errors
+            # Only print once to avoid spamming
+            if not hasattr(self, '_capture_error_printed'):
+                print(f"[HeadlessVideoRecorder] Frame capture exception: {e}")
+                self._capture_error_printed = True
             return None
 
     def record_episode(self, max_steps=300):
