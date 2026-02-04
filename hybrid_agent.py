@@ -450,7 +450,15 @@ class HybridAMPAgentBase:
 
         if self._diff_rollout is None:
             print("[PGHC] Warning: No differentiable rollout available")
-            return {"outer_loop_status": "skipped_no_rollout"}
+            return {
+                "outer_loop_loss": 0.0,
+                "outer_loop_grad": 0.0,
+                "outer_loop_count": self._outer_loop_count,
+                "outer_loop_accepted": False,
+                "outer_loop_lr": self._design_lr,
+                "stability_delta_rel": self._current_delta_rel,
+                "trust_region_iters": 0,
+            }
 
         # =================================================================
         # Line 21-22: Differentiable rollout and BPTT
@@ -465,7 +473,15 @@ class HybridAMPAgentBase:
 
         if design_grad is None or np.isnan(design_grad):
             print("[PGHC] Warning: Invalid gradient, skipping update")
-            return {"outer_loop_status": "skipped_invalid_grad"}
+            return {
+                "outer_loop_loss": current_objective,
+                "outer_loop_grad": 0.0,
+                "outer_loop_count": self._outer_loop_count,
+                "outer_loop_accepted": False,
+                "outer_loop_lr": self._design_lr,
+                "stability_delta_rel": self._current_delta_rel,
+                "trust_region_iters": 0,
+            }
 
         print(f"[PGHC] Design gradient: {design_grad:.6f}")
 
@@ -754,6 +770,14 @@ class HybridAMPAgent(HybridAMPAgentBase):
         if self._should_run_outer_loop():
             outer_info = self._outer_loop_update()
             info.update(outer_info)
+        else:
+            # Always include outer loop keys with placeholder values for logger
+            info["outer_loop_loss"] = 0.0
+            info["outer_loop_grad"] = 0.0
+            info["outer_loop_count"] = self._outer_loop_count
+            info["outer_loop_accepted"] = False
+            info["outer_loop_lr"] = self._design_lr
+            info["trust_region_iters"] = 0
 
         # Update iteration counter
         self._iter += 1
@@ -859,8 +883,13 @@ if MIMICKIT_AVAILABLE:
                 info.update(outer_info)
             else:
                 # Always include outer loop keys with placeholder values for logger
+                # (base_agent auto-logs all train_info keys, so they must exist from iter 0)
                 info["outer_loop_loss"] = 0.0
                 info["outer_loop_grad"] = 0.0
+                info["outer_loop_count"] = self._outer_loop_count
+                info["outer_loop_accepted"] = False
+                info["outer_loop_lr"] = self._design_lr
+                info["trust_region_iters"] = 0
 
             # Add design parameter and stability metrics to info
             info["design_param_theta"] = self._parametric_model.get_theta()
