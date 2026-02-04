@@ -857,6 +857,10 @@ if MIMICKIT_AVAILABLE:
             if self._should_run_outer_loop():
                 outer_info = self._outer_loop_update()
                 info.update(outer_info)
+            else:
+                # Always include outer loop keys with placeholder values for logger
+                info["outer_loop_loss"] = 0.0
+                info["outer_loop_grad"] = 0.0
 
             # Add design parameter and stability metrics to info
             info["design_param_theta"] = self._parametric_model.get_theta()
