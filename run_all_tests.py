@@ -3,10 +3,11 @@
 Run All Hybrid Co-Design Tests
 
 This script runs all test suites for the hybrid co-design implementation:
-1. test_implementation.py - Unit tests for components
-2. validate_outer_loop.py - End-to-end outer loop validation
-3. test_gpu_memory.py - GPU memory stability tests
-4. test_checkpoint.py - Checkpoint save/load tests
+1. test_level0_verification.py - Level 0: Mathematical correctness (no physics)
+2. test_implementation.py - Unit tests for components
+3. validate_outer_loop.py - End-to-end outer loop validation
+4. test_gpu_memory.py - GPU memory stability tests
+5. test_checkpoint.py - Checkpoint save/load tests
 
 Usage:
     python run_all_tests.py
@@ -61,6 +62,7 @@ def main():
     print(f"Python: {sys.executable}")
 
     tests = [
+        ("Level 0 Verification", os.path.join(SCRIPT_DIR, "test_level0_verification.py")),
         ("Unit Tests", os.path.join(SCRIPT_DIR, "test_implementation.py")),
         ("Outer Loop Validation", os.path.join(SCRIPT_DIR, "validate_outer_loop.py")),
         ("GPU Memory Tests", os.path.join(SCRIPT_DIR, "test_gpu_memory.py")),

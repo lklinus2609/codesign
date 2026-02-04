@@ -5,7 +5,13 @@
       "Bash(git -C \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\newton\" remote -v)",
       "Bash(git -C \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\MimicKit\" status --short)",
       "Bash(git -C \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\newton\" status --short)",
-      "Bash(gh pr list:*)"
+      "Bash(gh pr list:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(python test_level0_verification.py:*)",
+      "Bash(dir:*)",
+      "Bash(python:*)"
     ]
   }
 }

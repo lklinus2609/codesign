@@ -898,13 +898,14 @@ if MIMICKIT_AVAILABLE:
 
             return info
 
-        def setup_video_recording(self, video_interval=500, fps=30):
+        def setup_video_recording(self, video_interval=500, fps=30, save_dir=None):
             """
-            Set up video recording for wandb.
+            Set up video recording for wandb and/or local storage.
 
             Args:
                 video_interval: Record video every N iterations (0 to disable)
                 fps: Frames per second for video
+                save_dir: Directory to save local video files (None = don't save locally)
             """
             self._video_interval = video_interval
             self._video_fps = fps
@@ -914,9 +915,10 @@ if MIMICKIT_AVAILABLE:
                 try:
                     from codesign.video_recorder import HeadlessVideoRecorder
                     self._video_recorder = HeadlessVideoRecorder(
-                        self._env, self, self._device, fps=fps
+                        self._env, self, self._device, fps=fps, save_dir=save_dir
                     )
-                    print(f"[PGHC] Headless video recording enabled (every {video_interval} iters)")
+                    local_msg = f", saving to {save_dir}" if save_dir else ""
+                    print(f"[PGHC] Headless video recording enabled (every {video_interval} iters{local_msg})")
                 except ImportError as e:
                     print(f"[PGHC] Video recording not available: {e}")
 

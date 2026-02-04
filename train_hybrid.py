@@ -106,9 +106,9 @@ def parse_args():
                         choices=["tb", "wandb"],
                         help="Logger type: 'tb' for TensorBoard, 'wandb' for Weights & Biases")
 
-    # Video logging (wandb only)
+    # Video logging
     parser.add_argument("--video_interval", type=int, default=500,
-                        help="Record video every N iterations (0 to disable, wandb only)")
+                        help="Record video every N iterations (0 to disable). Saves to output_dir/videos/")
 
     return parser.parse_args()
 
@@ -379,9 +379,14 @@ def train_integrated(args, agent_config, env_config):
     if args.resume:
         agent.load(args.resume)
 
-    # Set up video recording (wandb only)
-    if args.logger == "wandb" and args.video_interval > 0:
-        agent.setup_video_recording(video_interval=args.video_interval, fps=30)
+    # Set up video recording (saves locally and to wandb if available)
+    if args.video_interval > 0:
+        video_save_dir = os.path.join(args.out_dir, "videos")
+        agent.setup_video_recording(
+            video_interval=args.video_interval,
+            fps=30,
+            save_dir=video_save_dir
+        )
 
     # Use MimicKit's training infrastructure
     # Convert max_iters to max_samples for MimicKit API

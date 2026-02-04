@@ -45,7 +45,7 @@ class HeadlessVideoRecorder:
     environment's existing model and state - no display required.
     """
 
-    def __init__(self, env, agent, device, width=640, height=480, fps=30):
+    def __init__(self, env, agent, device, width=640, height=480, fps=30, save_dir=None):
         """
         Initialize the headless video recorder.
 
@@ -56,6 +56,7 @@ class HeadlessVideoRecorder:
             width: Video width in pixels
             height: Video height in pixels
             fps: Frames per second for video
+            save_dir: Directory to save local video files (None = don't save locally)
         """
         self._env = env
         self._agent = agent
@@ -63,6 +64,11 @@ class HeadlessVideoRecorder:
         self._width = width
         self._height = height
         self._fps = fps
+        self._save_dir = save_dir
+
+        # Create save directory if specified
+        if self._save_dir is not None:
+            os.makedirs(self._save_dir, exist_ok=True)
 
         # Headless viewer (created on first use)
         self._viewer = None
@@ -191,9 +197,18 @@ class HeadlessVideoRecorder:
                     if hasattr(self._agent, '_obs_norm'):
                         obs_tensor = self._agent._obs_norm.normalize(obs_tensor)
 
-                    action = self._agent._model.eval_actor(obs_tensor)
-                    if isinstance(action, tuple):
-                        action = action[0]
+                    action_dist = self._agent._model.eval_actor(obs_tensor)
+                    if isinstance(action_dist, tuple):
+                        action_dist = action_dist[0]
+
+                    # Extract action from distribution (mode = mean for Gaussian)
+                    if hasattr(action_dist, 'mode'):
+                        action = action_dist.mode
+                    elif hasattr(action_dist, 'mean'):
+                        action = action_dist.mean
+                    else:
+                        # Already a tensor
+                        action = action_dist
 
                     # Unnormalize action if needed
                     if hasattr(self._agent, '_a_norm'):
@@ -246,22 +261,57 @@ class HeadlessVideoRecorder:
         video = np.stack(frames, axis=0)
         return video
 
+    def _save_video_locally(self, video, iteration, prefix):
+        """
+        Save video to local file as MP4.
+
+        Args:
+            video: numpy array (T, H, W, C)
+            iteration: Current training iteration
+            prefix: Prefix for filename
+
+        Returns:
+            Path to saved file, or None if failed
+        """
+        if self._save_dir is None:
+            return None
+
+        try:
+            import imageio
+        except ImportError:
+            print("[HeadlessVideoRecorder] imageio not installed, cannot save locally. Install with: pip install imageio imageio-ffmpeg")
+            return None
+
+        filename = f"{prefix}_iter{iteration:08d}.mp4"
+        filepath = os.path.join(self._save_dir, filename)
+
+        try:
+            # imageio expects (T, H, W, C) uint8
+            if video.dtype != np.uint8:
+                video = (video * 255).astype(np.uint8)
+
+            imageio.mimwrite(filepath, video, fps=self._fps, codec='libx264')
+            return filepath
+        except Exception as e:
+            print(f"[HeadlessVideoRecorder] Failed to save video locally: {e}")
+            return None
+
     def record_and_log(self, iteration, num_episodes=1, max_steps=300, prefix="policy"):
         """
-        Record episodes and log video to wandb.
+        Record episodes and log video to wandb and/or save locally.
 
         Args:
             iteration: Current training iteration (for labeling)
             num_episodes: Number of episodes to record
             max_steps: Maximum steps per episode
-            prefix: Prefix for wandb log key
+            prefix: Prefix for wandb log key and local filename
         """
-        if not WANDB_AVAILABLE:
-            print("[HeadlessVideoRecorder] wandb not available")
-            return
+        # Check if we can log anywhere
+        can_wandb = WANDB_AVAILABLE and wandb.run is not None
+        can_local = self._save_dir is not None
 
-        if wandb.run is None:
-            print("[HeadlessVideoRecorder] No active wandb run")
+        if not can_wandb and not can_local:
+            print("[HeadlessVideoRecorder] No output configured (no wandb run and no save_dir)")
             return
 
         all_frames = []
@@ -277,8 +327,19 @@ class HeadlessVideoRecorder:
         # Convert to video
         video = self.frames_to_video(all_frames)
 
-        if video is not None:
-            # Log to wandb
+        if video is None:
+            return
+
+        saved_path = None
+
+        # Save locally first
+        if can_local:
+            saved_path = self._save_video_locally(video, iteration, prefix)
+            if saved_path:
+                print(f"[HeadlessVideoRecorder] Saved video to {saved_path}")
+
+        # Log to wandb
+        if can_wandb:
             wandb.log({
                 f"{prefix}_video": wandb.Video(
                     video,
@@ -286,8 +347,7 @@ class HeadlessVideoRecorder:
                     format="mp4"
                 )
             }, step=iteration)
-
-            print(f"[HeadlessVideoRecorder] Logged video at iteration {iteration} "
+            print(f"[HeadlessVideoRecorder] Logged video to wandb at iteration {iteration} "
                   f"({len(all_frames)} frames, {video.shape})")
 
 
