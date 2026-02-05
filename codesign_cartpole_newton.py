@@ -32,6 +32,9 @@ from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 
 def record_episode_video(env, policy, max_steps=200, width=640, height=480):
     """Record a video of one episode using Newton's ViewerGL."""
+    # Synchronize GPU before creating viewer
+    wp.synchronize()
+
     try:
         viewer = newton.viewer.ViewerGL(headless=True, width=width, height=height)
     except Exception as e:
@@ -42,9 +45,19 @@ def record_episode_video(env, policy, max_steps=200, width=640, height=480):
     obs = env.reset()
     sim_time = 0.0
 
+    # Compute forward kinematics to populate body positions for rendering
+    newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
+    wp.synchronize()
+
     # Set up viewer with model
     viewer.set_model(env.model)
     viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
+
+    # Warm-up render to initialize OpenGL state
+    viewer.begin_frame(0.0)
+    viewer.log_state(env.state_0)
+    viewer.end_frame()
+    _ = viewer.get_frame()  # Discard first frame (may be incomplete)
 
     for step in range(max_steps):
         # Get action
@@ -206,6 +219,8 @@ def evaluate_policy(env, policy, n_episodes=5):
             if terminated or truncated:
                 break
         returns.append(total_reward)
+        # Sync after each episode to prevent GPU command queue buildup
+        wp.synchronize()
     return np.mean(returns), np.std(returns)
 
 
@@ -217,9 +232,13 @@ def compute_design_gradient(env, policy, eps=0.02, horizon=200, n_rollouts=3):
         action = policy.get_action(obs, deterministic=True)
         return float(action[0]) * env.force_max
 
+    # Synchronize GPU before model rebuild
+    wp.synchronize()
+
     # Evaluate at L - eps
     env.parametric_model.set_L(L_current - eps)
     env._build_model()
+    wp.synchronize()
     returns_minus = []
     for _ in range(n_rollouts):
         obs = env.reset()
@@ -232,9 +251,13 @@ def compute_design_gradient(env, policy, eps=0.02, horizon=200, n_rollouts=3):
                 break
         returns_minus.append(total_return)
 
+    # Synchronize before next rebuild
+    wp.synchronize()
+
     # Evaluate at L + eps
     env.parametric_model.set_L(L_current + eps)
     env._build_model()
+    wp.synchronize()
     returns_plus = []
     for _ in range(n_rollouts):
         obs = env.reset()
@@ -247,9 +270,13 @@ def compute_design_gradient(env, policy, eps=0.02, horizon=200, n_rollouts=3):
                 break
         returns_plus.append(total_return)
 
+    # Synchronize before restoring
+    wp.synchronize()
+
     # Restore L
     env.parametric_model.set_L(L_current)
     env._build_model()
+    wp.synchronize()
 
     gradient = (np.mean(returns_plus) - np.mean(returns_minus)) / (2 * eps)
     mean_return = (np.mean(returns_plus) + np.mean(returns_minus)) / 2
@@ -433,6 +460,9 @@ def pghc_codesign(
         for inner_iter in range(max_inner_iterations):
             rollout = collect_rollout(env, policy, horizon=200)
             ppo_update(policy, optimizer, rollout)
+            # Sync GPU periodically to prevent command queue buildup
+            if (inner_iter + 1) % 5 == 0:
+                wp.synchronize()
 
             # Evaluate and update stability gate
             mean_ret, std_ret = evaluate_policy(env, policy, n_episodes=3)
@@ -508,8 +538,12 @@ def pghc_codesign(
         old_L = parametric_model.L
         parametric_model.set_L(old_L + step)
 
+        # Synchronize GPU before rebuilding environment
+        wp.synchronize()
+
         # Rebuild environment with new L
         env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
+        wp.synchronize()
 
         print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
         history["L"].append(parametric_model.L)
