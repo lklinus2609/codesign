@@ -217,15 +217,16 @@ class CartPolePolicy(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, act_dim),
         )
-        # Higher initial std for more exploration (exp(0.5) ≈ 1.65)
-        self.log_std = nn.Parameter(torch.ones(act_dim) * 0.5)
+        # Moderate exploration (exp(-0.5) ≈ 0.6)
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
 
-        # Small random init for final layer (not zero - need some signal)
+        # Small random init for final layer
         nn.init.uniform_(self.net[-1].weight, -0.1, 0.1)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
-        return self.net(x)
+        # Use tanh to bound output to [-1, 1] - gives proper gradients
+        return torch.tanh(self.net(x))
 
     def get_action(self, obs, deterministic=False):
         """Get action for single observation."""

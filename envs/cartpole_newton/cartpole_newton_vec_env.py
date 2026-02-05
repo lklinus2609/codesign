@@ -441,8 +441,8 @@ class CartPoleNewtonVecEnv:
         actions = np.asarray(actions, dtype=np.float32).flatten()
         assert len(actions) == self.num_worlds
 
-        # Clip actions
-        forces = np.clip(actions * self.force_max, -self.force_max, self.force_max)
+        # Scale actions to forces (actions should already be in [-1, 1] from tanh policy)
+        forces = actions * self.force_max
 
         # Apply forces to control.joint_f ONCE before substep loop (like official Newton tests)
         # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
