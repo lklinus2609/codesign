@@ -24,10 +24,10 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
-from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton, NEWTON_AVAILABLE
-if NEWTON_AVAILABLE:
-    import warp as wp
-    import newton
+import warp as wp
+import newton
+
+from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 
 
 def record_episode_video(env, policy, max_steps=200, width=640, height=480):
