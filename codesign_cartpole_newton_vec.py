@@ -371,7 +371,10 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
             break
 
     # Return stats from first n completed episodes
-    return np.mean(episode_returns[:n_episodes]), np.std(episode_returns[:n_episodes])
+    mean_return = np.mean(episode_returns[:n_episodes])
+    std_return = np.std(episode_returns[:n_episodes])
+    mean_length = np.mean(episode_lengths[:n_episodes])
+    return mean_return, std_return, mean_length
 
 
 def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_rollouts=3):
@@ -481,7 +484,7 @@ def pghc_codesign_vec(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
-    num_worlds=256,
+    num_worlds=4096,
     use_wandb=False,
     video_every_n_iters=100,
 ):
@@ -585,7 +588,7 @@ def pghc_codesign_vec(
             ppo_update_vec(policy, optimizer, rollout)
 
             # Evaluate
-            mean_ret, std_ret = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
+            mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
             stability_gate.update(mean_ret)
             stats = stability_gate.get_stats()
 
@@ -595,6 +598,7 @@ def pghc_codesign_vec(
                 wandb.log({
                     "inner/return_mean": mean_ret,
                     "inner/return_std": std_ret,
+                    "inner/episode_length": mean_len,
                     "inner/relative_change": stats["relative_change"],
                     "inner/iteration": inner_iter + 1,
                     "design/L": parametric_model.L,
@@ -606,10 +610,8 @@ def pghc_codesign_vec(
                 test_obs = torch.FloatTensor(env.reset())
                 with torch.no_grad():
                     test_actions = policy.get_actions_batch(test_obs)
-                print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, "
-                      f"rel_change={stats['relative_change']:.3f} "
-                      f"actions=[{test_actions.min():.2f}, {test_actions.max():.2f}] "
-                      f"({samples_per_iter} samples/iter)")
+                print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, len={mean_len:.0f}, "
+                      f"actions=[{test_actions.min():.2f}, {test_actions.max():.2f}]")
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
@@ -633,10 +635,10 @@ def pghc_codesign_vec(
                 break
 
         # Final evaluation
-        mean_return, std_return = evaluate_policy_vec(env, policy, n_episodes=10)
+        mean_return, std_return, mean_length = evaluate_policy_vec(env, policy, n_episodes=10)
         history["returns"].append(mean_return)
         history["inner_iterations"].append(stability_gate.iteration)
-        print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}")
+        print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}, Length = {mean_length:.0f}")
 
         # =============================================
         # OUTER LOOP: Compute design gradient
@@ -725,7 +727,7 @@ if __name__ == "__main__":
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--num-worlds", type=int, default=256, help="Number of parallel worlds")
+    parser.add_argument("--num-worlds", type=int, default=4096, help="Number of parallel worlds")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
