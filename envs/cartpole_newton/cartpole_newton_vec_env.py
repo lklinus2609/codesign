@@ -129,8 +129,8 @@ def check_termination_kernel(
 
 @wp.kernel
 def apply_forces_kernel(
-    forces: wp.array(dtype=float),
-    joint_f: wp.array(dtype=float),
+    forces: wp.array(dtype=wp.float32),
+    joint_f: wp.array(dtype=wp.float32),
     num_dofs_per_world: int,
 ):
     """Apply cart forces to joint_f array for all worlds.
@@ -355,8 +355,8 @@ class CartPoleNewtonVecEnv:
 
     def _alloc_buffers(self):
         """Allocate GPU buffers for parallel computation."""
-        self.forces_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
-        self.rewards_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
+        self.forces_wp = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
+        self.rewards_wp = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
         self.terminated_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
 
     def reset(self) -> np.ndarray:
