@@ -130,18 +130,23 @@ def check_termination_kernel(
 @wp.kernel
 def apply_forces_kernel(
     forces: wp.array(dtype=float),
-    body_f: wp.array(dtype=wp.spatial_vector),
-    num_bodies_per_world: int,
+    joint_f: wp.array(dtype=float),
+    num_dofs_per_world: int,
 ):
-    """Apply cart forces to body_f array for all worlds."""
+    """Apply cart forces to joint_f array for all worlds.
+
+    Uses control.joint_f which directly applies generalized forces to joint DOFs.
+    For prismatic joint (cart), this is a force in the joint axis direction.
+    """
     tid = wp.tid()
 
-    # Cart is body 0 in each world
-    cart_body_idx = tid * num_bodies_per_world
+    # Cart is DOF 0 in each world (prismatic joint)
+    # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
+    cart_dof_idx = tid * num_dofs_per_world
 
-    # Force in x direction (spatial vector: [torque, force])
+    # Apply force to cart prismatic joint
     force = forces[tid]
-    body_f[cart_body_idx] = wp.spatial_vector(0.0, 0.0, 0.0, force, 0.0, 0.0)
+    joint_f[cart_dof_idx] = force
 
 
 @wp.kernel
@@ -332,6 +337,7 @@ class CartPoleNewtonVecEnv:
         # Store counts per world
         self.num_bodies_per_world = self.model.body_count // self.num_worlds
         self.num_joints_per_world = 2  # x and theta
+        self.num_dofs_per_world = 2  # prismatic (x) + revolute (theta)
 
         # Use MuJoCo solver (reduced coordinates - updates joint_q directly)
         # Set nconmax=0 to disable collision contacts (cart-pole doesn't need collisions)
@@ -442,13 +448,14 @@ class CartPoleNewtonVecEnv:
 
         # Simulate substeps
         for _ in range(self.num_substeps):
-            self.state_0.clear_forces()
+            # Clear and apply control forces via joint_f (generalized joint forces)
+            self.control.joint_f.zero_()
 
-            # Apply cart forces
+            # Apply cart forces to joint_f (DOF 0 = cart prismatic joint)
             wp.launch(
                 apply_forces_kernel,
                 dim=self.num_worlds,
-                inputs=[self.forces_wp, self.state_0.body_f, self.num_bodies_per_world],
+                inputs=[self.forces_wp, self.control.joint_f, self.num_dofs_per_world],
                 device=self.device,
             )
 
