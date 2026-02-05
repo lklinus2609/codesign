@@ -501,10 +501,19 @@ class CartPoleNewtonVecEnv:
         # Check for NaN/Inf (physics instability)
         invalid = np.isnan(x) | np.isinf(x) | np.isnan(theta) | np.isinf(theta)
         if np.any(invalid):
+            num_invalid = np.sum(invalid)
+            print(f"[DEBUG] {num_invalid}/{self.num_worlds} worlds have invalid state!")
             x = np.where(invalid, 0.0, x)
             theta = np.where(invalid, np.pi, theta)
             x_dot = np.where(invalid, 0.0, x_dot)
             theta_dot = np.where(invalid, 0.0, theta_dot)
+
+        # Debug: check if x is out of bounds on first few steps
+        if self._step_count <= 3:
+            out_of_bounds = np.abs(x) > self.x_limit
+            print(f"[DEBUG] step={self._step_count}: x in [{x.min():.2f}, {x.max():.2f}], "
+                  f"theta in [{theta.min():.2f}, {theta.max():.2f}], "
+                  f"out_of_bounds={np.sum(out_of_bounds)}/{self.num_worlds}")
 
         # IsaacLab-style reward structure:
         # (1) Alive bonus: +1.0 per step
