@@ -34,72 +34,124 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 
 
+class PersistentVideoRecorder:
+    """
+    Persistent video recorder that reuses the same OpenGL viewer across recordings.
+
+    Key insight from Newton examples: Creating/closing ViewerGL repeatedly corrupts
+    OpenGL state. Instead, create once and reuse.
+    """
+
+    def __init__(self, width=640, height=480):
+        self._width = width
+        self._height = height
+        self._viewer = None
+        self._initialized = False
+
+    def _ensure_viewer(self):
+        """Create viewer on first use only."""
+        if self._initialized:
+            return self._viewer is not None
+
+        self._initialized = True
+        try:
+            self._viewer = newton.viewer.ViewerGL(headless=True, width=self._width, height=self._height)
+            print(f"    [video] Created persistent headless viewer {self._width}x{self._height}")
+            return True
+        except Exception as e:
+            print(f"    [video] ViewerGL not available: {e}")
+            self._viewer = None
+            return False
+
+    def record_episode(self, env, policy, max_steps=200):
+        """Record a video of one episode."""
+        if not self._ensure_viewer():
+            return None
+
+        # Force GPU sync
+        wp.synchronize()
+
+        frames = []
+        obs = env.reset()
+        sim_time = 0.0
+
+        # Compute forward kinematics to populate body positions for rendering
+        newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
+        wp.synchronize()
+
+        # Update viewer with model (key: reuse viewer, update model)
+        self._viewer.set_model(env.model)
+        self._viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
+
+        # Warm-up render after model change
+        self._viewer.begin_frame(0.0)
+        self._viewer.log_state(env.state_0)
+        self._viewer.end_frame()
+        _ = self._viewer.get_frame()  # Discard warm-up frame
+        wp.synchronize()
+
+        for step in range(max_steps):
+            # Get action
+            action = policy.get_action(obs, deterministic=True)
+            force = float(action[0]) * env.force_max
+
+            # Render frame
+            self._viewer.begin_frame(sim_time)
+            self._viewer.log_state(env.state_0)
+            self._viewer.end_frame()
+
+            # get_frame returns wp.array on GPU, convert to numpy
+            frame_wp = self._viewer.get_frame()
+            if frame_wp is not None:
+                frame = frame_wp.numpy()
+                frames.append(frame)
+
+            # Step
+            obs, reward, terminated, truncated, _ = env.step(force)
+            sim_time += env.dt
+
+            if terminated or truncated:
+                # Add a few more frames showing final state
+                for _ in range(10):
+                    self._viewer.begin_frame(sim_time)
+                    self._viewer.log_state(env.state_0)
+                    self._viewer.end_frame()
+                    frame_wp = self._viewer.get_frame()
+                    if frame_wp is not None:
+                        frames.append(frame_wp.numpy())
+                break
+
+        wp.synchronize()
+
+        if len(frames) == 0:
+            return None
+
+        return np.stack(frames)
+
+    def close(self):
+        """Close the viewer (call at end of training)."""
+        if self._viewer is not None:
+            self._viewer.close()
+            self._viewer = None
+            self._initialized = False
+
+
+# Global video recorder instance (singleton pattern)
+_video_recorder = None
+
+
+def get_video_recorder(width=640, height=480):
+    """Get or create the persistent video recorder."""
+    global _video_recorder
+    if _video_recorder is None:
+        _video_recorder = PersistentVideoRecorder(width, height)
+    return _video_recorder
+
+
 def record_episode_video(env, policy, max_steps=200, width=640, height=480):
-    """Record a video of one episode using Newton's ViewerGL."""
-    # Synchronize GPU before creating viewer
-    wp.synchronize()
-
-    try:
-        viewer = newton.viewer.ViewerGL(headless=True, width=width, height=height)
-    except Exception as e:
-        print(f"    [video] ViewerGL not available: {e}")
-        return None
-
-    frames = []
-    obs = env.reset()
-    sim_time = 0.0
-
-    # Compute forward kinematics to populate body positions for rendering
-    newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
-    wp.synchronize()
-
-    # Set up viewer with model
-    viewer.set_model(env.model)
-    viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
-
-    # Warm-up render to initialize OpenGL state
-    viewer.begin_frame(0.0)
-    viewer.log_state(env.state_0)
-    viewer.end_frame()
-    _ = viewer.get_frame()  # Discard first frame (may be incomplete)
-
-    for step in range(max_steps):
-        # Get action
-        action = policy.get_action(obs, deterministic=True)
-        force = float(action[0]) * env.force_max
-
-        # Render frame
-        viewer.begin_frame(sim_time)
-        viewer.log_state(env.state_0)
-        viewer.end_frame()
-
-        # get_frame returns wp.array on GPU, convert to numpy
-        frame_wp = viewer.get_frame()
-        if frame_wp is not None:
-            frame = frame_wp.numpy()
-            frames.append(frame)
-
-        # Step
-        obs, reward, terminated, truncated, _ = env.step(force)
-        sim_time += env.dt
-
-        if terminated or truncated:
-            # Add a few more frames showing final state
-            for _ in range(10):
-                viewer.begin_frame(sim_time)
-                viewer.log_state(env.state_0)
-                viewer.end_frame()
-                frame_wp = viewer.get_frame()
-                if frame_wp is not None:
-                    frames.append(frame_wp.numpy())
-            break
-
-    viewer.close()
-
-    if len(frames) == 0:
-        return None
-
-    return np.stack(frames)
+    """Record a video of one episode using persistent ViewerGL."""
+    recorder = get_video_recorder(width, height)
+    return recorder.record_episode(env, policy, max_steps)
 
 
 class CartPolePolicy(nn.Module):
@@ -606,6 +658,12 @@ def pghc_codesign(
             "summary/total_inner_iterations": sum(history["inner_iterations"]),
         })
         wandb.finish()
+
+    # Clean up persistent video recorder
+    global _video_recorder
+    if _video_recorder is not None:
+        _video_recorder.close()
+        _video_recorder = None
 
     return history, policy, parametric_model
 
