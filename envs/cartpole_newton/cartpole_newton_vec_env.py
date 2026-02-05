@@ -402,18 +402,24 @@ class CartPoleNewtonVecEnv:
         # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
         # MuJoCo uses its own mjw_data.qpos/qvel, not Newton's State
         mjw_data = self.solver.mjw_data
-        qpos = mjw_data.qpos.numpy()  # Shape: [nworld, nq]
-        qvel = mjw_data.qvel.numpy()  # Shape: [nworld, nv]
+
+        # Create new arrays for MuJoCo (avoid modifying in-place)
+        nq = 2  # cart_x, pole_theta
+        nv = 2  # cart_x_dot, pole_theta_dot
+        qpos_new = np.zeros((self.num_worlds, nq), dtype=np.float32)
+        qvel_new = np.zeros((self.num_worlds, nv), dtype=np.float32)
 
         for i in range(self.num_worlds):
-            # MuJoCo qpos/qvel layout per world: [cart_x, pole_theta]
-            qpos[i, 0] = joint_q[i * self.num_joints_per_world]      # cart x
-            qpos[i, 1] = joint_q[i * self.num_joints_per_world + 1]  # pole theta
-            qvel[i, 0] = joint_qd[i * self.num_joints_per_world]     # cart x_dot
-            qvel[i, 1] = joint_qd[i * self.num_joints_per_world + 1] # pole theta_dot
+            qpos_new[i, 0] = joint_q[i * self.num_joints_per_world]
+            qpos_new[i, 1] = joint_q[i * self.num_joints_per_world + 1]
+            qvel_new[i, 0] = joint_qd[i * self.num_joints_per_world]
+            qvel_new[i, 1] = joint_qd[i * self.num_joints_per_world + 1]
 
-        mjw_data.qpos.assign(qpos)
-        mjw_data.qvel.assign(qvel)
+        # Use warp array from numpy
+        qpos_wp = wp.array(qpos_new, dtype=wp.float32, device=self.device)
+        qvel_wp = wp.array(qvel_new, dtype=wp.float32, device=self.device)
+        wp.copy(mjw_data.qpos, qpos_wp)
+        wp.copy(mjw_data.qvel, qvel_wp)
         wp.synchronize()
 
         # Debug: check initial state
@@ -638,8 +644,10 @@ class CartPoleNewtonVecEnv:
 
         # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
         mjw_data = self.solver.mjw_data
-        qpos = mjw_data.qpos.numpy()
-        qvel = mjw_data.qvel.numpy()
+
+        # Get current MuJoCo state
+        qpos = mjw_data.qpos.numpy().copy()
+        qvel = mjw_data.qvel.numpy().copy()
 
         for i in range(self.num_worlds):
             if reset_mask[i]:
@@ -648,8 +656,11 @@ class CartPoleNewtonVecEnv:
                 qvel[i, 0] = joint_qd[i * self.num_joints_per_world]
                 qvel[i, 1] = joint_qd[i * self.num_joints_per_world + 1]
 
-        mjw_data.qpos.assign(qpos)
-        mjw_data.qvel.assign(qvel)
+        # Use warp array from numpy
+        qpos_wp = wp.array(qpos.astype(np.float32), dtype=wp.float32, device=self.device)
+        qvel_wp = wp.array(qvel.astype(np.float32), dtype=wp.float32, device=self.device)
+        wp.copy(mjw_data.qpos, qpos_wp)
+        wp.copy(mjw_data.qvel, qvel_wp)
         wp.synchronize()
 
         # Debug: verify reset worked
