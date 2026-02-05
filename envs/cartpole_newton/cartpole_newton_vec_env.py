@@ -357,7 +357,8 @@ class CartPoleNewtonVecEnv:
         self.contacts = None
 
         # Create ArticulationView for batch operations (like Newton's official examples)
-        self.cartpoles = ArticulationView(self.model, "*/cartpole", verbose=False)
+        # Use the key we set in add_articulation()
+        self.cartpoles = ArticulationView(self.model, "cartpole", verbose=True)
 
         # Forward kinematics
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
