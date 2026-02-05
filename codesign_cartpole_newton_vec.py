@@ -27,6 +27,77 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, ParametricCartPoleNewton
 
 
+def record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
+    """Record a video of one episode using Newton's ViewerGL."""
+    # Synchronize GPU before creating viewer
+    wp.synchronize()
+
+    try:
+        viewer = newton.viewer.ViewerGL(headless=True, width=width, height=height)
+    except Exception as e:
+        print(f"    [video] ViewerGL not available: {e}")
+        return None
+
+    # Create single environment for video
+    env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
+
+    frames = []
+    obs = env.reset()
+    sim_time = 0.0
+
+    # Compute forward kinematics to populate body positions for rendering
+    newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
+    wp.synchronize()
+
+    # Set up viewer with model
+    viewer.set_model(env.model)
+    viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
+
+    # Warm-up render to initialize OpenGL state
+    viewer.begin_frame(0.0)
+    viewer.log_state(env.state_0)
+    viewer.end_frame()
+    _ = viewer.get_frame()  # Discard first frame
+
+    for step in range(max_steps):
+        # Get action
+        action = policy.get_action(obs, deterministic=True)
+        force = float(action[0]) * env.force_max
+
+        # Render frame
+        viewer.begin_frame(sim_time)
+        viewer.log_state(env.state_0)
+        viewer.end_frame()
+
+        # get_frame returns wp.array on GPU, convert to numpy
+        frame_wp = viewer.get_frame()
+        if frame_wp is not None:
+            frame = frame_wp.numpy()
+            frames.append(frame)
+
+        # Step
+        obs, reward, terminated, truncated, _ = env.step(force)
+        sim_time += env.dt
+
+        if terminated or truncated:
+            # Add a few more frames showing final state
+            for _ in range(10):
+                viewer.begin_frame(sim_time)
+                viewer.log_state(env.state_0)
+                viewer.end_frame()
+                frame_wp = viewer.get_frame()
+                if frame_wp is not None:
+                    frames.append(frame_wp.numpy())
+            break
+
+    viewer.close()
+
+    if len(frames) == 0:
+        return None
+
+    return np.stack(frames)
+
+
 class CartPolePolicy(nn.Module):
     """Policy network for cart-pole (supports batched inference)."""
 
@@ -288,6 +359,7 @@ def pghc_codesign_vec(
     ctrl_cost_weight=0.5,
     num_worlds=64,
     use_wandb=False,
+    video_every_n_iters=10,
 ):
     """
     PGHC Co-Design using vectorized environments for fast training.
@@ -350,6 +422,13 @@ def pghc_codesign_vec(
     print(f"  Control cost weight: {ctrl_cost_weight}")
     print(f"  Stability threshold: {stability_threshold:.1%}")
 
+    # Record initial video (untrained policy)
+    if use_wandb and video_every_n_iters > 0:
+        print("\n  [wandb] Recording initial policy video...")
+        video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200)
+        if video is not None:
+            wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4")}, step=0)
+
     for outer_iter in range(n_outer_iterations):
         print(f"\n{'='*60}")
         print(f"Outer Iteration {outer_iter + 1}/{n_outer_iterations}")
@@ -394,6 +473,19 @@ def pghc_codesign_vec(
                 print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, "
                       f"rel_change={stats['relative_change']:.3f} "
                       f"({samples_per_iter} samples/iter)")
+
+            # Record video every N inner iterations
+            if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
+                print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
+                video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200)
+                if video is not None:
+                    wandb.log({
+                        "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                        "video/inner_iter": inner_iter + 1,
+                        "video/outer_iter": outer_iter + 1,
+                        "video/L": parametric_model.L,
+                        "video/return": mean_ret,
+                    }, step=global_step)
 
             if stability_gate.is_converged():
                 print(f"    CONVERGED at iter {inner_iter + 1}")
@@ -466,6 +558,16 @@ def pghc_codesign_vec(
     print(f"  ({num_worlds} worlds x 200 steps x {sum(history['inner_iterations'])} iters)")
 
     if use_wandb:
+        # Record final video
+        if video_every_n_iters > 0:
+            print("\n  [wandb] Recording final policy video...")
+            video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=300)
+            if video is not None:
+                wandb.log({
+                    "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                    "video/L_final": parametric_model.L,
+                })
+
         wandb.log({
             "summary/L_initial": history["L"][0],
             "summary/L_final": history["L"][-1],
@@ -485,6 +587,7 @@ if __name__ == "__main__":
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
     parser.add_argument("--num-worlds", type=int, default=64, help="Number of parallel worlds")
+    parser.add_argument("--video-every", type=int, default=10, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
     history, policy, model = pghc_codesign_vec(
@@ -498,4 +601,5 @@ if __name__ == "__main__":
         ctrl_cost_weight=args.ctrl_cost,
         num_worlds=args.num_worlds,
         use_wandb=args.wandb,
+        video_every_n_iters=args.video_every,
     )
