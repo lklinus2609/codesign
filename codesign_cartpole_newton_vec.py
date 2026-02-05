@@ -27,9 +27,17 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, ParametricCartPoleNewton
 
 
-def record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
+def record_episode_video(L_value, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
     """Record a video of one episode using Newton's ViewerGL."""
-    # Synchronize GPU before creating viewer
+    # Force GPU sync and garbage collection to clear any stale state
+    wp.synchronize()
+    import gc
+    gc.collect()
+    wp.synchronize()
+
+    # Create FRESH parametric model and environment for video (avoid shared state)
+    fresh_parametric = ParametricCartPoleNewton(L_init=L_value)
+    env = CartPoleNewtonEnv(parametric_model=fresh_parametric, ctrl_cost_weight=ctrl_cost_weight)
     wp.synchronize()
 
     try:
@@ -37,9 +45,6 @@ def record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=2
     except Exception as e:
         print(f"    [video] ViewerGL not available: {e}")
         return None
-
-    # Create single environment for video
-    env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
 
     frames = []
     obs = env.reset()
@@ -425,7 +430,7 @@ def pghc_codesign_vec(
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
         print("\n  [wandb] Recording initial policy video...")
-        video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200)
+        video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=200)
         if video is not None:
             wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4")}, step=0)
 
@@ -477,7 +482,7 @@ def pghc_codesign_vec(
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
                 print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
-                video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=200)
+                video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=200)
                 if video is not None:
                     wandb.log({
                         "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
@@ -561,7 +566,7 @@ def pghc_codesign_vec(
         # Record final video
         if video_every_n_iters > 0:
             print("\n  [wandb] Recording final policy video...")
-            video = record_episode_video(parametric_model, policy, ctrl_cost_weight, max_steps=300)
+            video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=300)
             if video is not None:
                 wandb.log({
                     "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
