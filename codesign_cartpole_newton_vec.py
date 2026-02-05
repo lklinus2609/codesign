@@ -32,7 +32,7 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 
-def _record_video_subprocess(L_value, policy_state_dict, ctrl_cost_weight, max_steps, width, height):
+def _record_video_subprocess(L_value, policy_state_dict, max_steps, width, height):
     """
     Record video in a subprocess to get a fresh OpenGL context.
 
@@ -49,7 +49,6 @@ def _record_video_subprocess(L_value, policy_state_dict, ctrl_cost_weight, max_s
         pickle.dump({
             'state_dict': policy_state_dict,
             'L_value': L_value,
-            'ctrl_cost_weight': ctrl_cost_weight,
             'max_steps': max_steps,
             'width': width,
             'height': height,
@@ -93,7 +92,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, ctrl_cost_weight=config["ctrl_cost_weight"])
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -190,7 +189,7 @@ if frames:
     return video
 
 
-def record_episode_video(L_value, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
+def record_episode_video(L_value, policy, max_steps=200, width=640, height=480):
     """
     Record a video of one episode.
 
@@ -201,7 +200,7 @@ def record_episode_video(L_value, policy, ctrl_cost_weight, max_steps=200, width
     policy_state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
 
     return _record_video_subprocess(
-        L_value, policy_state_dict, ctrl_cost_weight, max_steps, width, height
+        L_value, policy_state_dict, max_steps, width, height
     )
 
 
@@ -238,6 +237,8 @@ class CartPolePolicy(nn.Module):
                 return mean.numpy()
             std = torch.exp(self.log_std)
             action = mean + std * torch.randn_like(mean)
+            # Clip to [-1, 1] after adding noise
+            action = torch.clamp(action, -1.0, 1.0)
             return action.numpy()
 
     def get_actions_batch(self, obs_batch, deterministic=False):
@@ -250,6 +251,8 @@ class CartPolePolicy(nn.Module):
                 return mean.numpy()
             std = torch.exp(self.log_std)
             actions = mean + std * torch.randn_like(mean)
+            # Clip to [-1, 1] after adding noise
+            actions = torch.clamp(actions, -1.0, 1.0)
             return actions.numpy()
 
     def get_action_and_log_prob_batch(self, obs_batch):
@@ -257,8 +260,10 @@ class CartPolePolicy(nn.Module):
         mean = self.forward(obs_batch)
         std = torch.exp(self.log_std)
         dist = torch.distributions.Normal(mean, std)
-        actions = dist.rsample()
-        log_probs = dist.log_prob(actions).sum(-1)
+        actions_raw = dist.rsample()
+        log_probs = dist.log_prob(actions_raw).sum(-1)
+        # Clip actions to [-1, 1]
+        actions = torch.clamp(actions_raw, -1.0, 1.0)
         return actions, log_probs
 
 
@@ -369,14 +374,20 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
     return np.mean(episode_returns[:n_episodes]), np.std(episode_returns[:n_episodes])
 
 
-def compute_design_gradient(parametric_model, policy, ctrl_cost_weight, eps=0.02, horizon=200, n_rollouts=3):
+def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_rollouts=3):
     """Compute dReturn/dL using finite differences with vec env (num_worlds=1)."""
 
     def eval_at_L(L_val):
         """Evaluate mean return at a specific L value."""
         parametric_model.set_L(L_val)
         # Create vec env with single world for gradient evaluation
-        env = CartPoleNewtonVecEnv(parametric_model=parametric_model, num_worlds=1, ctrl_cost_weight=ctrl_cost_weight)
+        env = CartPoleNewtonVecEnv(
+            parametric_model=parametric_model,
+            num_worlds=1,
+            force_max=100.0,
+            x_limit=3.0,
+            start_near_upright=True,
+        )
 
         returns = []
         for _ in range(n_rollouts):
@@ -470,10 +481,9 @@ def pghc_codesign_vec(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
-    ctrl_cost_weight=0.01,  # Low for swing-up
-    num_worlds=256,  # mujoco_warp unstable with high counts
+    num_worlds=256,
     use_wandb=False,
-    video_every_n_iters=100,  # Reduced frequency - video recording blocks training
+    video_every_n_iters=100,
 ):
     """
     PGHC Co-Design using vectorized environments for fast training.
@@ -494,7 +504,8 @@ def pghc_codesign_vec(
                 "stability_threshold": stability_threshold,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
-                "ctrl_cost_weight": ctrl_cost_weight,
+                "force_max": 100.0,
+                "x_limit": 3.0,
             },
         )
         print(f"  [wandb] Logging enabled")
@@ -509,7 +520,9 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        ctrl_cost_weight=ctrl_cost_weight,
+        force_max=100.0,  # IsaacLab uses 100
+        x_limit=3.0,  # IsaacLab uses (-3, 3)
+        start_near_upright=True,  # Balance task first (like IsaacLab)
     )
 
     policy = CartPolePolicy()
@@ -534,14 +547,16 @@ def pghc_codesign_vec(
     print(f"\nConfiguration:")
     print(f"  Num parallel worlds: {num_worlds}")
     print(f"  Initial L: {parametric_model.L:.3f} m")
-    print(f"  Control cost weight: {ctrl_cost_weight}")
+    print(f"  Force max: {env.force_max} N")
+    print(f"  Cart bounds: (-{env.x_limit}, {env.x_limit})")
+    print(f"  Start near upright: {env.start_near_upright}")
     print(f"  Stability threshold: {stability_threshold:.1%}")
     print(f"  Outer loop starts after: {outer_loop_start_iter} inner iterations")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
         print("\n  [wandb] Recording initial policy video...")
-        video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=200)
+        video = record_episode_video(parametric_model.L, policy, max_steps=200)
         if video is not None:
             wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4")}, step=0)
 
@@ -599,7 +614,7 @@ def pghc_codesign_vec(
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
                 print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
-                video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=200)
+                video = record_episode_video(parametric_model.L, policy, max_steps=200)
                 if video is not None:
                     wandb.log({
                         "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
@@ -630,7 +645,7 @@ def pghc_codesign_vec(
         wp.synchronize()
 
         _, gradient = compute_design_gradient(
-            parametric_model, policy, ctrl_cost_weight,
+            parametric_model, policy,
             eps=0.02, horizon=200, n_rollouts=3
         )
         history["gradients"].append(gradient)
@@ -649,7 +664,9 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            ctrl_cost_weight=ctrl_cost_weight,
+            force_max=100.0,
+            x_limit=3.0,
+            start_near_upright=True,
         )
         wp.synchronize()
 
@@ -685,7 +702,7 @@ def pghc_codesign_vec(
         # Record final video
         if video_every_n_iters > 0:
             print("\n  [wandb] Recording final policy video...")
-            video = record_episode_video(parametric_model.L, policy, ctrl_cost_weight, max_steps=300)
+            video = record_episode_video(parametric_model.L, policy, max_steps=300)
             if video is not None:
                 wandb.log({
                     "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
@@ -708,7 +725,6 @@ if __name__ == "__main__":
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--ctrl-cost", type=float, default=0.01, help="Control cost weight")
     parser.add_argument("--num-worlds", type=int, default=256, help="Number of parallel worlds")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
@@ -720,7 +736,6 @@ if __name__ == "__main__":
         min_inner_iterations=15,
         design_lr=args.design_lr,
         initial_L=args.initial_L,
-        ctrl_cost_weight=args.ctrl_cost,
         num_worlds=args.num_worlds,
         use_wandb=args.wandb,
         video_every_n_iters=args.video_every,

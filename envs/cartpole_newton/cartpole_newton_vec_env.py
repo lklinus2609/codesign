@@ -217,10 +217,12 @@ class CartPoleNewtonVecEnv:
         num_worlds: int = 64,
         parametric_model: ParametricCartPoleNewton = None,
         dt: float = 0.02,
-        force_max: float = 15.0,  # 15N on 1kg = 15 m/s², enough for swing-up
+        force_max: float = 100.0,  # IsaacLab uses 100.0
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
-        ctrl_cost_weight: float = 0.01,  # Low for swing-up (needs big movements)
+        ctrl_cost_weight: float = 0.01,
+        x_limit: float = 3.0,  # IsaacLab uses (-3.0, 3.0)
+        start_near_upright: bool = True,  # Start with balance task first
         device: str = "cuda:0",
     ):
         if not NEWTON_AVAILABLE:
@@ -234,6 +236,8 @@ class CartPoleNewtonVecEnv:
         self.num_substeps = num_substeps
         self.sub_dt = dt / num_substeps
         self.ctrl_cost_weight = ctrl_cost_weight
+        self.x_limit = x_limit
+        self.start_near_upright = start_near_upright
 
         if parametric_model is None:
             self.parametric_model = ParametricCartPoleNewton()
@@ -291,15 +295,15 @@ class CartPoleNewtonVecEnv:
         pole_link = builder.add_link()
         builder.add_shape_capsule(pole_link, radius=pole_radius, half_height=L)
 
-        # Prismatic joint for cart
+        # Prismatic joint for cart (limits slightly beyond termination for physics)
         j0 = builder.add_joint_prismatic(
             parent=-1,
             child=cart_link,
             axis=wp.vec3(1.0, 0.0, 0.0),
             parent_xform=wp.transform(wp.vec3(0.0, 0.0, cart_height/2), wp.quat_identity()),
             child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
-            limit_lower=-2.4,
-            limit_upper=2.4,
+            limit_lower=-4.0,
+            limit_upper=4.0,
         )
 
         # Revolute joint for pole
@@ -313,10 +317,9 @@ class CartPoleNewtonVecEnv:
 
         builder.add_articulation([j0, j1], key="cartpole")
 
-        # Set initial joint positions BEFORE finalize (like the example)
-        # joint_q layout: [x, theta] for cart-pole
-        # Start pointing down (theta=π) for swing-up task
-        builder.joint_q[-2:] = [0.0, np.pi]  # x=0, theta=π (pointing down)
+        # Set initial joint positions BEFORE finalize
+        # These will be overwritten by reset() anyway
+        builder.joint_q[-2:] = [0.0, 0.0]  # x=0, theta=0 (upright)
 
         return builder
 
@@ -363,7 +366,6 @@ class CartPoleNewtonVecEnv:
         self.steps[:] = 0
         self._step_count = 0
 
-        # Initial state: pole pointing down (theta = π) for swing-up task
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -371,17 +373,25 @@ class CartPoleNewtonVecEnv:
             x_idx = i * self.num_joints_per_world
             theta_idx = i * self.num_joints_per_world + 1
 
-            # Cart at center, pole pointing down (theta = π) for swing-up
-            joint_q[x_idx] = 0.0
-            joint_q[theta_idx] = np.pi  # Pointing down, swing-up task
-            joint_qd[x_idx] = 0.0
-            joint_qd[theta_idx] = 0.0
+            if self.start_near_upright:
+                # IsaacLab style: random start near upright for BALANCE task
+                # Cart: random position in (-1, 1), velocity in (-0.5, 0.5)
+                # Pole: random angle in (-0.25π, 0.25π), velocity in (-0.25π, 0.25π)
+                joint_q[x_idx] = np.random.uniform(-1.0, 1.0)
+                joint_q[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                joint_qd[x_idx] = np.random.uniform(-0.5, 0.5)
+                joint_qd[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+            else:
+                # Swing-up task: pole starts pointing down
+                joint_q[x_idx] = 0.0
+                joint_q[theta_idx] = np.pi
+                joint_qd[x_idx] = 0.0
+                joint_qd[theta_idx] = 0.0
 
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
         # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
-        # MuJoCo solver reads/writes body_q, so we need this after changing joint_q
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         wp.synchronize()
 
@@ -485,32 +495,39 @@ class CartPoleNewtonVecEnv:
         # Compute rewards from observations
         theta = obs[:, 1]
         x = obs[:, 0]
+        x_dot = obs[:, 2]
+        theta_dot = obs[:, 3]
 
         # Check for NaN/Inf (physics instability)
         invalid = np.isnan(x) | np.isinf(x) | np.isnan(theta) | np.isinf(theta)
         if np.any(invalid):
-            # Clamp invalid values to prevent reward explosion
             x = np.where(invalid, 0.0, x)
             theta = np.where(invalid, np.pi, theta)
+            x_dot = np.where(invalid, 0.0, x_dot)
+            theta_dot = np.where(invalid, 0.0, theta_dot)
 
-        # Swing-up reward structure:
-        # 1. Survival bonus: +1 per step for staying in bounds
-        survival_bonus = 1.0
+        # IsaacLab-style reward structure:
+        # (1) Alive bonus: +1.0 per step
+        alive_reward = 1.0
 
-        # 2. Height reward: cos(theta) = -1 (down) to +1 (up)
-        height_reward = np.cos(theta)
+        # (2) Pole position: penalize angle from upright (theta=0)
+        # IsaacLab uses -1.0 * L2, we use cos which is similar
+        # cos(theta) = 1 at upright, -1 at down
+        pole_pos_reward = np.cos(theta)
 
-        # 3. Control cost: use actual applied forces
-        ctrl_cost = self.ctrl_cost_weight * (forces / self.force_max) ** 2
+        # (3) Cart velocity penalty (small) - IsaacLab uses -0.01 * L1
+        cart_vel_penalty = 0.01 * np.abs(x_dot)
 
-        # No position penalty during episode - cart needs freedom to swing
-        rewards = survival_bonus + height_reward - ctrl_cost
+        # (4) Pole angular velocity penalty (small) - IsaacLab uses -0.005 * L1
+        pole_vel_penalty = 0.005 * np.abs(theta_dot)
+
+        rewards = alive_reward + pole_pos_reward - cart_vel_penalty - pole_vel_penalty
 
         # Check termination (cart position limit or invalid state)
-        terminated = (np.abs(x) > 2.4) | invalid
+        terminated = (np.abs(x) > self.x_limit) | invalid
 
-        # Termination penalty - only penalty for going out of bounds
-        rewards[terminated] -= 5.0
+        # Termination penalty: -2.0 (same as IsaacLab)
+        rewards[terminated] -= 2.0
 
         # Check truncation (max steps)
         truncated = self.steps >= self.max_steps
@@ -532,7 +549,7 @@ class CartPoleNewtonVecEnv:
         return obs, rewards, dones, infos
 
     def _reset_worlds(self, reset_mask: np.ndarray):
-        """Reset specific worlds that terminated - pole starts pointing down."""
+        """Reset specific worlds that terminated."""
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -541,11 +558,18 @@ class CartPoleNewtonVecEnv:
                 x_idx = i * self.num_joints_per_world
                 theta_idx = i * self.num_joints_per_world + 1
 
-                # Cart at center, pole pointing down (theta = π) for swing-up
-                joint_q[x_idx] = 0.0
-                joint_q[theta_idx] = np.pi  # Pointing down, swing-up task
-                joint_qd[x_idx] = 0.0
-                joint_qd[theta_idx] = 0.0
+                if self.start_near_upright:
+                    # IsaacLab style: random start near upright
+                    joint_q[x_idx] = np.random.uniform(-1.0, 1.0)
+                    joint_q[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                    joint_qd[x_idx] = np.random.uniform(-0.5, 0.5)
+                    joint_qd[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                else:
+                    # Swing-up: pole starts pointing down
+                    joint_q[x_idx] = 0.0
+                    joint_q[theta_idx] = np.pi
+                    joint_qd[x_idx] = 0.0
+                    joint_qd[theta_idx] = 0.0
 
                 self.steps[i] = 0
 
