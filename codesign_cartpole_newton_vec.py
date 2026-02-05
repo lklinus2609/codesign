@@ -457,7 +457,6 @@ class StabilityGate:
 
 def pghc_codesign_vec(
     n_outer_iterations=15,
-    max_inner_iterations=100,
     stability_window=10,
     stability_threshold=0.01,
     min_inner_iterations=20,
@@ -555,7 +554,8 @@ def pghc_codesign_vec(
         print(f"\n  [Inner Loop] Training PPO ({num_worlds} parallel envs)...")
         stability_gate.reset()
 
-        for inner_iter in range(max_inner_iterations):
+        inner_iter = 0
+        while True:
             # Collect rollout from all worlds
             rollout = collect_rollout_vec(env, policy, horizon=200)
             ppo_update_vec(policy, optimizer, rollout)
@@ -598,8 +598,8 @@ def pghc_codesign_vec(
             if stability_gate.is_converged():
                 print(f"    CONVERGED at iter {inner_iter + 1}")
                 break
-        else:
-            print(f"    MAX ITERATIONS reached")
+
+            inner_iter += 1
 
         # Final evaluation
         mean_return, std_return = evaluate_policy_vec(env, policy, n_episodes=10)
@@ -690,7 +690,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PGHC Co-Design (Vectorized)")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
-    parser.add_argument("--max-inner-iters", type=int, default=50, help="Max inner iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
@@ -700,7 +699,6 @@ if __name__ == "__main__":
 
     history, policy, model = pghc_codesign_vec(
         n_outer_iterations=args.outer_iters,
-        max_inner_iterations=args.max_inner_iters,
         stability_window=10,
         stability_threshold=0.01,
         min_inner_iterations=15,
