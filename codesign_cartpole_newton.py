@@ -306,7 +306,7 @@ class StabilityGate:
     (return has plateaued), satisfying the Envelope Theorem assumption.
     """
 
-    def __init__(self, window_size=10, threshold=0.05, min_iterations=20):
+    def __init__(self, window_size=10, threshold=0.01, min_iterations=20):
         """
         Args:
             window_size: Number of recent returns to track
@@ -367,7 +367,7 @@ def pghc_codesign(
     n_outer_iterations=15,
     max_inner_iterations=100,
     stability_window=10,
-    stability_threshold=0.05,
+    stability_threshold=0.01,
     min_inner_iterations=20,
     design_lr=0.02,
     max_step=0.1,
@@ -625,7 +625,7 @@ if __name__ == "__main__":
         n_outer_iterations=args.outer_iters,
         max_inner_iterations=args.max_inner_iters,
         stability_window=10,
-        stability_threshold=0.05,
+        stability_threshold=0.01,
         min_inner_iterations=20,
         design_lr=args.design_lr,
         initial_L=args.initial_L,
