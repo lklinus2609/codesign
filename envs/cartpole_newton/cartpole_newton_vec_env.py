@@ -217,7 +217,7 @@ class CartPoleNewtonVecEnv:
         num_worlds: int = 64,
         parametric_model: ParametricCartPoleNewton = None,
         dt: float = 0.02,
-        force_max: float = 10.0,
+        force_max: float = 3.0,  # Reduced from 10 for stable learning (3 m/s² on 1kg cart)
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
         ctrl_cost_weight: float = 0.01,  # Low for swing-up (needs big movements)
@@ -340,9 +340,8 @@ class CartPoleNewtonVecEnv:
         self.num_dofs_per_world = 2  # prismatic (x) + revolute (theta)
 
         # Use MuJoCo solver (reduced coordinates - updates joint_q directly)
-        # Set nconmax=0 to disable collision contacts (cart-pole doesn't need collisions)
-        # Keep njmax default - we need joint constraints for the articulation
-        self.solver = newton.solvers.SolverMuJoCo(self.model, nconmax=0)
+        # disable_contacts=True since cart-pole doesn't need collisions
+        self.solver = newton.solvers.SolverMuJoCo(self.model, disable_contacts=True)
 
         # Allocate states
         self.state_0 = self.model.state()
