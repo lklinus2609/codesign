@@ -443,21 +443,16 @@ class CartPoleNewtonVecEnv:
 
         # Clip actions
         forces = np.clip(actions * self.force_max, -self.force_max, self.force_max)
-        self.forces_wp.assign(forces)
 
-        # Simulate substeps
+        # Apply forces to control.joint_f ONCE before substep loop (like official Newton tests)
+        # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
+        joint_f = np.zeros(self.num_worlds * self.num_dofs_per_world, dtype=np.float32)
+        for i in range(self.num_worlds):
+            joint_f[i * self.num_dofs_per_world] = forces[i]  # Cart DOF only
+        self.control.joint_f.assign(joint_f)
+
+        # Simulate substeps (control stays constant)
         for _ in range(self.num_substeps):
-            # Clear and apply control forces via joint_f (generalized joint forces)
-            self.control.joint_f.zero_()
-
-            # Apply cart forces to joint_f (DOF 0 = cart prismatic joint)
-            wp.launch(
-                apply_forces_kernel,
-                dim=self.num_worlds,
-                inputs=[self.forces_wp, self.control.joint_f, self.num_dofs_per_world],
-                device=self.device,
-            )
-
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 

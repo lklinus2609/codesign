@@ -219,6 +219,11 @@ class CartPolePolicy(nn.Module):
         )
         self.log_std = nn.Parameter(torch.zeros(act_dim))
 
+        # Zero-init final layer for unbiased initial actions
+        # This is standard practice in RL to ensure initial policy is centered
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+
     def forward(self, x):
         return self.net(x)
 
