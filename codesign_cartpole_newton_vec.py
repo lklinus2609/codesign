@@ -269,6 +269,8 @@ class CartPolePolicy(nn.Module):
 
 def collect_rollout_vec(env, policy, horizon=200):
     """Collect rollout from vectorized environment."""
+    wp.synchronize()  # Ensure clean state before rollout
+
     num_worlds = env.num_worlds
     obs = env.reset()
 
@@ -292,6 +294,8 @@ def collect_rollout_vec(env, policy, horizon=200):
         all_dones.append(dones)
 
         obs = next_obs
+
+    wp.synchronize()  # Ensure all GPU operations complete
 
     # Stack into tensors: (horizon, num_worlds, ...)
     return {

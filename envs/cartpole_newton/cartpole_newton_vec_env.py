@@ -358,7 +358,7 @@ class CartPoleNewtonVecEnv:
 
         # Create ArticulationView for batch operations (like Newton's official examples)
         # Use the key we set in add_articulation()
-        self.cartpoles = ArticulationView(self.model, "cartpole", verbose=True)
+        self.cartpoles = ArticulationView(self.model, "cartpole", verbose=False)
 
         # Forward kinematics
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
@@ -371,6 +371,8 @@ class CartPoleNewtonVecEnv:
 
     def reset(self) -> np.ndarray:
         """Reset all environments using Newton's official ArticulationView pattern."""
+        wp.synchronize()
+
         self.steps[:] = 0
         self._step_count = 0
 
@@ -416,6 +418,8 @@ class CartPoleNewtonVecEnv:
 
     def _propagate_state(self):
         """Run one simulation step to propagate state through solver (Newton pattern)."""
+        wp.synchronize()
+
         # Use zero control for propagation
         joint_f = self.cartpoles.get_attribute("joint_f", self.control)
         joint_f_np = joint_f.numpy()
@@ -427,6 +431,8 @@ class CartPoleNewtonVecEnv:
         self.state_0.clear_forces()
         self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
         self.state_0, self.state_1 = self.state_1, self.state_0
+
+        wp.synchronize()
 
     def _get_obs(self) -> np.ndarray:
         """Get observations for all worlds using ArticulationView (Newton's pattern)."""
