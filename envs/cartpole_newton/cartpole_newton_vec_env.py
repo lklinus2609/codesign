@@ -54,17 +54,18 @@ def compute_rewards_kernel(
 @wp.kernel
 def check_termination_kernel(
     joint_q: wp.array(dtype=float),
-    theta_threshold: float,
+    x_limit: float,
     num_joints_per_world: int,
     terminated: wp.array(dtype=int),
 ):
-    """Check if each world has terminated (pole fell)."""
+    """Check if each world has terminated (cart out of bounds)."""
     tid = wp.tid()
 
-    theta_idx = tid * num_joints_per_world + 1
-    theta = joint_q[theta_idx]
+    x_idx = tid * num_joints_per_world
+    x = joint_q[x_idx]
 
-    if wp.abs(theta) > theta_threshold:
+    # Only terminate if cart goes out of bounds (no theta limit for swing-up)
+    if wp.abs(x) > x_limit:
         terminated[tid] = 1
     else:
         terminated[tid] = 0
@@ -95,23 +96,20 @@ def reset_worlds_kernel(
     num_joints_per_world: int,
     rng_seed: int,
 ):
-    """Reset terminated worlds with random initial state."""
+    """Reset terminated worlds - pole starts pointing down (theta = pi)."""
     tid = wp.tid()
 
     if terminated[tid] == 1:
-        # Random initial state (small perturbations)
-        state = wp.rand_init(rng_seed + tid)
-
         x_idx = tid * num_joints_per_world
         theta_idx = tid * num_joints_per_world + 1
 
-        # Position: small random values
-        joint_q[x_idx] = (wp.randf(state) - 0.5) * 0.1
-        joint_q[theta_idx] = (wp.randf(state) - 0.5) * 0.1
+        # Position: cart at center, pole pointing down (theta = pi)
+        joint_q[x_idx] = 0.0
+        joint_q[theta_idx] = 3.14159265359  # pi - pole pointing down
 
-        # Velocity: small random values
-        joint_qd[x_idx] = (wp.randf(state) - 0.5) * 0.1
-        joint_qd[theta_idx] = (wp.randf(state) - 0.5) * 0.1
+        # Velocity: zero
+        joint_qd[x_idx] = 0.0
+        joint_qd[theta_idx] = 0.0
 
 
 class ParametricCartPoleNewton:
@@ -292,7 +290,7 @@ class CartPoleNewtonVecEnv:
         self.steps[:] = 0
         self._step_count = 0
 
-        # Random initial states
+        # Initial state: pole pointing down (theta = pi)
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -300,10 +298,11 @@ class CartPoleNewtonVecEnv:
             x_idx = i * self.num_joints_per_world
             theta_idx = i * self.num_joints_per_world + 1
 
-            joint_q[x_idx] = np.random.uniform(-0.05, 0.05)
-            joint_q[theta_idx] = np.random.uniform(-0.05, 0.05)
-            joint_qd[x_idx] = np.random.uniform(-0.05, 0.05)
-            joint_qd[theta_idx] = np.random.uniform(-0.05, 0.05)
+            # Cart at center, pole pointing down (theta = pi)
+            joint_q[x_idx] = 0.0
+            joint_q[theta_idx] = np.pi  # Pole pointing down
+            joint_qd[x_idx] = 0.0
+            joint_qd[theta_idx] = 0.0
 
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
@@ -384,13 +383,13 @@ class CartPoleNewtonVecEnv:
             device=self.device,
         )
 
-        # Check termination using kernel
+        # Check termination using kernel (cart position limit, not theta)
         wp.launch(
             check_termination_kernel,
             dim=self.num_worlds,
             inputs=[
                 self.model.joint_q,
-                self.theta_threshold,
+                2.4,  # x_limit - cart position bounds
                 self.num_joints_per_world,
             ],
             outputs=[self.terminated_wp],
@@ -422,7 +421,7 @@ class CartPoleNewtonVecEnv:
         return obs, rewards, dones, infos
 
     def _reset_worlds(self, reset_mask: np.ndarray):
-        """Reset specific worlds that terminated."""
+        """Reset specific worlds that terminated - pole starts pointing down."""
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -431,10 +430,11 @@ class CartPoleNewtonVecEnv:
                 x_idx = i * self.num_joints_per_world
                 theta_idx = i * self.num_joints_per_world + 1
 
-                joint_q[x_idx] = np.random.uniform(-0.05, 0.05)
-                joint_q[theta_idx] = np.random.uniform(-0.05, 0.05)
-                joint_qd[x_idx] = np.random.uniform(-0.05, 0.05)
-                joint_qd[theta_idx] = np.random.uniform(-0.05, 0.05)
+                # Cart at center, pole pointing down (theta = pi)
+                joint_q[x_idx] = 0.0
+                joint_q[theta_idx] = np.pi  # Pole pointing down
+                joint_qd[x_idx] = 0.0
+                joint_qd[theta_idx] = 0.0
 
                 self.steps[i] = 0
 
