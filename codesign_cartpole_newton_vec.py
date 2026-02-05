@@ -470,9 +470,9 @@ def pghc_codesign_vec(
     max_step=0.1,
     initial_L=0.6,
     ctrl_cost_weight=0.5,
-    num_worlds=4096,  # 4090 can handle this easily for cart-pole
+    num_worlds=1024,  # mujoco_warp has issues with higher counts
     use_wandb=False,
-    video_every_n_iters=10,
+    video_every_n_iters=100,  # Reduced frequency - video recording blocks training
 ):
     """
     PGHC Co-Design using vectorized environments for fast training.
@@ -708,8 +708,8 @@ if __name__ == "__main__":
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
-    parser.add_argument("--num-worlds", type=int, default=4096, help="Number of parallel worlds")
-    parser.add_argument("--video-every", type=int, default=10, help="Record video every N inner iterations (0 to disable)")
+    parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel worlds")
+    parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
     history, policy, model = pghc_codesign_vec(
