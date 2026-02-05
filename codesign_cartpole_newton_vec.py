@@ -217,11 +217,11 @@ class CartPolePolicy(nn.Module):
             nn.Tanh(),
             nn.Linear(hidden_dim, act_dim),
         )
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        # Higher initial std for more exploration (exp(0.5) ≈ 1.65)
+        self.log_std = nn.Parameter(torch.ones(act_dim) * 0.5)
 
-        # Zero-init final layer for unbiased initial actions
-        # This is standard practice in RL to ensure initial policy is centered
-        nn.init.zeros_(self.net[-1].weight)
+        # Small random init for final layer (not zero - need some signal)
+        nn.init.uniform_(self.net[-1].weight, -0.1, 0.1)
         nn.init.zeros_(self.net[-1].bias)
 
     def forward(self, x):
@@ -465,6 +465,7 @@ def pghc_codesign_vec(
     stability_window=10,
     stability_threshold=0.01,
     min_inner_iterations=20,
+    outer_loop_start_iter=1000,  # Skip outer loop until this many total inner iters
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
@@ -527,12 +528,14 @@ def pghc_codesign_vec(
     }
 
     global_step = 0
+    total_inner_iterations = 0  # Track total inner iters across all outer loops
 
     print(f"\nConfiguration:")
     print(f"  Num parallel worlds: {num_worlds}")
     print(f"  Initial L: {parametric_model.L:.3f} m")
     print(f"  Control cost weight: {ctrl_cost_weight}")
     print(f"  Stability threshold: {stability_threshold:.1%}")
+    print(f"  Outer loop starts after: {outer_loop_start_iter} inner iterations")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
@@ -600,8 +603,10 @@ def pghc_codesign_vec(
                         "video/return": mean_ret,
                     }, step=global_step)
 
+            total_inner_iterations += 1
+
             if stability_gate.is_converged():
-                print(f"    CONVERGED at iter {inner_iter + 1}")
+                print(f"    CONVERGED at iter {inner_iter + 1} (total: {total_inner_iterations})")
                 break
 
             inner_iter += 1
@@ -615,6 +620,10 @@ def pghc_codesign_vec(
         # =============================================
         # OUTER LOOP: Compute design gradient
         # =============================================
+        if total_inner_iterations < outer_loop_start_iter:
+            print(f"\n  [Outer Loop] SKIPPED (need {outer_loop_start_iter - total_inner_iterations} more inner iters)")
+            continue
+
         print(f"\n  [Outer Loop] Computing dReturn/dL (frozen policy)...")
         wp.synchronize()
 
