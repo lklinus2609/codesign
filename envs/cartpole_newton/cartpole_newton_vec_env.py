@@ -394,8 +394,10 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
+        # IMPORTANT: eval_fk syncs joint_q -> body_q
+        # Must update BOTH state_0 and state_1 to avoid stale data after swap
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         wp.synchronize()
 
         return self._get_obs()
@@ -597,8 +599,10 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
+        # IMPORTANT: eval_fk syncs joint_q -> body_q
+        # Must update BOTH state_0 and state_1 to avoid stale data after swap
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         wp.synchronize()
 
         # Debug: verify reset worked
