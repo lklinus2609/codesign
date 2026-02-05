@@ -25,11 +25,10 @@ except ImportError:
     WANDB_AVAILABLE = False
 
 try:
+    import matplotlib
+    matplotlib.use('Agg')  # Use non-interactive backend (headless)
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
-    from matplotlib.backends.backend_agg import FigureCanvasAgg
-    import tempfile
-    import os
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
@@ -374,6 +373,7 @@ def pghc_codesign(
     initial_L=0.6,
     ctrl_cost_weight=0.5,
     use_wandb=False,
+    video_every_n_outer=5,
 ):
     """
     PGHC Co-Design for Newton Cart-Pole with Stability Gating.
@@ -444,7 +444,7 @@ def pghc_codesign(
     print(f"  Min iterations: {min_inner_iterations}")
 
     # Record initial video (untrained policy)
-    if use_wandb and MATPLOTLIB_AVAILABLE:
+    if use_wandb and MATPLOTLIB_AVAILABLE and video_every_n_outer > 0:
         print("\n  [wandb] Recording initial policy video...")
         video = record_episode_video(env, policy, max_steps=200)
         if video is not None:
@@ -518,17 +518,18 @@ def pghc_codesign(
         history["inner_iterations"].append(stability_gate.iteration)
         print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}")
 
-        # Record video of converged policy (before morphology change)
-        if use_wandb and MATPLOTLIB_AVAILABLE:
-            print(f"  [wandb] Recording video (L={parametric_model.L:.2f}m)...")
-            video = record_episode_video(env, policy, max_steps=200)
-            if video is not None:
-                wandb.log({
-                    "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
-                    "video/outer_iter": outer_iter + 1,
-                    "video/L": parametric_model.L,
-                    "video/return": mean_return,
-                }, step=global_step)
+        # Record video of converged policy (every N outer iterations)
+        if use_wandb and MATPLOTLIB_AVAILABLE and video_every_n_outer > 0:
+            if (outer_iter + 1) % video_every_n_outer == 0 or outer_iter == 0:
+                print(f"  [wandb] Recording video (L={parametric_model.L:.2f}m)...")
+                video = record_episode_video(env, policy, max_steps=200)
+                if video is not None:
+                    wandb.log({
+                        "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                        "video/outer_iter": outer_iter + 1,
+                        "video/L": parametric_model.L,
+                        "video/return": mean_return,
+                    }, step=global_step)
 
         # =============================================
         # OUTER LOOP: Compute design gradient
@@ -590,7 +591,7 @@ def pghc_codesign(
     # Log final summary to wandb
     if use_wandb:
         # Record final video
-        if MATPLOTLIB_AVAILABLE:
+        if MATPLOTLIB_AVAILABLE and video_every_n_outer > 0:
             print("\n  [wandb] Recording final policy video...")
             video = record_episode_video(env, policy, max_steps=300)
             if video is not None:
@@ -619,6 +620,7 @@ if __name__ == "__main__":
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
+    parser.add_argument("--video-every", type=int, default=5, help="Record video every N outer iterations (0 to disable)")
     args = parser.parse_args()
 
     history, policy, model = pghc_codesign(
@@ -631,4 +633,5 @@ if __name__ == "__main__":
         initial_L=args.initial_L,
         ctrl_cost_weight=args.ctrl_cost,
         use_wandb=args.wandb,
+        video_every_n_outer=args.video_every,
     )

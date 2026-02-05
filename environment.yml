@@ -89,5 +89,5 @@ dependencies:
       - typing-inspection
       - urllib3
       - usd-core
-      - wandb
+      - wandb[media]
       - warp-lang
