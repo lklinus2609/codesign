@@ -334,8 +334,9 @@ class CartPoleNewtonVecEnv:
         self.num_joints_per_world = 2  # x and theta
 
         # Use MuJoCo solver (reduced coordinates - updates joint_q directly)
-        # Set nconmax=0 to disable collision handling (cart-pole doesn't need collisions)
-        self.solver = newton.solvers.SolverMuJoCo(self.model, nconmax=0, njmax=0)
+        # Set nconmax=0 to disable collision contacts (cart-pole doesn't need collisions)
+        # Keep njmax default - we need joint constraints for the articulation
+        self.solver = newton.solvers.SolverMuJoCo(self.model, nconmax=0)
 
         # Allocate states
         self.state_0 = self.model.state()
@@ -374,8 +375,9 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # Note: MuJoCo solver uses reduced coordinates, no need for eval_fk
-        # The solver will use joint_q directly
+        # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
+        # MuJoCo solver reads/writes body_q, so we need this after changing joint_q
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         wp.synchronize()
 
         return self._get_obs()
@@ -527,7 +529,8 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # Note: MuJoCo solver uses reduced coordinates, no need for eval_fk
+        # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
 
 def test_vec_env():
