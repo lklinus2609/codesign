@@ -328,9 +328,10 @@ class CartPoleNewtonVecEnv:
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
-        # Debug: verify theta is changing (remove after testing)
+        # Debug: check both joint_q and body state
         if self._step_count <= 5:
-            print(f"[DEBUG] step={self._step_count}, theta[0]={joint_q[1]:.4f}")
+            body_q = self.state_0.body_q.numpy()
+            print(f"[DEBUG] step={self._step_count}, joint_q[1]={joint_q[1]:.4f}, body_q[1]={body_q[1]}")
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
