@@ -96,16 +96,16 @@ def reset_worlds_kernel(
     num_joints_per_world: int,
     rng_seed: int,
 ):
-    """Reset terminated worlds - pole starts pointing down (theta = pi)."""
+    """Reset terminated worlds - pole starts nearly upright (theta = 0.1)."""
     tid = wp.tid()
 
     if terminated[tid] == 1:
         x_idx = tid * num_joints_per_world
         theta_idx = tid * num_joints_per_world + 1
 
-        # Position: cart at center, pole pointing down (theta = pi)
+        # Position: cart at center, pole nearly upright
         joint_q[x_idx] = 0.0
-        joint_q[theta_idx] = 3.14159265359  # pi - pole pointing down
+        joint_q[theta_idx] = 0.1  # Nearly upright, will fall
 
         # Velocity: zero
         joint_qd[x_idx] = 0.0
@@ -254,7 +254,8 @@ class CartPoleNewtonVecEnv:
 
         # Set initial joint positions BEFORE finalize (like the example)
         # joint_q layout: [x, theta] for cart-pole
-        builder.joint_q[-2:] = [0.0, np.pi]  # x=0, theta=pi (pointing down)
+        # Start near upright (theta=0.1) so it falls under gravity
+        builder.joint_q[-2:] = [0.0, 0.1]  # x=0, theta=0.1 (nearly upright)
 
         return builder
 
@@ -299,7 +300,7 @@ class CartPoleNewtonVecEnv:
         self.steps[:] = 0
         self._step_count = 0
 
-        # Initial state: pole pointing down (theta = pi)
+        # Initial state: pole nearly upright (theta = 0.1)
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -307,9 +308,9 @@ class CartPoleNewtonVecEnv:
             x_idx = i * self.num_joints_per_world
             theta_idx = i * self.num_joints_per_world + 1
 
-            # Cart at center, pole pointing down (theta = pi)
+            # Cart at center, pole nearly upright (theta = 0.1)
             joint_q[x_idx] = 0.0
-            joint_q[theta_idx] = np.pi  # Pole pointing down
+            joint_q[theta_idx] = 0.1  # Nearly upright, will fall
             joint_qd[x_idx] = 0.0
             joint_qd[theta_idx] = 0.0
 
@@ -448,9 +449,9 @@ class CartPoleNewtonVecEnv:
                 x_idx = i * self.num_joints_per_world
                 theta_idx = i * self.num_joints_per_world + 1
 
-                # Cart at center, pole pointing down (theta = pi)
+                # Cart at center, pole nearly upright
                 joint_q[x_idx] = 0.0
-                joint_q[theta_idx] = np.pi  # Pole pointing down
+                joint_q[theta_idx] = 0.1  # Nearly upright, will fall
                 joint_qd[x_idx] = 0.0
                 joint_qd[theta_idx] = 0.0
 
