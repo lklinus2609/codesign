@@ -16,6 +16,7 @@ import numpy as np
 try:
     import warp as wp
     import newton
+    from newton.selection import ArticulationView
     NEWTON_AVAILABLE = True
 except ImportError:
     NEWTON_AVAILABLE = False
@@ -355,6 +356,9 @@ class CartPoleNewtonVecEnv:
         self.control = self.model.control()
         self.contacts = None
 
+        # Create ArticulationView for batch operations (like Newton's official examples)
+        self.cartpoles = ArticulationView(self.model, "*/cartpole", verbose=False)
+
         # Forward kinematics
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
@@ -365,117 +369,88 @@ class CartPoleNewtonVecEnv:
         self.terminated_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
 
     def reset(self) -> np.ndarray:
-        """Reset all environments. Returns observations (num_worlds, 4)."""
+        """Reset all environments using Newton's official ArticulationView pattern."""
         self.steps[:] = 0
         self._step_count = 0
 
-        joint_q = self.model.joint_q.numpy()
-        joint_qd = self.model.joint_qd.numpy()
+        # Get current joint state via ArticulationView (returns (num_worlds, num_dofs) array)
+        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+
+        # Convert to numpy for modification
+        joint_q_np = joint_q.numpy()
+        joint_qd_np = joint_qd.numpy()
 
         for i in range(self.num_worlds):
-            x_idx = i * self.num_joints_per_world
-            theta_idx = i * self.num_joints_per_world + 1
-
             if self.start_near_upright:
                 # IsaacLab style: random start near upright for BALANCE task
-                # Cart: random position in (-1, 1), velocity in (-0.5, 0.5)
-                # Pole: random angle in (-0.25π, 0.25π), velocity in (-0.25π, 0.25π)
-                joint_q[x_idx] = np.random.uniform(-1.0, 1.0)
-                joint_q[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
-                joint_qd[x_idx] = np.random.uniform(-0.5, 0.5)
-                joint_qd[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                joint_q_np[i, 0] = np.random.uniform(-1.0, 1.0)      # cart x
+                joint_q_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)  # pole angle
+                joint_qd_np[i, 0] = np.random.uniform(-0.5, 0.5)     # cart velocity
+                joint_qd_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)  # pole angular vel
             else:
                 # Swing-up task: pole starts pointing down
-                joint_q[x_idx] = 0.0
-                joint_q[theta_idx] = np.pi
-                joint_qd[x_idx] = 0.0
-                joint_qd[theta_idx] = 0.0
+                joint_q_np[i, 0] = 0.0
+                joint_q_np[i, 1] = np.pi
+                joint_qd_np[i, 0] = 0.0
+                joint_qd_np[i, 1] = 0.0
 
-        self.model.joint_q.assign(joint_q)
-        self.model.joint_qd.assign(joint_qd)
+        # Set state via ArticulationView (like Newton's official examples)
+        joint_q_wp = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
+        joint_qd_wp = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
+        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q_wp)
+        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd_wp)
 
-        # IMPORTANT: Must sync to BOTH Newton state AND MuJoCo internal state
-        # 1. Set Newton state via eval_fk
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
+        # Also set on state_1 to avoid stale data
+        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q_wp)
+        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd_wp)
 
-        # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
-        # MuJoCo uses its own mjw_data.qpos/qvel, not Newton's State
-        mjw_data = self.solver.mjw_data
-
-        # Create new arrays for MuJoCo (avoid modifying in-place)
-        nq = 2  # cart_x, pole_theta
-        nv = 2  # cart_x_dot, pole_theta_dot
-        qpos_new = np.zeros((self.num_worlds, nq), dtype=np.float32)
-        qvel_new = np.zeros((self.num_worlds, nv), dtype=np.float32)
-
-        for i in range(self.num_worlds):
-            qpos_new[i, 0] = joint_q[i * self.num_joints_per_world]
-            qpos_new[i, 1] = joint_q[i * self.num_joints_per_world + 1]
-            qvel_new[i, 0] = joint_qd[i * self.num_joints_per_world]
-            qvel_new[i, 1] = joint_qd[i * self.num_joints_per_world + 1]
-
-        # Use warp array from numpy
-        qpos_wp = wp.array(qpos_new, dtype=wp.float32, device=self.device)
-        qvel_wp = wp.array(qvel_new, dtype=wp.float32, device=self.device)
-        wp.copy(mjw_data.qpos, qpos_wp)
-        wp.copy(mjw_data.qvel, qvel_wp)
+        # Propagate reset state by running one simulate step (like test_anymal_reset.py)
+        # This ensures MuJoCo's internal state is properly initialized
+        self._propagate_state()
         wp.synchronize()
 
-        # Debug: check initial state
         obs = self._get_obs()
-        print(f"[DEBUG] After reset(): x in [{obs[:, 0].min():.2f}, {obs[:, 0].max():.2f}], "
-              f"theta in [{obs[:, 1].min():.2f}, {obs[:, 1].max():.2f}]")
         return obs
 
-    def _get_obs(self) -> np.ndarray:
-        """Get observations for all worlds. Returns (num_worlds, 4)."""
-        # Read body state directly (MuJoCo doesn't update model.joint_q)
-        body_q = self.state_0.body_q.numpy()
-        body_qd = self.state_0.body_qd.numpy()
+    def _propagate_state(self):
+        """Run one simulation step to propagate state through solver (Newton pattern)."""
+        # Use zero control for propagation
+        joint_f = self.cartpoles.get_attribute("joint_f", self.control)
+        joint_f_np = joint_f.numpy()
+        joint_f_np[:] = 0.0
+        joint_f_wp = wp.array(joint_f_np, dtype=wp.float32, device=self.device)
+        self.cartpoles.set_attribute("joint_f", self.control, joint_f_wp)
 
-        # Worlds are centered around origin during replication
-        # World 0 is at x = -(num_worlds-1) * spacing / 2
-        spacing = 3.0
-        first_world_x = -(self.num_worlds - 1) * spacing / 2.0
+        # Run one substep to propagate
+        self.state_0.clear_forces()
+        self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
+        self.state_0, self.state_1 = self.state_1, self.state_0
+
+    def _get_obs(self) -> np.ndarray:
+        """Get observations for all worlds using ArticulationView (Newton's pattern)."""
+        # Get joint state via ArticulationView (handles mapping automatically)
+        # Returns (num_worlds, num_dofs) where num_dofs=2: [cart_x, pole_theta]
+        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+
+        joint_q_np = joint_q.numpy()
+        joint_qd_np = joint_qd.numpy()
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
-        for i in range(self.num_worlds):
-            cart_idx = i * self.num_bodies_per_world + 0
-            pole_idx = i * self.num_bodies_per_world + 1
-
-            # Cart position: x component minus world offset (centered)
-            world_offset = first_world_x + i * spacing
-            cart_pos = body_q[cart_idx][:3]
-            x = cart_pos[0] - world_offset
-
-            # Pole angle from quaternion (rotation around y-axis)
-            pole_quat = body_q[pole_idx][3:7]  # qx, qy, qz, qw
-            qy, qw = pole_quat[1], pole_quat[3]
-            theta = 2.0 * np.arctan2(qy, qw)
-
-            # Cart velocity (x component of linear velocity)
-            # body_qd is spatial vector [wx, wy, wz, vx, vy, vz]
-            cart_vel = body_qd[cart_idx]
-            x_dot = cart_vel[3]  # linear velocity x
-
-            # Pole angular velocity (y component of angular velocity)
-            pole_vel = body_qd[pole_idx]
-            theta_dot = pole_vel[1]  # angular velocity around y
-
-            obs[i, 0] = x
-            obs[i, 1] = theta
-            obs[i, 2] = x_dot
-            obs[i, 3] = theta_dot
+        obs[:, 0] = joint_q_np[:, 0]   # cart x
+        obs[:, 1] = joint_q_np[:, 1]   # pole theta
+        obs[:, 2] = joint_qd_np[:, 0]  # cart x_dot
+        obs[:, 3] = joint_qd_np[:, 1]  # pole theta_dot
 
         return obs
 
     def step(self, actions: np.ndarray):
         """
-        Step all environments in parallel.
+        Step all environments in parallel using Newton's official pattern.
 
         Args:
-            actions: (num_worlds,) or (num_worlds, 1) forces
+            actions: (num_worlds,) or (num_worlds, 1) forces in [-1, 1]
 
         Returns:
             obs: (num_worlds, 4)
@@ -490,49 +465,23 @@ class CartPoleNewtonVecEnv:
         # Scale actions to forces (actions should already be in [-1, 1] from tanh policy)
         forces = actions * self.force_max
 
-        # Apply forces to control.joint_f ONCE before substep loop (like official Newton tests)
-        # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
-        joint_f = np.zeros(self.num_worlds * self.num_dofs_per_world, dtype=np.float32)
-        for i in range(self.num_worlds):
-            joint_f[i * self.num_dofs_per_world] = forces[i]  # Cart DOF only
-        self.control.joint_f.assign(joint_f)
+        # Set forces via ArticulationView (like selection_cartpole.py)
+        # joint_f shape: (num_worlds, num_dofs_per_world)
+        joint_f = self.cartpoles.get_attribute("joint_f", self.control)
+        joint_f_np = joint_f.numpy()
+        joint_f_np[:, 0] = forces  # Apply force to cart DOF only (index 0)
+        joint_f_np[:, 1] = 0.0     # No torque on pole joint
+        joint_f_wp = wp.array(joint_f_np, dtype=wp.float32, device=self.device)
+        self.cartpoles.set_attribute("joint_f", self.control, joint_f_wp)
 
-        # Debug: check body positions before solver
-        if self._step_count <= 2:
-            body_q_before = self.state_0.body_q.numpy()
-            cart_x_before = body_q_before[0][0]  # First cart's x position
-            print(f"[DEBUG] Before solver: cart0 body_x = {cart_x_before:.3f}")
-
-        # Simulate substeps (control stays constant)
+        # Simulate substeps using Newton's official pattern:
+        # clear_forces() INSIDE the loop, BEFORE each solver.step()
         for _ in range(self.num_substeps):
+            self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        # Debug: check body positions after solver
-        if self._step_count <= 2:
-            body_q_after = self.state_0.body_q.numpy()
-            cart_x_after = body_q_after[0][0]
-            print(f"[DEBUG] After solver: cart0 body_x = {cart_x_after:.3f}")
-
-        # Synchronize to prevent warp state corruption (known issue)
-        wp.synchronize()
-
-        # Extract joint positions from body state
-        # (MuJoCo solver updates body_q but not model.joint_q)
-        wp.launch(
-            extract_joint_state_kernel,
-            dim=self.num_worlds,
-            inputs=[
-                self.state_0.body_q,
-                self.state_0.body_qd,
-                self.num_bodies_per_world,
-                self.model.joint_q,
-                self.model.joint_qd,
-                self.num_joints_per_world,
-                self.num_worlds,
-            ],
-            device=self.device,
-        )
+        # Synchronize to prevent warp state corruption
         wp.synchronize()
 
         self.steps += 1
@@ -550,19 +499,10 @@ class CartPoleNewtonVecEnv:
         # Check for NaN/Inf (physics instability)
         invalid = np.isnan(x) | np.isinf(x) | np.isnan(theta) | np.isinf(theta)
         if np.any(invalid):
-            num_invalid = np.sum(invalid)
-            print(f"[DEBUG] {num_invalid}/{self.num_worlds} worlds have invalid state!")
             x = np.where(invalid, 0.0, x)
             theta = np.where(invalid, np.pi, theta)
             x_dot = np.where(invalid, 0.0, x_dot)
             theta_dot = np.where(invalid, 0.0, theta_dot)
-
-        # Debug: check if x is out of bounds on first few steps
-        if self._step_count <= 3:
-            out_of_bounds = np.abs(x) > self.x_limit
-            print(f"[DEBUG] step={self._step_count}: x=[{x.min():.2f}, {x.max():.2f}], "
-                  f"x_dot=[{x_dot.min():.1f}, {x_dot.max():.1f}], "
-                  f"out_of_bounds={np.sum(out_of_bounds)}")
 
         # IsaacLab-style reward structure:
         # (1) Alive bonus: +1.0 per step
@@ -607,69 +547,46 @@ class CartPoleNewtonVecEnv:
         return obs, rewards, dones, infos
 
     def _reset_worlds(self, reset_mask: np.ndarray):
-        """Reset specific worlds that terminated."""
+        """Reset specific worlds that terminated using ArticulationView pattern."""
         num_reset = np.sum(reset_mask)
+        if num_reset == 0:
+            return
 
-        # Read current joint state (from model, not from extract kernel output)
-        joint_q = self.model.joint_q.numpy()
-        joint_qd = self.model.joint_qd.numpy()
+        # Get current joint state via ArticulationView
+        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+
+        joint_q_np = joint_q.numpy()
+        joint_qd_np = joint_qd.numpy()
 
         for i in range(self.num_worlds):
             if reset_mask[i]:
-                x_idx = i * self.num_joints_per_world
-                theta_idx = i * self.num_joints_per_world + 1
-
                 if self.start_near_upright:
                     # IsaacLab style: random start near upright
-                    joint_q[x_idx] = np.random.uniform(-1.0, 1.0)
-                    joint_q[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
-                    joint_qd[x_idx] = np.random.uniform(-0.5, 0.5)
-                    joint_qd[theta_idx] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                    joint_q_np[i, 0] = np.random.uniform(-1.0, 1.0)
+                    joint_q_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
+                    joint_qd_np[i, 0] = np.random.uniform(-0.5, 0.5)
+                    joint_qd_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
                 else:
                     # Swing-up: pole starts pointing down
-                    joint_q[x_idx] = 0.0
-                    joint_q[theta_idx] = np.pi
-                    joint_qd[x_idx] = 0.0
-                    joint_qd[theta_idx] = 0.0
+                    joint_q_np[i, 0] = 0.0
+                    joint_q_np[i, 1] = np.pi
+                    joint_qd_np[i, 0] = 0.0
+                    joint_qd_np[i, 1] = 0.0
 
                 self.steps[i] = 0
 
-        self.model.joint_q.assign(joint_q)
-        self.model.joint_qd.assign(joint_qd)
+        # Set state via ArticulationView (like Newton's official examples)
+        joint_q_wp = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
+        joint_qd_wp = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
+        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q_wp)
+        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd_wp)
+        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q_wp)
+        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd_wp)
 
-        # IMPORTANT: Must sync to BOTH Newton state AND MuJoCo internal state
-        # 1. Set Newton state via eval_fk
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
-
-        # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
-        mjw_data = self.solver.mjw_data
-
-        # Get current MuJoCo state
-        qpos = mjw_data.qpos.numpy().copy()
-        qvel = mjw_data.qvel.numpy().copy()
-
-        for i in range(self.num_worlds):
-            if reset_mask[i]:
-                qpos[i, 0] = joint_q[i * self.num_joints_per_world]
-                qpos[i, 1] = joint_q[i * self.num_joints_per_world + 1]
-                qvel[i, 0] = joint_qd[i * self.num_joints_per_world]
-                qvel[i, 1] = joint_qd[i * self.num_joints_per_world + 1]
-
-        # Use warp array from numpy
-        qpos_wp = wp.array(qpos.astype(np.float32), dtype=wp.float32, device=self.device)
-        qvel_wp = wp.array(qvel.astype(np.float32), dtype=wp.float32, device=self.device)
-        wp.copy(mjw_data.qpos, qpos_wp)
-        wp.copy(mjw_data.qvel, qvel_wp)
+        # Propagate reset state (like test_anymal_reset.py)
+        self._propagate_state()
         wp.synchronize()
-
-        # Debug: verify reset worked
-        if num_reset > 0 and self._step_count < 10:
-            obs_after = self._get_obs()
-            x_reset = obs_after[reset_mask, 0]
-            x_dot_reset = obs_after[reset_mask, 2]
-            print(f"[DEBUG] Reset {num_reset} worlds: x=[{x_reset.min():.2f}, {x_reset.max():.2f}], "
-                  f"x_dot=[{x_dot_reset.min():.2f}, {x_dot_reset.max():.2f}]")
 
 
 def test_vec_env():

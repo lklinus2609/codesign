@@ -12,7 +12,8 @@
       "Bash(python test_level0_verification.py:*)",
       "Bash(dir:*)",
       "Bash(python:*)",
-      "Bash(ls -la \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\newton\"\" 2>/dev/null || dir \"C:UserslinusDesktopcodesignnewton \")"
+      "Bash(ls -la \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\newton\"\" 2>/dev/null || dir \"C:UserslinusDesktopcodesignnewton \")",
+      "Bash(python3:*)"
     ]
   }
 }
