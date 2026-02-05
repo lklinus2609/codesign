@@ -398,6 +398,22 @@ class CartPoleNewtonVecEnv:
         # Must update BOTH state_0 and state_1 to avoid stale data after swap
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
+
+        # Also explicitly set body velocities (eval_fk might not propagate joint_qd correctly)
+        body_qd_0 = self.state_0.body_qd.numpy()
+        body_qd_1 = self.state_1.body_qd.numpy()
+        for i in range(self.num_worlds):
+            cart_idx = i * self.num_bodies_per_world
+            pole_idx = i * self.num_bodies_per_world + 1
+            x_dot = joint_qd[i * self.num_joints_per_world]
+            theta_dot = joint_qd[i * self.num_joints_per_world + 1]
+            # Set velocities (spatial vector: [wx, wy, wz, vx, vy, vz])
+            body_qd_0[cart_idx] = [0, 0, 0, x_dot, 0, 0]
+            body_qd_0[pole_idx] = [0, theta_dot, 0, 0, 0, 0]
+            body_qd_1[cart_idx] = [0, 0, 0, x_dot, 0, 0]
+            body_qd_1[pole_idx] = [0, theta_dot, 0, 0, 0, 0]
+        self.state_0.body_qd.assign(body_qd_0)
+        self.state_1.body_qd.assign(body_qd_1)
         wp.synchronize()
 
         # Debug: check initial state
@@ -619,6 +635,21 @@ class CartPoleNewtonVecEnv:
         # Must update BOTH state_0 and state_1 to avoid stale data after swap
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
+
+        # Also explicitly zero body velocities for reset worlds (eval_fk might not do this)
+        body_qd_0 = self.state_0.body_qd.numpy()
+        body_qd_1 = self.state_1.body_qd.numpy()
+        for i in range(self.num_worlds):
+            if reset_mask[i]:
+                cart_idx = i * self.num_bodies_per_world
+                pole_idx = i * self.num_bodies_per_world + 1
+                # Zero out velocities (spatial vector: [wx, wy, wz, vx, vy, vz])
+                body_qd_0[cart_idx] = [0, 0, 0, 0, 0, 0]
+                body_qd_0[pole_idx] = [0, 0, 0, 0, 0, 0]
+                body_qd_1[cart_idx] = [0, 0, 0, 0, 0, 0]
+                body_qd_1[pole_idx] = [0, 0, 0, 0, 0, 0]
+        self.state_0.body_qd.assign(body_qd_0)
+        self.state_1.body_qd.assign(body_qd_1)
         wp.synchronize()
 
         # Debug: verify reset worked
