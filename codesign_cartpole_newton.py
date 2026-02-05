@@ -6,13 +6,23 @@ This validates the full PGHC pipeline with Newton before moving to Level 2 (Ant)
 
 Uses stability gating: inner loop runs until policy converges (return plateau),
 then outer loop updates morphology.
+
+Run with wandb logging:
+    python codesign_cartpole_newton.py --wandb
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import argparse
 from collections import deque
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 
@@ -263,6 +273,7 @@ def pghc_codesign(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
+    use_wandb=False,
 ):
     """
     PGHC Co-Design for Newton Cart-Pole with Stability Gating.
@@ -274,6 +285,29 @@ def pghc_codesign(
     print("PGHC Co-Design for Cart-Pole (Newton Physics)")
     print("Stability Gating Mode")
     print("=" * 60)
+
+    # Initialize wandb
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project="pghc-codesign",
+            name="cartpole-newton-L1.5",
+            config={
+                "level": "1.5",
+                "environment": "cartpole-newton",
+                "n_outer_iterations": n_outer_iterations,
+                "max_inner_iterations": max_inner_iterations,
+                "stability_window": stability_window,
+                "stability_threshold": stability_threshold,
+                "min_inner_iterations": min_inner_iterations,
+                "design_lr": design_lr,
+                "max_step": max_step,
+                "initial_L": initial_L,
+            },
+        )
+        print("  [wandb] Logging enabled")
+    elif use_wandb and not WANDB_AVAILABLE:
+        print("  [wandb] Not available, install with: pip install wandb")
+        use_wandb = False
 
     # Initialize
     parametric_model = ParametricCartPoleNewton(L_init=initial_L)
@@ -297,6 +331,9 @@ def pghc_codesign(
         "inner_iterations": [],
     }
 
+    # Global step counter for wandb x-axis
+    global_step = 0
+
     print(f"\nInitial pole length L = {parametric_model.L:.3f} m")
     print(f"L range: [{parametric_model.L_min}, {parametric_model.L_max}] m")
     print(f"\nStability gating:")
@@ -309,6 +346,14 @@ def pghc_codesign(
         print(f"Outer Iteration {outer_iter + 1}/{n_outer_iterations}")
         print(f"{'='*60}")
         print(f"  Current L = {parametric_model.L:.3f} m")
+
+        # Log outer loop start
+        if use_wandb:
+            wandb.log({
+                "outer/iteration": outer_iter + 1,
+                "outer/L_current": parametric_model.L,
+                "outer/event": 1,  # Marker for outer loop start
+            }, step=global_step)
 
         # =============================================
         # INNER LOOP: Train until convergence
@@ -325,6 +370,20 @@ def pghc_codesign(
             stability_gate.update(mean_ret)
             stats = stability_gate.get_stats()
 
+            global_step += 1
+
+            # Log every inner iteration to wandb
+            if use_wandb:
+                wandb.log({
+                    "inner/return_mean": mean_ret,
+                    "inner/return_std": std_ret,
+                    "inner/relative_change": stats["relative_change"],
+                    "inner/iteration": inner_iter + 1,
+                    "design/L": parametric_model.L,
+                    "design/pole_mass": parametric_model.pole_mass,
+                    "outer/iteration": outer_iter + 1,
+                }, step=global_step)
+
             if (inner_iter + 1) % 10 == 0:
                 print(f"    Iter {inner_iter + 1}: return = {mean_ret:.1f}, "
                       f"rel_change = {stats['relative_change']:.3f}")
@@ -333,9 +392,16 @@ def pghc_codesign(
             if stability_gate.is_converged():
                 print(f"    CONVERGED at iter {inner_iter + 1} "
                       f"(rel_change = {stats['relative_change']:.3f} < {stability_threshold})")
+                if use_wandb:
+                    wandb.log({
+                        "inner/converged": 1,
+                        "inner/convergence_iter": inner_iter + 1,
+                    }, step=global_step)
                 break
         else:
             print(f"    MAX ITERATIONS reached ({max_inner_iterations})")
+            if use_wandb:
+                wandb.log({"inner/converged": 0}, step=global_step)
 
         # Final evaluation
         mean_return, std_return = evaluate_policy(env, policy, n_episodes=5)
@@ -366,6 +432,16 @@ def pghc_codesign(
         print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
         history["L"].append(parametric_model.L)
 
+        # Log outer loop results
+        if use_wandb:
+            wandb.log({
+                "outer/return_at_convergence": mean_return,
+                "outer/gradient": gradient,
+                "outer/L_step": step,
+                "outer/L_new": parametric_model.L,
+                "outer/inner_iterations_used": stability_gate.iteration,
+            }, step=global_step)
+
     # =============================================
     # Final Results
     # =============================================
@@ -390,16 +466,36 @@ def pghc_codesign(
     for i, grad in enumerate(history["gradients"]):
         print(f"  Iter {i+1}: {grad:+.4f}")
 
+    # Log final summary to wandb
+    if use_wandb:
+        wandb.log({
+            "summary/L_initial": history["L"][0],
+            "summary/L_final": history["L"][-1],
+            "summary/L_change": history["L"][-1] - history["L"][0],
+            "summary/final_return": history["returns"][-1],
+            "summary/total_inner_iterations": sum(history["inner_iterations"]),
+        })
+        wandb.finish()
+
     return history, policy, parametric_model
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="PGHC Co-Design for Cart-Pole (Newton)")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
+    parser.add_argument("--max-inner-iters", type=int, default=100, help="Max inner iterations")
+    parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
+    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
+    args = parser.parse_args()
+
     history, policy, model = pghc_codesign(
-        n_outer_iterations=10,
-        max_inner_iterations=100,
+        n_outer_iterations=args.outer_iters,
+        max_inner_iterations=args.max_inner_iters,
         stability_window=10,
         stability_threshold=0.05,
         min_inner_iterations=20,
-        design_lr=0.02,
-        initial_L=0.6,
+        design_lr=args.design_lr,
+        initial_L=args.initial_L,
+        use_wandb=args.wandb,
     )
