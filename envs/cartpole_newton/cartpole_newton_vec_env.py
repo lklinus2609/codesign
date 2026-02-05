@@ -217,7 +217,7 @@ class CartPoleNewtonVecEnv:
         num_worlds: int = 64,
         parametric_model: ParametricCartPoleNewton = None,
         dt: float = 0.02,
-        force_max: float = 3.0,  # Reduced from 10 for stable learning (3 m/s² on 1kg cart)
+        force_max: float = 15.0,  # 15N on 1kg = 15 m/s², enough for swing-up
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
         ctrl_cost_weight: float = 0.01,  # Low for swing-up (needs big movements)
