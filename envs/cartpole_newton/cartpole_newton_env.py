@@ -115,65 +115,66 @@ class CartPoleNewtonEnv:
 
         builder = newton.ModelBuilder()
 
-        # Add cart (box on slider)
+        # Set default density (will be overridden by shape dimensions)
         cart_width = 0.3
         cart_height = 0.1
         cart_depth = 0.2
+        pole_radius = 0.02
 
-        # Cart body - add_body() returns body index, transform set via joint
-        cart_body = builder.add_body()
-        cart_density = cart_mass / (cart_width * cart_depth * cart_height)
-        builder.add_shape_box(
-            body=cart_body,
-            hx=cart_width/2,
-            hy=cart_depth/2,
-            hz=cart_height/2,
-            density=cart_density,
-        )
+        # Calculate densities to achieve desired masses
+        cart_volume = cart_width * cart_depth * cart_height
+        pole_volume = np.pi * pole_radius**2 * 2 * L
+        cart_density = cart_mass / cart_volume if cart_volume > 0 else 1000.0
+        pole_density = pole_mass / pole_volume if pole_volume > 0 else 1000.0
 
-        # Slider joint for cart (moves along x-axis)
-        builder.add_joint_prismatic(
+        # Set default shape density
+        builder.default_shape_cfg.density = cart_density
+
+        # Cart link
+        cart_link = builder.add_link()
+        builder.add_shape_box(cart_link, hx=cart_width/2, hy=cart_depth/2, hz=cart_height/2)
+
+        # Pole link
+        builder.default_shape_cfg.density = pole_density
+        pole_link = builder.add_link()
+        builder.add_shape_capsule(pole_link, radius=pole_radius, half_height=L)
+
+        # Prismatic joint for cart (moves along x-axis)
+        j0 = builder.add_joint_prismatic(
             parent=-1,  # World
-            child=cart_body,
-            parent_xform=wp.transform((0.0, 0.0, cart_height/2), wp.quat_identity()),
-            child_xform=wp.transform_identity(),
-            axis=(1.0, 0.0, 0.0),
+            child=cart_link,
+            axis=wp.vec3(1.0, 0.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, cart_height/2), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()),
             limit_lower=-2.4,
             limit_upper=2.4,
         )
 
-        # Pole body (attached to top of cart)
-        pole_radius = 0.02
-        pole_body = builder.add_body()
-        # Capsule volume approx = pi * r^2 * 2L
-        pole_volume = np.pi * pole_radius**2 * 2 * L
-        pole_density = pole_mass / pole_volume if pole_volume > 0 else 1000.0
-        builder.add_shape_capsule(
-            body=pole_body,
-            radius=pole_radius,
-            half_height=L,
-            density=pole_density,
+        # Revolute joint for pole (rotates around y-axis)
+        j1 = builder.add_joint_revolute(
+            parent=cart_link,
+            child=pole_link,
+            axis=wp.vec3(0.0, 1.0, 0.0),
+            parent_xform=wp.transform(wp.vec3(0.0, 0.0, cart_height/2), wp.quat_identity()),
+            child_xform=wp.transform(wp.vec3(0.0, 0.0, -L), wp.quat_identity()),
         )
 
-        # Hinge joint for pole (rotates around y-axis)
-        builder.add_joint_revolute(
-            parent=cart_body,
-            child=pole_body,
-            parent_xform=wp.transform((0.0, 0.0, cart_height/2), wp.quat_identity()),
-            child_xform=wp.transform((0.0, 0.0, -L), wp.quat_identity()),
-            axis=(0.0, 1.0, 0.0),
-        )
+        # Create articulation
+        builder.add_articulation([j0, j1], key="cartpole")
 
         # Finalize with gradients enabled
         self.model = builder.finalize(requires_grad=True)
 
-        # Use semi-implicit solver (differentiable)
-        self.solver = newton.solvers.SolverSemiImplicit(self.model)
+        # Use XPBD solver (works well for articulations)
+        self.solver = newton.solvers.SolverXPBD(self.model)
 
         # Allocate states
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
+
+        # Forward kinematics
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
         # No contacts needed for cart-pole
         self.contacts = None
