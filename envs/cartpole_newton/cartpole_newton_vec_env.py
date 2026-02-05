@@ -252,6 +252,10 @@ class CartPoleNewtonVecEnv:
 
         builder.add_articulation([j0, j1], key="cartpole")
 
+        # Set initial joint positions BEFORE finalize (like the example)
+        # joint_q layout: [x, theta] for cart-pole
+        builder.joint_q[-2:] = [0.0, np.pi]  # x=0, theta=pi (pointing down)
+
         return builder
 
     def _build_model(self):
@@ -360,17 +364,18 @@ class CartPoleNewtonVecEnv:
         forces = np.clip(actions * self.force_max, -self.force_max, self.force_max)
         self.forces_wp.assign(forces)
 
-        # Simulate substeps
+        # Simulate substeps (like the example - no force application for now)
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
 
-            # Apply forces using kernel
-            wp.launch(
-                apply_forces_kernel,
-                dim=self.num_worlds,
-                inputs=[self.forces_wp, self.state_0.body_f, self.num_bodies_per_world],
-                device=self.device,
-            )
+            # TODO: Apply cart forces via actuator/control, not body_f
+            # For now, test pure gravity simulation like the example
+            # wp.launch(
+            #     apply_forces_kernel,
+            #     dim=self.num_worlds,
+            #     inputs=[self.forces_wp, self.state_0.body_f, self.num_bodies_per_world],
+            #     device=self.device,
+            # )
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
