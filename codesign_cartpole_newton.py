@@ -24,7 +24,106 @@ try:
 except ImportError:
     WANDB_AVAILABLE = False
 
+try:
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    import tempfile
+    import os
+    MATPLOTLIB_AVAILABLE = True
+except ImportError:
+    MATPLOTLIB_AVAILABLE = False
+
 from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
+
+
+def render_cartpole_frame(x, theta, L, force=0, step=0, return_so_far=0):
+    """Render a single frame of the cart-pole as a numpy array."""
+    fig, ax = plt.subplots(1, 1, figsize=(8, 4), dpi=100)
+
+    # Cart dimensions
+    cart_width = 0.4
+    cart_height = 0.2
+
+    # Draw track
+    ax.hlines(0, -2.5, 2.5, colors='gray', linewidth=2)
+
+    # Draw cart
+    cart = patches.Rectangle(
+        (x - cart_width/2, 0),
+        cart_width, cart_height,
+        linewidth=2, edgecolor='blue', facecolor='lightblue'
+    )
+    ax.add_patch(cart)
+
+    # Draw pole
+    pole_x = x
+    pole_y = cart_height
+    pole_end_x = pole_x + L * np.sin(theta)
+    pole_end_y = pole_y + L * np.cos(theta)
+
+    ax.plot([pole_x, pole_end_x], [pole_y, pole_end_y],
+            color='brown', linewidth=6, solid_capstyle='round')
+
+    # Draw pole tip
+    ax.plot(pole_end_x, pole_end_y, 'o', color='red', markersize=10)
+
+    # Draw force arrow
+    if abs(force) > 0.5:
+        arrow_scale = 0.3
+        ax.arrow(x, cart_height/2, force * arrow_scale, 0,
+                head_width=0.05, head_length=0.02, fc='green', ec='green')
+
+    # Labels
+    ax.set_xlim(-2.5, 2.5)
+    ax.set_ylim(-0.5, 2.0)
+    ax.set_aspect('equal')
+    ax.set_title(f'Step: {step} | L: {L:.2f}m | θ: {np.degrees(theta):.1f}° | Return: {return_so_far:.1f}')
+    ax.axis('off')
+
+    # Convert to numpy array
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    buf = canvas.buffer_rgba()
+    frame = np.asarray(buf)[:, :, :3]  # Remove alpha channel
+
+    plt.close(fig)
+    return frame
+
+
+def record_episode_video(env, policy, max_steps=200):
+    """Record a video of one episode."""
+    if not MATPLOTLIB_AVAILABLE:
+        return None
+
+    frames = []
+    obs = env.reset()
+    total_reward = 0
+
+    for step in range(max_steps):
+        # Get action
+        action = policy.get_action(obs, deterministic=True)
+        force = float(action[0]) * env.force_max
+
+        # Render frame
+        x, theta = obs[0], obs[1]
+        L = env.parametric_model.L
+        frame = render_cartpole_frame(x, theta, L, force, step, total_reward)
+        frames.append(frame)
+
+        # Step
+        obs, reward, terminated, truncated, _ = env.step(force)
+        total_reward += reward
+
+        if terminated or truncated:
+            # Add a few more frames showing final state
+            for _ in range(10):
+                x, theta = obs[0], obs[1]
+                frame = render_cartpole_frame(x, theta, L, 0, step, total_reward)
+                frames.append(frame)
+            break
+
+    return np.stack(frames)
 
 
 class CartPolePolicy(nn.Module):
@@ -273,7 +372,7 @@ def pghc_codesign(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
-    ctrl_cost_weight=0.1,
+    ctrl_cost_weight=0.5,
     use_wandb=False,
 ):
     """
@@ -344,6 +443,13 @@ def pghc_codesign(
     print(f"  Threshold: {stability_threshold:.1%}")
     print(f"  Min iterations: {min_inner_iterations}")
 
+    # Record initial video (untrained policy)
+    if use_wandb and MATPLOTLIB_AVAILABLE:
+        print("\n  [wandb] Recording initial policy video...")
+        video = record_episode_video(env, policy, max_steps=200)
+        if video is not None:
+            wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4")}, step=0)
+
     for outer_iter in range(n_outer_iterations):
         print(f"\n{'='*60}")
         print(f"Outer Iteration {outer_iter + 1}/{n_outer_iterations}")
@@ -412,6 +518,18 @@ def pghc_codesign(
         history["inner_iterations"].append(stability_gate.iteration)
         print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}")
 
+        # Record video of converged policy (before morphology change)
+        if use_wandb and MATPLOTLIB_AVAILABLE:
+            print(f"  [wandb] Recording video (L={parametric_model.L:.2f}m)...")
+            video = record_episode_video(env, policy, max_steps=200)
+            if video is not None:
+                wandb.log({
+                    "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                    "video/outer_iter": outer_iter + 1,
+                    "video/L": parametric_model.L,
+                    "video/return": mean_return,
+                }, step=global_step)
+
         # =============================================
         # OUTER LOOP: Compute design gradient
         # =============================================
@@ -471,6 +589,16 @@ def pghc_codesign(
 
     # Log final summary to wandb
     if use_wandb:
+        # Record final video
+        if MATPLOTLIB_AVAILABLE:
+            print("\n  [wandb] Recording final policy video...")
+            video = record_episode_video(env, policy, max_steps=300)
+            if video is not None:
+                wandb.log({
+                    "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                    "video/L_final": parametric_model.L,
+                })
+
         wandb.log({
             "summary/L_initial": history["L"][0],
             "summary/L_final": history["L"][-1],
@@ -490,7 +618,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-inner-iters", type=int, default=100, help="Max inner iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--ctrl-cost", type=float, default=0.1, help="Control cost weight")
+    parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
     args = parser.parse_args()
 
     history, policy, model = pghc_codesign(

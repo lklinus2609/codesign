@@ -76,7 +76,7 @@ class CartPoleNewtonEnv:
         force_max: float = 10.0,
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
-        ctrl_cost_weight: float = 0.1,
+        ctrl_cost_weight: float = 0.5,
         device: str = "cuda",
     ):
         if not NEWTON_AVAILABLE:
