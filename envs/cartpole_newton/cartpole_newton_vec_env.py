@@ -217,7 +217,7 @@ class CartPoleNewtonVecEnv:
         num_worlds: int = 64,
         parametric_model: ParametricCartPoleNewton = None,
         dt: float = 0.02,
-        force_max: float = 100.0,  # IsaacLab uses 100.0
+        force_max: float = 30.0,  # 30N on 1kg cart, reasonable for balance/swing-up
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
         ctrl_cost_weight: float = 0.01,

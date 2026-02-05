@@ -523,7 +523,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=100.0,  # IsaacLab uses 100
+        force_max=30.0,  # 30N on 1kg = 30 m/s², reasonable for swing-up
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
