@@ -29,7 +29,7 @@ except ImportError:
 import warp as wp
 import newton
 
-from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, ParametricCartPoleNewton
+from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 
 def _record_video_subprocess(L_value, policy_state_dict, ctrl_cost_weight, max_steps, width, height):
@@ -89,18 +89,18 @@ policy.load_state_dict(config["state_dict"])
 policy.eval()
 
 # Import environment
-from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
+from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
-# Create environment
+# Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonEnv(parametric_model=parametric, ctrl_cost_weight=config["ctrl_cost_weight"])
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, ctrl_cost_weight=config["ctrl_cost_weight"])
 wp.synchronize()
 
 # Create viewer
 viewer = newton.viewer.ViewerGL(headless=True, width=config["width"], height=config["height"])
 
 frames = []
-obs = env.reset()
+obs = env.reset()[0]  # Get single world obs
 sim_time = 0.0
 
 # Forward kinematics
@@ -131,10 +131,12 @@ for step in range(config["max_steps"]):
     if frame_wp is not None:
         frames.append(frame_wp.numpy())
 
-    obs, reward, terminated, truncated, _ = env.step(force)
+    obs_all, rewards, dones, _ = env.step(np.array([force]))
+    obs = obs_all[0]
+    terminated = dones[0]
     sim_time += env.dt
 
-    if terminated or truncated:
+    if terminated or env.steps[0] >= config["max_steps"]:
         for _ in range(10):
             viewer.begin_frame(sim_time)
             viewer.log_state(env.state_0)
@@ -362,24 +364,25 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
 
 
 def compute_design_gradient(parametric_model, policy, ctrl_cost_weight, eps=0.02, horizon=200, n_rollouts=3):
-    """Compute dReturn/dL using finite differences with single-env (more accurate)."""
+    """Compute dReturn/dL using finite differences with vec env (num_worlds=1)."""
 
     def eval_at_L(L_val):
         """Evaluate mean return at a specific L value."""
         parametric_model.set_L(L_val)
-        # Create single env for gradient evaluation
-        env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
+        # Create vec env with single world for gradient evaluation
+        env = CartPoleNewtonVecEnv(parametric_model=parametric_model, num_worlds=1, ctrl_cost_weight=ctrl_cost_weight)
 
         returns = []
         for _ in range(n_rollouts):
-            obs = env.reset()
+            obs = env.reset()[0]  # Get single world obs
             total_return = 0
             for _ in range(horizon):
                 action = policy.get_action(obs, deterministic=True)
                 force = float(action[0]) * env.force_max
-                obs, reward, terminated, truncated, _ = env.step(force)
-                total_return += reward
-                if terminated or truncated:
+                obs_all, rewards, dones, _ = env.step(np.array([force]))
+                obs = obs_all[0]
+                total_return += rewards[0]
+                if dones[0]:
                     break
             returns.append(total_return)
         return np.mean(returns)
