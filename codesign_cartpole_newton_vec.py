@@ -586,8 +586,13 @@ def pghc_codesign_vec(
 
             if (inner_iter + 1) % 5 == 0:
                 samples_per_iter = num_worlds * 200
+                # Debug: check action distribution
+                test_obs = torch.FloatTensor(env.reset())
+                with torch.no_grad():
+                    test_actions = policy.get_actions_batch(test_obs)
                 print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, "
                       f"rel_change={stats['relative_change']:.3f} "
+                      f"actions=[{test_actions.min():.2f}, {test_actions.max():.2f}] "
                       f"({samples_per_iter} samples/iter)")
 
             # Record video every N inner iterations
@@ -604,12 +609,12 @@ def pghc_codesign_vec(
                     }, step=global_step)
 
             total_inner_iterations += 1
-
-            if stability_gate.is_converged():
-                print(f"    CONVERGED at iter {inner_iter + 1} (total: {total_inner_iterations})")
-                break
-
             inner_iter += 1
+
+            # Only allow convergence break AFTER we've trained enough
+            if total_inner_iterations >= outer_loop_start_iter and stability_gate.is_converged():
+                print(f"    CONVERGED at iter {inner_iter} (total: {total_inner_iterations})")
+                break
 
         # Final evaluation
         mean_return, std_return = evaluate_policy_vec(env, policy, n_episodes=10)
@@ -620,10 +625,6 @@ def pghc_codesign_vec(
         # =============================================
         # OUTER LOOP: Compute design gradient
         # =============================================
-        if total_inner_iterations < outer_loop_start_iter:
-            print(f"\n  [Outer Loop] SKIPPED (need {outer_loop_start_iter - total_inner_iterations} more inner iters)")
-            continue
-
         print(f"\n  [Outer Loop] Computing dReturn/dL (frozen policy)...")
         wp.synchronize()
 
