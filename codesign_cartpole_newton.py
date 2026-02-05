@@ -29,6 +29,7 @@ try:
     matplotlib.use('Agg')  # Use non-interactive backend (headless)
     import matplotlib.pyplot as plt
     import matplotlib.patches as patches
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
     MATPLOTLIB_AVAILABLE = True
 except ImportError:
     MATPLOTLIB_AVAILABLE = False
