@@ -309,13 +309,23 @@ class CartPoleNewtonVecEnv:
 
         # Forward kinematics
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        wp.synchronize()
+
+        # Debug: verify reset state
+        print(f"[DEBUG] reset: theta[0]={joint_q[1]:.4f} (should be ~3.14)")
 
         return self._get_obs()
 
     def _get_obs(self) -> np.ndarray:
         """Get observations for all worlds. Returns (num_worlds, 4)."""
+        wp.synchronize()  # Ensure GPU ops complete
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
+
+        # Debug: print theta for first world on first few steps
+        if self._step_count <= 3:
+            theta0 = joint_q[1]  # theta for world 0
+            print(f"[DEBUG] step={self._step_count}, theta[0]={theta0:.4f}, cos={np.cos(theta0):.4f}")
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
@@ -364,6 +374,12 @@ class CartPoleNewtonVecEnv:
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+
+        # Sync GPU to ensure joint_q is updated before reading
+        wp.synchronize()
+
+        # Update body positions from joint positions (needed for rendering)
+        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
         self.steps += 1
         self._step_count += 1
