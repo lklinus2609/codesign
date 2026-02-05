@@ -220,7 +220,7 @@ class CartPoleNewtonVecEnv:
         force_max: float = 10.0,
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
-        ctrl_cost_weight: float = 0.5,
+        ctrl_cost_weight: float = 0.01,  # Low for swing-up (needs big movements)
         device: str = "cuda:0",
     ):
         if not NEWTON_AVAILABLE:
@@ -485,15 +485,27 @@ class CartPoleNewtonVecEnv:
         # Get observations (computed from body state)
         obs = self._get_obs()
 
-        # Compute rewards from observations (theta is obs[:, 1])
+        # Compute rewards from observations
         theta = obs[:, 1]
+        x = obs[:, 0]
         forces = self.forces_wp.numpy()
-        balance_reward = np.cos(theta)
+
+        # Swing-up reward structure:
+        # 1. Survival bonus: +1 per step for staying in bounds
+        survival_bonus = 1.0
+
+        # 2. Height reward: cos(theta) = -1 (down) to +1 (up)
+        height_reward = np.cos(theta)
+
+        # 3. Position penalty: keep cart centered (small coefficient)
+        position_cost = 0.1 * x ** 2
+
+        # 4. Control cost: very low - swing-up needs big movements
         ctrl_cost = self.ctrl_cost_weight * (forces / self.force_max) ** 2
-        rewards = balance_reward - ctrl_cost
+
+        rewards = survival_bonus + height_reward - position_cost - ctrl_cost
 
         # Check termination (cart position limit)
-        x = obs[:, 0]
         terminated = np.abs(x) > 2.4
 
         # Termination penalty - discourage cart from going out of bounds
