@@ -32,6 +32,7 @@ def extract_joint_state_kernel(
     joint_q_out: wp.array(dtype=float),
     joint_qd_out: wp.array(dtype=float),
     num_joints_per_world: int,
+    num_worlds: int,
 ):
     """Extract joint positions/velocities from body transforms."""
     tid = wp.tid()  # world index
@@ -50,8 +51,10 @@ def extract_joint_state_kernel(
 
     # Cart position: x component of cart body position
     cart_pos = wp.transform_get_translation(cart_tf)
-    # Subtract world offset (worlds are spaced 3.0 apart in x)
-    world_offset = float(tid) * 3.0
+    # Subtract world offset (worlds are centered around origin)
+    spacing = 3.0
+    first_world_x = -float(num_worlds - 1) * spacing / 2.0
+    world_offset = first_world_x + float(tid) * spacing
     x = cart_pos[0] - world_offset
 
     # Pole angle: extract from pole body quaternion
@@ -403,13 +406,18 @@ class CartPoleNewtonVecEnv:
         body_q = self.state_0.body_q.numpy()
         body_qd = self.state_0.body_qd.numpy()
 
+        # Worlds are centered around origin during replication
+        # World 0 is at x = -(num_worlds-1) * spacing / 2
+        spacing = 3.0
+        first_world_x = -(self.num_worlds - 1) * spacing / 2.0
+
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
             cart_idx = i * self.num_bodies_per_world + 0
             pole_idx = i * self.num_bodies_per_world + 1
 
-            # Cart position: x component minus world offset
-            world_offset = i * 3.0  # worlds spaced 3.0 apart
+            # Cart position: x component minus world offset (centered)
+            world_offset = first_world_x + i * spacing
             cart_pos = body_q[cart_idx][:3]
             x = cart_pos[0] - world_offset
 
@@ -481,6 +489,7 @@ class CartPoleNewtonVecEnv:
                 self.model.joint_q,
                 self.model.joint_qd,
                 self.num_joints_per_world,
+                self.num_worlds,
             ],
             device=self.device,
         )
