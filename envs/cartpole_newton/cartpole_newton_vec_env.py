@@ -334,7 +334,8 @@ class CartPoleNewtonVecEnv:
         self.num_joints_per_world = 2  # x and theta
 
         # Use MuJoCo solver (reduced coordinates - updates joint_q directly)
-        self.solver = newton.solvers.SolverMuJoCo(self.model)
+        # Set nconmax=0 to disable collision handling (cart-pole doesn't need collisions)
+        self.solver = newton.solvers.SolverMuJoCo(self.model, nconmax=0, njmax=0)
 
         # Allocate states
         self.state_0 = self.model.state()
@@ -437,18 +438,17 @@ class CartPoleNewtonVecEnv:
         forces = np.clip(actions * self.force_max, -self.force_max, self.force_max)
         self.forces_wp.assign(forces)
 
-        # Simulate substeps (like the example - no force application for now)
+        # Simulate substeps
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
 
-            # TODO: Apply cart forces via actuator/control, not body_f
-            # For now, test pure gravity simulation like the example
-            # wp.launch(
-            #     apply_forces_kernel,
-            #     dim=self.num_worlds,
-            #     inputs=[self.forces_wp, self.state_0.body_f, self.num_bodies_per_world],
-            #     device=self.device,
-            # )
+            # Apply cart forces
+            wp.launch(
+                apply_forces_kernel,
+                dim=self.num_worlds,
+                inputs=[self.forces_wp, self.state_0.body_f, self.num_bodies_per_world],
+                device=self.device,
+            )
 
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
