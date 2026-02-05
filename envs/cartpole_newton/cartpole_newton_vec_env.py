@@ -502,8 +502,8 @@ class CartPoleNewtonVecEnv:
         # Check termination (cart position limit)
         terminated = np.abs(x) > 2.4
 
-        # Termination penalty - discourage cart from going out of bounds
-        rewards[terminated] -= 10.0
+        # Termination penalty - mild, don't overwhelm learning signal
+        rewards[terminated] -= 2.0
 
         # Check truncation (max steps)
         truncated = self.steps >= self.max_steps
