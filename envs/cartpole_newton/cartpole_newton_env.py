@@ -115,24 +115,20 @@ class CartPoleNewtonEnv:
 
         builder = newton.ModelBuilder()
 
-        # Configure for differentiable simulation
-        builder.default_shape_cfg.density = 1000.0  # Will override with explicit mass
-
         # Add cart (box on slider)
         cart_width = 0.3
         cart_height = 0.1
         cart_depth = 0.2
 
-        # Cart body
-        cart_body = builder.add_body(
-            origin=wp.transform((0.0, 0.0, cart_height/2), wp.quat_identity()),
-            m=cart_mass,
-        )
+        # Cart body - add_body() returns body index, transform set via joint
+        cart_body = builder.add_body()
+        cart_density = cart_mass / (cart_width * cart_depth * cart_height)
         builder.add_shape_box(
             body=cart_body,
             hx=cart_width/2,
             hy=cart_depth/2,
             hz=cart_height/2,
+            density=cart_density,
         )
 
         # Slider joint for cart (moves along x-axis)
@@ -148,14 +144,15 @@ class CartPoleNewtonEnv:
 
         # Pole body (attached to top of cart)
         pole_radius = 0.02
-        pole_body = builder.add_body(
-            origin=wp.transform((0.0, 0.0, cart_height + L), wp.quat_identity()),
-            m=pole_mass,
-        )
+        pole_body = builder.add_body()
+        # Capsule volume approx = pi * r^2 * 2L
+        pole_volume = np.pi * pole_radius**2 * 2 * L
+        pole_density = pole_mass / pole_volume if pole_volume > 0 else 1000.0
         builder.add_shape_capsule(
             body=pole_body,
             radius=pole_radius,
             half_height=L,
+            density=pole_density,
         )
 
         # Hinge joint for pole (rotates around y-axis)
