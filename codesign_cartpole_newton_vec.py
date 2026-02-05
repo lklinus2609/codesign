@@ -8,12 +8,17 @@ Run with wandb logging:
     python codesign_cartpole_newton_vec.py --wandb --num-worlds 64
 """
 
+# CRITICAL: Must set BEFORE importing pyglet/newton for headless video recording
+import os
+os.environ["PYGLET_HEADLESS"] = "1"
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import argparse
 from collections import deque
+import gc
 
 try:
     import wandb
@@ -28,10 +33,9 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, Parame
 
 
 def record_episode_video(L_value, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
-    """Record a video of one episode using Newton's ViewerGL."""
+    """Record a video of one episode using Newton's ViewerGL (headless)."""
     # Force GPU sync and garbage collection to clear any stale state
     wp.synchronize()
-    import gc
     gc.collect()
     wp.synchronize()
 

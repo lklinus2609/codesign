@@ -11,6 +11,10 @@ Run with wandb logging:
     python codesign_cartpole_newton.py --wandb
 """
 
+# CRITICAL: Must set BEFORE importing pyglet/newton for headless video recording
+import os
+os.environ["PYGLET_HEADLESS"] = "1"
+
 import numpy as np
 import torch
 import torch.nn as nn
