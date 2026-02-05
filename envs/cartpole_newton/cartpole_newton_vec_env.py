@@ -373,8 +373,8 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # Forward kinematics
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        # Note: MuJoCo solver uses reduced coordinates, no need for eval_fk
+        # The solver will use joint_q directly
         wp.synchronize()
 
         return self._get_obs()
@@ -535,8 +535,7 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # Update FK for reset worlds
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        # Note: MuJoCo solver uses reduced coordinates, no need for eval_fk
 
 
 def test_vec_env():
