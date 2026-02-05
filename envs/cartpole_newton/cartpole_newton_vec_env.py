@@ -22,6 +22,62 @@ except ImportError:
     print("Warning: Newton/Warp not available.")
 
 
+# Kernel to extract joint positions from body transforms
+# MuJoCo solver updates body_q but not model.joint_q
+@wp.kernel
+def extract_joint_state_kernel(
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    num_bodies_per_world: int,
+    joint_q_out: wp.array(dtype=float),
+    joint_qd_out: wp.array(dtype=float),
+    num_joints_per_world: int,
+):
+    """Extract joint positions/velocities from body transforms."""
+    tid = wp.tid()  # world index
+
+    # Body indices for this world
+    cart_idx = tid * num_bodies_per_world + 0
+    pole_idx = tid * num_bodies_per_world + 1
+
+    # Get body transforms
+    cart_tf = body_q[cart_idx]
+    pole_tf = body_q[pole_idx]
+
+    # Get body velocities (spatial vectors: [angular, linear])
+    cart_vel = body_qd[cart_idx]
+    pole_vel = body_qd[pole_idx]
+
+    # Cart position: x component of cart body position
+    cart_pos = wp.transform_get_translation(cart_tf)
+    # Subtract world offset (worlds are spaced 3.0 apart in x)
+    world_offset = float(tid) * 3.0
+    x = cart_pos[0] - world_offset
+
+    # Pole angle: extract from pole body quaternion
+    # For rotation around y-axis: qy = sin(θ/2), qw = cos(θ/2)
+    pole_quat = wp.transform_get_rotation(pole_tf)
+    qy = pole_quat[1]  # y component
+    qw = pole_quat[3]  # w component
+    theta = 2.0 * wp.atan2(qy, qw)
+
+    # Velocities
+    # Cart x velocity: linear velocity x component
+    x_dot = wp.spatial_bottom(cart_vel)[0]
+
+    # Pole angular velocity around y-axis
+    theta_dot = wp.spatial_top(pole_vel)[1]
+
+    # Write to output arrays
+    x_idx = tid * num_joints_per_world
+    theta_idx = tid * num_joints_per_world + 1
+
+    joint_q_out[x_idx] = x
+    joint_q_out[theta_idx] = theta
+    joint_qd_out[x_idx] = x_dot
+    joint_qd_out[theta_idx] = theta_dot
+
+
 # Warp kernel for computing rewards in parallel
 @wp.kernel
 def compute_rewards_kernel(
@@ -328,10 +384,9 @@ class CartPoleNewtonVecEnv:
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
-        # Debug: check both joint_q and body state
+        # Debug: verify theta is now updating
         if self._step_count <= 5:
-            body_q = self.state_0.body_q.numpy()
-            print(f"[DEBUG] step={self._step_count}, joint_q[1]={joint_q[1]:.4f}, body_q[1]={body_q[1]}")
+            print(f"[DEBUG] step={self._step_count}, theta={joint_q[1]:.4f}")
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
@@ -382,7 +437,21 @@ class CartPoleNewtonVecEnv:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        # MuJoCo solver updates joint_q directly (reduced coordinates)
+        # Extract joint positions from body state
+        # (MuJoCo solver updates body_q but not model.joint_q)
+        wp.launch(
+            extract_joint_state_kernel,
+            dim=self.num_worlds,
+            inputs=[
+                self.state_0.body_q,
+                self.state_0.body_qd,
+                self.num_bodies_per_world,
+                self.model.joint_q,
+                self.model.joint_qd,
+                self.num_joints_per_world,
+            ],
+            device=self.device,
+        )
         wp.synchronize()
 
         self.steps += 1
