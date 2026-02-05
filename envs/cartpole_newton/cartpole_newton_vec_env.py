@@ -475,10 +475,22 @@ class CartPoleNewtonVecEnv:
             joint_f[i * self.num_dofs_per_world] = forces[i]  # Cart DOF only
         self.control.joint_f.assign(joint_f)
 
+        # Debug: check body positions before solver
+        if self._step_count <= 2:
+            body_q_before = self.state_0.body_q.numpy()
+            cart_x_before = body_q_before[0][0]  # First cart's x position
+            print(f"[DEBUG] Before solver: cart0 body_x = {cart_x_before:.3f}")
+
         # Simulate substeps (control stays constant)
         for _ in range(self.num_substeps):
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
+
+        # Debug: check body positions after solver
+        if self._step_count <= 2:
+            body_q_after = self.state_0.body_q.numpy()
+            cart_x_after = body_q_after[0][0]
+            print(f"[DEBUG] After solver: cart0 body_x = {cart_x_after:.3f}")
 
         # Synchronize to prevent warp state corruption (known issue)
         wp.synchronize()
