@@ -194,14 +194,14 @@ class CartPoleNewtonEnv:
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
-        # Small random initial state
+        # Start with pole pointing straight down (theta = pi)
         if theta_init is None:
-            theta_init = np.random.uniform(-0.05, 0.05)
+            theta_init = np.pi
 
-        joint_q[0] = np.random.uniform(-0.05, 0.05)  # Cart position
-        joint_q[1] = theta_init  # Pole angle
-        joint_qd[0] = np.random.uniform(-0.05, 0.05)  # Cart velocity
-        joint_qd[1] = np.random.uniform(-0.05, 0.05)  # Pole angular velocity
+        joint_q[0] = 0.0  # Cart at center
+        joint_q[1] = theta_init  # Pole angle (pi = pointing down)
+        joint_qd[0] = 0.0  # Cart velocity
+        joint_qd[1] = 0.0  # Pole angular velocity
 
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
@@ -259,12 +259,13 @@ class CartPoleNewtonEnv:
         obs = self._get_obs()
         theta = obs[1]
 
-        # Check termination
-        self.terminated = abs(theta) > self.theta_threshold
+        # Check termination (only cart position bounds, no theta limit for swing-up)
+        x = obs[0]
+        self.terminated = abs(x) > 2.4
         truncated = self.steps >= self.max_steps
 
-        # Shaped reward with control cost
-        # - Balance reward: cos(theta) in [0, 1] for |theta| < 0.2
+        # Shaped reward for swing-up task
+        # - cos(theta): -1 at bottom (theta=pi), +1 at top (theta=0)
         # - Control cost: penalize large forces
         balance_reward = float(np.cos(theta))
         ctrl_cost = self.ctrl_cost_weight * (force / self.force_max) ** 2
