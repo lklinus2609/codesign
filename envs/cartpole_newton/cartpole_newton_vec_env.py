@@ -22,6 +22,64 @@ except ImportError:
     print("Warning: Newton/Warp not available.")
 
 
+# Kernel to extract joint positions from body state
+# Newton's XPBD solver updates body_q but not model.joint_q
+@wp.kernel
+def extract_joint_positions_kernel(
+    body_q: wp.array(dtype=wp.transform),
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    num_bodies_per_world: int,
+    joint_q_out: wp.array(dtype=float),
+    joint_qd_out: wp.array(dtype=float),
+    num_joints_per_world: int,
+):
+    """Extract joint positions/velocities from body transforms."""
+    tid = wp.tid()  # world index
+
+    # Body indices for this world
+    cart_idx = tid * num_bodies_per_world + 0
+    pole_idx = tid * num_bodies_per_world + 1
+
+    # Get body transforms
+    cart_tf = body_q[cart_idx]
+    pole_tf = body_q[pole_idx]
+
+    # Get body velocities (spatial vectors: [angular, linear])
+    cart_vel = body_qd[cart_idx]
+    pole_vel = body_qd[pole_idx]
+
+    # Cart position: x component of cart body position
+    cart_pos = wp.transform_get_translation(cart_tf)
+    x = cart_pos[0]
+
+    # Pole angle: extract from pole body quaternion
+    # For rotation around y-axis, theta = atan2(sin(theta), cos(theta))
+    # The pole's local z-axis when rotated gives us sin/cos of angle
+    pole_quat = wp.transform_get_rotation(pole_tf)
+
+    # Rotate unit z-vector by quaternion to get pole direction
+    pole_up = wp.quat_rotate(pole_quat, wp.vec3(0.0, 0.0, 1.0))
+
+    # theta = atan2(x-component, z-component) of the pole's up vector
+    theta = wp.atan2(pole_up[0], pole_up[2])
+
+    # Velocities
+    # Cart x velocity: linear velocity x component
+    x_dot = wp.spatial_bottom(cart_vel)[0]
+
+    # Pole angular velocity around y-axis
+    theta_dot = wp.spatial_top(pole_vel)[1]
+
+    # Write to output arrays
+    x_idx = tid * num_joints_per_world
+    theta_idx = tid * num_joints_per_world + 1
+
+    joint_q_out[x_idx] = x
+    joint_q_out[theta_idx] = theta
+    joint_qd_out[x_idx] = x_dot
+    joint_qd_out[theta_idx] = theta_dot
+
+
 # Warp kernel for computing rewards in parallel
 @wp.kernel
 def compute_rewards_kernel(
@@ -311,21 +369,12 @@ class CartPoleNewtonVecEnv:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         wp.synchronize()
 
-        # Debug: verify reset state
-        print(f"[DEBUG] reset: theta[0]={joint_q[1]:.4f} (should be ~3.14)")
-
         return self._get_obs()
 
     def _get_obs(self) -> np.ndarray:
         """Get observations for all worlds. Returns (num_worlds, 4)."""
-        wp.synchronize()  # Ensure GPU ops complete
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
-
-        # Debug: print theta for first world on first few steps
-        if self._step_count <= 3:
-            theta0 = joint_q[1]  # theta for world 0
-            print(f"[DEBUG] step={self._step_count}, theta[0]={theta0:.4f}, cos={np.cos(theta0):.4f}")
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
@@ -375,11 +424,22 @@ class CartPoleNewtonVecEnv:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        # Sync GPU to ensure joint_q is updated before reading
+        # Extract joint positions from body state
+        # (Newton's XPBD solver updates body_q but not model.joint_q)
+        wp.launch(
+            extract_joint_positions_kernel,
+            dim=self.num_worlds,
+            inputs=[
+                self.state_0.body_q,
+                self.state_0.body_qd,
+                self.num_bodies_per_world,
+                self.model.joint_q,
+                self.model.joint_qd,
+                self.num_joints_per_world,
+            ],
+            device=self.device,
+        )
         wp.synchronize()
-
-        # Update body positions from joint positions (needed for rendering)
-        newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
         self.steps += 1
         self._step_count += 1
