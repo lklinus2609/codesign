@@ -51,7 +51,7 @@ class ParametricCartPoleNewton:
         return self.L
 
     def set_L(self, value: float):
-        self.L = np.clip(value, self.L_min, self.L_max)
+        self.L = float(np.clip(value, self.L_min, self.L_max))
 
     @property
     def pole_mass(self) -> float:
@@ -109,9 +109,10 @@ class CartPoleNewtonEnv:
         """Build Newton cart-pole model with current parameters."""
         wp.init()
 
-        L = self.parametric_model.L
-        cart_mass = self.parametric_model.cart_mass
-        pole_mass = self.parametric_model.pole_mass
+        # Convert to Python floats to avoid warp type issues
+        L = float(self.parametric_model.L)
+        cart_mass = float(self.parametric_model.cart_mass)
+        pole_mass = float(self.parametric_model.pole_mass)
 
         builder = newton.ModelBuilder()
 
@@ -124,8 +125,8 @@ class CartPoleNewtonEnv:
         # Calculate densities to achieve desired masses
         cart_volume = cart_width * cart_depth * cart_height
         pole_volume = np.pi * pole_radius**2 * 2 * L
-        cart_density = cart_mass / cart_volume if cart_volume > 0 else 1000.0
-        pole_density = pole_mass / pole_volume if pole_volume > 0 else 1000.0
+        cart_density = float(cart_mass / cart_volume) if cart_volume > 0 else 1000.0
+        pole_density = float(pole_mass / pole_volume) if pole_volume > 0 else 1000.0
 
         # Set default shape density
         builder.default_shape_cfg.density = cart_density
@@ -179,6 +180,9 @@ class CartPoleNewtonEnv:
         # No contacts needed for cart-pole
         self.contacts = None
 
+        # Store cart body index for force application
+        self.cart_body_idx = 0
+
     def reset(self, theta_init: float = None) -> np.ndarray:
         """Reset environment."""
         self.steps = 0
@@ -231,16 +235,19 @@ class CartPoleNewtonEnv:
             return self._get_obs(), 0.0, True, False, {}
 
         # Clip action
-        force = np.clip(action, -self.force_max, self.force_max)
-
-        # Apply force to cart joint
-        joint_act = self.model.joint_act.numpy()
-        joint_act[0] = force
-        self.model.joint_act.assign(joint_act)
+        force = float(np.clip(action, -self.force_max, self.force_max))
 
         # Simulate substeps
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
+
+            # Apply force to cart body via body_f
+            # body_f is a spatial vector [torque_x, torque_y, torque_z, force_x, force_y, force_z] per body
+            body_f = np.zeros(self.model.body_count * 6, dtype=np.float32)
+            # Cart is body 0, apply force in x direction (index 3 = force_x)
+            body_f[self.cart_body_idx * 6 + 3] = force
+            self.state_0.body_f.assign(body_f)
+
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
