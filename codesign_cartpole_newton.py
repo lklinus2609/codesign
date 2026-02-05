@@ -33,14 +33,13 @@ from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 def record_episode_video(env, policy, max_steps=200, width=640, height=480):
     """Record a video of one episode using Newton's ViewerGL."""
     try:
-        viewer = newton.ViewerGL(headless=True, width=width, height=height)
+        viewer = newton.viewer.ViewerGL(headless=True, width=width, height=height)
     except Exception as e:
         print(f"    [video] ViewerGL not available: {e}")
         return None
 
     frames = []
     obs = env.reset()
-    total_reward = 0
     sim_time = 0.0
 
     # Set up viewer with model
@@ -56,13 +55,15 @@ def record_episode_video(env, policy, max_steps=200, width=640, height=480):
         viewer.begin_frame(sim_time)
         viewer.log_state(env.state_0)
         viewer.end_frame()
-        frame = viewer.get_pixels()
-        if frame is not None:
-            frames.append(frame[:, :, :3])  # Remove alpha if present
+
+        # get_frame returns wp.array on GPU, convert to numpy
+        frame_wp = viewer.get_frame()
+        if frame_wp is not None:
+            frame = frame_wp.numpy()
+            frames.append(frame)
 
         # Step
         obs, reward, terminated, truncated, _ = env.step(force)
-        total_reward += reward
         sim_time += env.dt
 
         if terminated or truncated:
@@ -71,9 +72,9 @@ def record_episode_video(env, policy, max_steps=200, width=640, height=480):
                 viewer.begin_frame(sim_time)
                 viewer.log_state(env.state_0)
                 viewer.end_frame()
-                frame = viewer.get_pixels()
-                if frame is not None:
-                    frames.append(frame[:, :, :3])
+                frame_wp = viewer.get_frame()
+                if frame_wp is not None:
+                    frames.append(frame_wp.numpy())
             break
 
     viewer.close()
