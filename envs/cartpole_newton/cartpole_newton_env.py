@@ -208,8 +208,13 @@ class CartPoleNewtonEnv:
 
         # Evaluate forward kinematics
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        wp.synchronize()
 
-        return self._get_obs()
+        # Debug: verify theta was set correctly
+        obs = self._get_obs()
+        print(f"[DEBUG] reset: theta_init={theta_init:.4f}, obs[1]={obs[1]:.4f}")
+
+        return obs
 
     def _get_obs(self) -> np.ndarray:
         """Get observation [x, theta, x_dot, theta_dot]."""
@@ -258,6 +263,10 @@ class CartPoleNewtonEnv:
         # Get new state
         obs = self._get_obs()
         theta = obs[1]
+
+        # Debug: print theta to verify angle reading
+        if self.steps <= 3:
+            print(f"[DEBUG] step={self.steps}, theta={theta:.4f}, cos(theta)={np.cos(theta):.4f}")
 
         # Check termination (only cart position bounds, no theta limit for swing-up)
         x = obs[0]
