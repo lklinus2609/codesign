@@ -591,8 +591,8 @@ class CartPoleNewtonVecEnv:
         self.cartpoles.set_attribute("joint_q", self.state_1, joint_q_wp)
         self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd_wp)
 
-        # Propagate reset state (like test_anymal_reset.py)
-        self._propagate_state()
+        # Note: Don't call _propagate_state() here - we're inside step()
+        # ArticulationView.set_attribute handles the state synchronization
         wp.synchronize()
 
 
