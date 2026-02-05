@@ -165,8 +165,8 @@ class CartPoleNewtonEnv:
         # Create articulation
         builder.add_articulation([j0, j1], key="cartpole")
 
-        # Finalize with gradients enabled
-        self.model = builder.finalize(requires_grad=True)
+        # Finalize model (no requires_grad - we use finite difference for gradients)
+        self.model = builder.finalize()
 
         # Use XPBD solver (works well for articulations)
         self.solver = newton.solvers.SolverXPBD(self.model)
