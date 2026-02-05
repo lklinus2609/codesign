@@ -4,13 +4,15 @@ Level 1.5: PGHC Co-Design for Cart-Pole using Newton Physics
 
 This validates the full PGHC pipeline with Newton before moving to Level 2 (Ant).
 
-Uses simplified PGHC (trusts gradient with small steps).
+Uses stability gating: inner loop runs until policy converges (return plateau),
+then outer loop updates morphology.
 """
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from collections import deque
 
 from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
 
@@ -187,20 +189,90 @@ def compute_design_gradient(env, policy, eps=0.02, horizon=200, n_rollouts=3):
     return mean_return, gradient
 
 
+class StabilityGate:
+    """
+    Stability gating for PGHC.
+
+    Monitors policy performance and signals when policy has converged
+    (return has plateaued), satisfying the Envelope Theorem assumption.
+    """
+
+    def __init__(self, window_size=10, threshold=0.05, min_iterations=20):
+        """
+        Args:
+            window_size: Number of recent returns to track
+            threshold: Relative change threshold (5% = 0.05)
+            min_iterations: Minimum iterations before allowing convergence
+        """
+        self.window_size = window_size
+        self.threshold = threshold
+        self.min_iterations = min_iterations
+        self.returns = deque(maxlen=window_size)
+        self.iteration = 0
+
+    def reset(self):
+        """Reset for new morphology."""
+        self.returns.clear()
+        self.iteration = 0
+
+    def update(self, mean_return):
+        """Update with new return value."""
+        self.returns.append(mean_return)
+        self.iteration += 1
+
+    def is_converged(self):
+        """Check if policy has converged (return plateau)."""
+        if self.iteration < self.min_iterations:
+            return False
+
+        if len(self.returns) < self.window_size:
+            return False
+
+        # Compute relative change: (max - min) / |mean|
+        returns_arr = np.array(self.returns)
+        mean_val = np.mean(returns_arr)
+        if abs(mean_val) < 1e-6:
+            return True  # Near zero, consider converged
+
+        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / abs(mean_val)
+        return relative_change < self.threshold
+
+    def get_stats(self):
+        """Get current stability statistics."""
+        if len(self.returns) < 2:
+            return {"mean": 0, "std": 0, "relative_change": 1.0}
+
+        returns_arr = np.array(self.returns)
+        mean_val = np.mean(returns_arr)
+        std_val = np.std(returns_arr)
+        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / max(abs(mean_val), 1e-6)
+
+        return {
+            "mean": mean_val,
+            "std": std_val,
+            "relative_change": relative_change,
+        }
+
+
 def pghc_codesign(
     n_outer_iterations=15,
-    n_inner_iterations=20,
+    max_inner_iterations=100,
+    stability_window=10,
+    stability_threshold=0.05,
+    min_inner_iterations=20,
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
 ):
     """
-    PGHC Co-Design for Newton Cart-Pole.
+    PGHC Co-Design for Newton Cart-Pole with Stability Gating.
 
-    Simplified version: trusts gradient direction with small steps.
+    Inner loop runs until policy converges (return plateau), then outer loop
+    updates morphology. This enforces the Envelope Theorem assumption.
     """
     print("=" * 60)
     print("PGHC Co-Design for Cart-Pole (Newton Physics)")
+    print("Stability Gating Mode")
     print("=" * 60)
 
     # Initialize
@@ -210,15 +282,27 @@ def pghc_codesign(
     policy = CartPolePolicy()
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
 
+    # Stability gate
+    stability_gate = StabilityGate(
+        window_size=stability_window,
+        threshold=stability_threshold,
+        min_iterations=min_inner_iterations,
+    )
+
     # Track history
     history = {
         "L": [parametric_model.L],
         "returns": [],
         "gradients": [],
+        "inner_iterations": [],
     }
 
     print(f"\nInitial pole length L = {parametric_model.L:.3f} m")
     print(f"L range: [{parametric_model.L_min}, {parametric_model.L_max}] m")
+    print(f"\nStability gating:")
+    print(f"  Window size: {stability_window}")
+    print(f"  Threshold: {stability_threshold:.1%}")
+    print(f"  Min iterations: {min_inner_iterations}")
 
     for outer_iter in range(n_outer_iterations):
         print(f"\n{'='*60}")
@@ -227,22 +311,37 @@ def pghc_codesign(
         print(f"  Current L = {parametric_model.L:.3f} m")
 
         # =============================================
-        # INNER LOOP: Train policy at current L
+        # INNER LOOP: Train until convergence
         # =============================================
-        print(f"\n  [Inner Loop] Training PPO for {n_inner_iterations} iterations...")
+        print(f"\n  [Inner Loop] Training PPO until convergence...")
+        stability_gate.reset()
 
-        for inner_iter in range(n_inner_iterations):
+        for inner_iter in range(max_inner_iterations):
             rollout = collect_rollout(env, policy, horizon=200)
             ppo_update(policy, optimizer, rollout)
 
+            # Evaluate and update stability gate
+            mean_ret, std_ret = evaluate_policy(env, policy, n_episodes=3)
+            stability_gate.update(mean_ret)
+            stats = stability_gate.get_stats()
+
             if (inner_iter + 1) % 10 == 0:
-                mean_ret, std_ret = evaluate_policy(env, policy, n_episodes=3)
-                print(f"    Inner iter {inner_iter + 1}: return = {mean_ret:.1f} +/- {std_ret:.1f}")
+                print(f"    Iter {inner_iter + 1}: return = {mean_ret:.1f}, "
+                      f"rel_change = {stats['relative_change']:.3f}")
+
+            # Check convergence
+            if stability_gate.is_converged():
+                print(f"    CONVERGED at iter {inner_iter + 1} "
+                      f"(rel_change = {stats['relative_change']:.3f} < {stability_threshold})")
+                break
+        else:
+            print(f"    MAX ITERATIONS reached ({max_inner_iterations})")
 
         # Final evaluation
         mean_return, std_return = evaluate_policy(env, policy, n_episodes=5)
         history["returns"].append(mean_return)
-        print(f"  Policy trained. Return = {mean_return:.1f} +/- {std_return:.1f}")
+        history["inner_iterations"].append(stability_gate.iteration)
+        print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}")
 
         # =============================================
         # OUTER LOOP: Compute design gradient
@@ -279,6 +378,10 @@ def pghc_codesign(
     print(f"  Final:   {history['L'][-1]:.3f} m")
     print(f"  Change:  {history['L'][-1] - history['L'][0]:+.3f} m")
 
+    print(f"\nInner loop iterations per outer loop:")
+    for i, iters in enumerate(history["inner_iterations"]):
+        print(f"  Outer {i+1}: {iters} inner iterations")
+
     print(f"\nReturn progression:")
     for i, ret in enumerate(history["returns"]):
         print(f"  Iter {i+1}: {ret:.1f}")
@@ -293,7 +396,10 @@ def pghc_codesign(
 if __name__ == "__main__":
     history, policy, model = pghc_codesign(
         n_outer_iterations=10,
-        n_inner_iterations=15,
+        max_inner_iterations=100,
+        stability_window=10,
+        stability_threshold=0.05,
+        min_inner_iterations=20,
         design_lr=0.02,
         initial_L=0.6,
     )
