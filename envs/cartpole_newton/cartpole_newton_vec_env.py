@@ -384,9 +384,14 @@ class CartPoleNewtonVecEnv:
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
-        # Debug: verify theta is now updating
+        # Debug: compare joint_q vs manually computed theta from body_q
         if self._step_count <= 5:
-            print(f"[DEBUG] step={self._step_count}, theta={joint_q[1]:.4f}")
+            body_q = self.state_0.body_q.numpy()
+            # Body 1 is pole for world 0. Transform is [x,y,z,qx,qy,qz,qw]
+            pole_quat = body_q[1][3:7]  # qx, qy, qz, qw
+            qy, qw = pole_quat[1], pole_quat[3]
+            theta_from_body = 2.0 * np.arctan2(qy, qw)
+            print(f"[DEBUG] step={self._step_count}: joint_q[1]={joint_q[1]:.4f}, theta_from_body={theta_from_body:.4f}, quat={pole_quat}")
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
