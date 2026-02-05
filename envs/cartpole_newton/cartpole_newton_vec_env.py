@@ -394,26 +394,26 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # IMPORTANT: eval_fk syncs joint_q -> body_q
-        # Must update BOTH state_0 and state_1 to avoid stale data after swap
+        # IMPORTANT: Must sync to BOTH Newton state AND MuJoCo internal state
+        # 1. Set Newton state via eval_fk
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
-        # Also explicitly set body velocities (eval_fk might not propagate joint_qd correctly)
-        body_qd_0 = self.state_0.body_qd.numpy()
-        body_qd_1 = self.state_1.body_qd.numpy()
+        # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
+        # MuJoCo uses its own mjw_data.qpos/qvel, not Newton's State
+        mjw_data = self.solver.mjw_data
+        qpos = mjw_data.qpos.numpy()  # Shape: [nworld, nq]
+        qvel = mjw_data.qvel.numpy()  # Shape: [nworld, nv]
+
         for i in range(self.num_worlds):
-            cart_idx = i * self.num_bodies_per_world
-            pole_idx = i * self.num_bodies_per_world + 1
-            x_dot = joint_qd[i * self.num_joints_per_world]
-            theta_dot = joint_qd[i * self.num_joints_per_world + 1]
-            # Set velocities (spatial vector: [wx, wy, wz, vx, vy, vz])
-            body_qd_0[cart_idx] = [0, 0, 0, x_dot, 0, 0]
-            body_qd_0[pole_idx] = [0, theta_dot, 0, 0, 0, 0]
-            body_qd_1[cart_idx] = [0, 0, 0, x_dot, 0, 0]
-            body_qd_1[pole_idx] = [0, theta_dot, 0, 0, 0, 0]
-        self.state_0.body_qd.assign(body_qd_0)
-        self.state_1.body_qd.assign(body_qd_1)
+            # MuJoCo qpos/qvel layout per world: [cart_x, pole_theta]
+            qpos[i, 0] = joint_q[i * self.num_joints_per_world]      # cart x
+            qpos[i, 1] = joint_q[i * self.num_joints_per_world + 1]  # pole theta
+            qvel[i, 0] = joint_qd[i * self.num_joints_per_world]     # cart x_dot
+            qvel[i, 1] = joint_qd[i * self.num_joints_per_world + 1] # pole theta_dot
+
+        mjw_data.qpos.assign(qpos)
+        mjw_data.qvel.assign(qvel)
         wp.synchronize()
 
         # Debug: check initial state
@@ -483,8 +483,6 @@ class CartPoleNewtonVecEnv:
 
         # Scale actions to forces (actions should already be in [-1, 1] from tanh policy)
         forces = actions * self.force_max
-        # DEBUG: zero forces to test if explosion is force-related
-        forces = np.zeros_like(forces)
 
         # Apply forces to control.joint_f ONCE before substep loop (like official Newton tests)
         # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
@@ -633,25 +631,25 @@ class CartPoleNewtonVecEnv:
         self.model.joint_q.assign(joint_q)
         self.model.joint_qd.assign(joint_qd)
 
-        # IMPORTANT: eval_fk syncs joint_q -> body_q
-        # Must update BOTH state_0 and state_1 to avoid stale data after swap
+        # IMPORTANT: Must sync to BOTH Newton state AND MuJoCo internal state
+        # 1. Set Newton state via eval_fk
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
 
-        # Also explicitly zero body velocities for reset worlds (eval_fk might not do this)
-        body_qd_0 = self.state_0.body_qd.numpy()
-        body_qd_1 = self.state_1.body_qd.numpy()
+        # 2. Sync to MuJoCo's internal qpos/qvel (critical!)
+        mjw_data = self.solver.mjw_data
+        qpos = mjw_data.qpos.numpy()
+        qvel = mjw_data.qvel.numpy()
+
         for i in range(self.num_worlds):
             if reset_mask[i]:
-                cart_idx = i * self.num_bodies_per_world
-                pole_idx = i * self.num_bodies_per_world + 1
-                # Zero out velocities (spatial vector: [wx, wy, wz, vx, vy, vz])
-                body_qd_0[cart_idx] = [0, 0, 0, 0, 0, 0]
-                body_qd_0[pole_idx] = [0, 0, 0, 0, 0, 0]
-                body_qd_1[cart_idx] = [0, 0, 0, 0, 0, 0]
-                body_qd_1[pole_idx] = [0, 0, 0, 0, 0, 0]
-        self.state_0.body_qd.assign(body_qd_0)
-        self.state_1.body_qd.assign(body_qd_1)
+                qpos[i, 0] = joint_q[i * self.num_joints_per_world]
+                qpos[i, 1] = joint_q[i * self.num_joints_per_world + 1]
+                qvel[i, 0] = joint_qd[i * self.num_joints_per_world]
+                qvel[i, 1] = joint_qd[i * self.num_joints_per_world + 1]
+
+        mjw_data.qpos.assign(qpos)
+        mjw_data.qvel.assign(qvel)
         wp.synchronize()
 
         # Debug: verify reset worked
