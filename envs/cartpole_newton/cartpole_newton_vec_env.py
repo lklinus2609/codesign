@@ -568,6 +568,9 @@ class CartPoleNewtonVecEnv:
 
     def _reset_worlds(self, reset_mask: np.ndarray):
         """Reset specific worlds that terminated."""
+        num_reset = np.sum(reset_mask)
+
+        # Read current joint state (from model, not from extract kernel output)
         joint_q = self.model.joint_q.numpy()
         joint_qd = self.model.joint_qd.numpy()
 
@@ -597,6 +600,12 @@ class CartPoleNewtonVecEnv:
         # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
         wp.synchronize()
+
+        # Debug: verify reset worked
+        if num_reset > 0 and self._step_count < 10:
+            obs_after = self._get_obs()
+            x_reset = obs_after[reset_mask, 0]
+            print(f"[DEBUG] Reset {num_reset} worlds: x after reset in [{x_reset.min():.2f}, {x_reset.max():.2f}]")
 
 
 def test_vec_env():
