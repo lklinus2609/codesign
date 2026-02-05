@@ -76,6 +76,7 @@ class CartPoleNewtonEnv:
         force_max: float = 10.0,
         theta_threshold: float = 0.2,
         num_substeps: int = 4,
+        ctrl_cost_weight: float = 0.1,
         device: str = "cuda",
     ):
         if not NEWTON_AVAILABLE:
@@ -87,6 +88,7 @@ class CartPoleNewtonEnv:
         self.theta_threshold = theta_threshold
         self.num_substeps = num_substeps
         self.sub_dt = dt / num_substeps
+        self.ctrl_cost_weight = ctrl_cost_weight
 
         if parametric_model is None:
             self.parametric_model = ParametricCartPoleNewton()
@@ -261,8 +263,12 @@ class CartPoleNewtonEnv:
         self.terminated = abs(theta) > self.theta_threshold
         truncated = self.steps >= self.max_steps
 
-        # Shaped reward (for gradient flow)
-        reward = float(np.cos(theta))
+        # Shaped reward with control cost
+        # - Balance reward: cos(theta) in [0, 1] for |theta| < 0.2
+        # - Control cost: penalize large forces
+        balance_reward = float(np.cos(theta))
+        ctrl_cost = self.ctrl_cost_weight * (force / self.force_max) ** 2
+        reward = balance_reward - ctrl_cost
 
         info = {
             "x": obs[0],
@@ -272,6 +278,8 @@ class CartPoleNewtonEnv:
             "theta_dot": obs[3],
             "force": force,
             "L": self.parametric_model.L,
+            "balance_reward": balance_reward,
+            "ctrl_cost": ctrl_cost,
         }
 
         return obs, reward, self.terminated, truncated, info

@@ -273,6 +273,7 @@ def pghc_codesign(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
+    ctrl_cost_weight=0.1,
     use_wandb=False,
 ):
     """
@@ -302,6 +303,7 @@ def pghc_codesign(
                 "design_lr": design_lr,
                 "max_step": max_step,
                 "initial_L": initial_L,
+                "ctrl_cost_weight": ctrl_cost_weight,
             },
         )
         print("  [wandb] Logging enabled")
@@ -311,7 +313,7 @@ def pghc_codesign(
 
     # Initialize
     parametric_model = ParametricCartPoleNewton(L_init=initial_L)
-    env = CartPoleNewtonEnv(parametric_model=parametric_model)
+    env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
 
     policy = CartPolePolicy()
     optimizer = optim.Adam(policy.parameters(), lr=3e-4)
@@ -336,6 +338,7 @@ def pghc_codesign(
 
     print(f"\nInitial pole length L = {parametric_model.L:.3f} m")
     print(f"L range: [{parametric_model.L_min}, {parametric_model.L_max}] m")
+    print(f"Control cost weight: {ctrl_cost_weight}")
     print(f"\nStability gating:")
     print(f"  Window size: {stability_window}")
     print(f"  Threshold: {stability_threshold:.1%}")
@@ -427,7 +430,7 @@ def pghc_codesign(
         parametric_model.set_L(old_L + step)
 
         # Rebuild environment with new L
-        env = CartPoleNewtonEnv(parametric_model=parametric_model)
+        env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
 
         print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
         history["L"].append(parametric_model.L)
@@ -487,6 +490,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-inner-iters", type=int, default=100, help="Max inner iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
+    parser.add_argument("--ctrl-cost", type=float, default=0.1, help="Control cost weight")
     args = parser.parse_args()
 
     history, policy, model = pghc_codesign(
@@ -497,5 +501,6 @@ if __name__ == "__main__":
         min_inner_iterations=20,
         design_lr=args.design_lr,
         initial_L=args.initial_L,
+        ctrl_cost_weight=args.ctrl_cost,
         use_wandb=args.wandb,
     )
