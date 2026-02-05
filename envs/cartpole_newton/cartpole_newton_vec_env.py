@@ -456,6 +456,9 @@ class CartPoleNewtonVecEnv:
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
+        # Synchronize to prevent warp state corruption (known issue)
+        wp.synchronize()
+
         # Extract joint positions from body state
         # (MuJoCo solver updates body_q but not model.joint_q)
         wp.launch(
@@ -482,7 +485,13 @@ class CartPoleNewtonVecEnv:
         # Compute rewards from observations
         theta = obs[:, 1]
         x = obs[:, 0]
-        forces = self.forces_wp.numpy()
+
+        # Check for NaN/Inf (physics instability)
+        invalid = np.isnan(x) | np.isinf(x) | np.isnan(theta) | np.isinf(theta)
+        if np.any(invalid):
+            # Clamp invalid values to prevent reward explosion
+            x = np.where(invalid, 0.0, x)
+            theta = np.where(invalid, np.pi, theta)
 
         # Swing-up reward structure:
         # 1. Survival bonus: +1 per step for staying in bounds
@@ -491,19 +500,17 @@ class CartPoleNewtonVecEnv:
         # 2. Height reward: cos(theta) = -1 (down) to +1 (up)
         height_reward = np.cos(theta)
 
-        # 3. Position penalty: keep cart centered (small coefficient)
-        position_cost = 0.1 * x ** 2
-
-        # 4. Control cost: very low - swing-up needs big movements
+        # 3. Control cost: use actual applied forces
         ctrl_cost = self.ctrl_cost_weight * (forces / self.force_max) ** 2
 
-        rewards = survival_bonus + height_reward - position_cost - ctrl_cost
+        # No position penalty during episode - cart needs freedom to swing
+        rewards = survival_bonus + height_reward - ctrl_cost
 
-        # Check termination (cart position limit)
-        terminated = np.abs(x) > 2.4
+        # Check termination (cart position limit or invalid state)
+        terminated = (np.abs(x) > 2.4) | invalid
 
-        # Termination penalty - mild, don't overwhelm learning signal
-        rewards[terminated] -= 2.0
+        # Termination penalty - only penalty for going out of bounds
+        rewards[terminated] -= 5.0
 
         # Check truncation (max steps)
         truncated = self.steps >= self.max_steps
@@ -547,6 +554,7 @@ class CartPoleNewtonVecEnv:
 
         # IMPORTANT: eval_fk syncs joint_q -> body_q (state_0)
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
+        wp.synchronize()
 
 
 def test_vec_env():
