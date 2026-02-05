@@ -32,86 +32,175 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, ParametricCartPoleNewton
 
 
+def _record_video_subprocess(L_value, policy_state_dict, ctrl_cost_weight, max_steps, width, height):
+    """
+    Record video in a subprocess to get a fresh OpenGL context.
+
+    Newton's ViewerGL doesn't properly clean up OpenGL resources on close(),
+    causing black screens when creating multiple viewers. Running in a subprocess
+    guarantees a fresh OpenGL context each time.
+    """
+    import multiprocessing as mp
+    import pickle
+    import tempfile
+
+    # Save policy weights to temp file
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as f:
+        pickle.dump({
+            'state_dict': policy_state_dict,
+            'L_value': L_value,
+            'ctrl_cost_weight': ctrl_cost_weight,
+            'max_steps': max_steps,
+            'width': width,
+            'height': height,
+        }, f)
+        config_path = f.name
+
+    # Create output file for frames
+    with tempfile.NamedTemporaryFile(mode='wb', suffix='.pkl', delete=False) as f:
+        output_path = f.name
+
+    # Run recording in subprocess
+    import subprocess
+    import sys
+
+    script = f'''
+import os
+os.environ["PYGLET_HEADLESS"] = "1"
+
+import pickle
+import numpy as np
+import torch
+
+import warp as wp
+import newton
+
+# Initialize warp
+wp.init()
+
+# Load config
+with open("{config_path}", "rb") as f:
+    config = pickle.load(f)
+
+# Reconstruct policy
+from codesign_cartpole_newton_vec import CartPolePolicy
+policy = CartPolePolicy()
+policy.load_state_dict(config["state_dict"])
+policy.eval()
+
+# Import environment
+from envs.cartpole_newton import CartPoleNewtonEnv, ParametricCartPoleNewton
+
+# Create environment
+parametric = ParametricCartPoleNewton(L_init=config["L_value"])
+env = CartPoleNewtonEnv(parametric_model=parametric, ctrl_cost_weight=config["ctrl_cost_weight"])
+wp.synchronize()
+
+# Create viewer
+viewer = newton.viewer.ViewerGL(headless=True, width=config["width"], height=config["height"])
+
+frames = []
+obs = env.reset()
+sim_time = 0.0
+
+# Forward kinematics
+newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
+wp.synchronize()
+
+# Setup viewer
+viewer.set_model(env.model)
+viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
+
+# Warm-up
+viewer.begin_frame(0.0)
+viewer.log_state(env.state_0)
+viewer.end_frame()
+_ = viewer.get_frame()
+wp.synchronize()
+
+# Record frames
+for step in range(config["max_steps"]):
+    action = policy.get_action(obs, deterministic=True)
+    force = float(action[0]) * env.force_max
+
+    viewer.begin_frame(sim_time)
+    viewer.log_state(env.state_0)
+    viewer.end_frame()
+
+    frame_wp = viewer.get_frame()
+    if frame_wp is not None:
+        frames.append(frame_wp.numpy())
+
+    obs, reward, terminated, truncated, _ = env.step(force)
+    sim_time += env.dt
+
+    if terminated or truncated:
+        for _ in range(10):
+            viewer.begin_frame(sim_time)
+            viewer.log_state(env.state_0)
+            viewer.end_frame()
+            frame_wp = viewer.get_frame()
+            if frame_wp is not None:
+                frames.append(frame_wp.numpy())
+        break
+
+wp.synchronize()
+viewer.close()
+
+# Save frames
+if frames:
+    video = np.stack(frames)
+    with open("{output_path}", "wb") as f:
+        pickle.dump(video, f)
+'''
+
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        cwd=os.path.dirname(os.path.abspath(__file__)),
+    )
+
+    if result.returncode != 0:
+        print(f"    [video] Subprocess error: {result.stderr[:500]}")
+        # Cleanup temp files
+        try:
+            os.unlink(config_path)
+            os.unlink(output_path)
+        except:
+            pass
+        return None
+
+    # Load frames
+    try:
+        with open(output_path, 'rb') as f:
+            video = pickle.load(f)
+    except:
+        video = None
+
+    # Cleanup temp files
+    try:
+        os.unlink(config_path)
+        os.unlink(output_path)
+    except:
+        pass
+
+    return video
+
+
 def record_episode_video(L_value, policy, ctrl_cost_weight, max_steps=200, width=640, height=480):
     """
     Record a video of one episode.
 
-    Note: Newton's ViewerGL.set_model() can only be called once, so we must create
-    a fresh viewer for each recording. Proper cleanup with wp.synchronize() and
-    gc.collect() prevents OpenGL state corruption.
+    Uses subprocess to get a fresh OpenGL context, avoiding Newton's ViewerGL
+    resource cleanup issues that cause black screens on subsequent recordings.
     """
-    # Full GPU sync and cleanup before creating viewer
-    wp.synchronize()
-    gc.collect()
-    wp.synchronize()
+    # Get policy state dict for subprocess
+    policy_state_dict = {k: v.cpu() for k, v in policy.state_dict().items()}
 
-    # Create fresh environment
-    fresh_parametric = ParametricCartPoleNewton(L_init=L_value)
-    env = CartPoleNewtonEnv(parametric_model=fresh_parametric, ctrl_cost_weight=ctrl_cost_weight)
-    wp.synchronize()
-
-    # Create fresh viewer (set_model can only be called once per viewer)
-    try:
-        viewer = newton.viewer.ViewerGL(headless=True, width=width, height=height)
-    except Exception as e:
-        print(f"    [video] ViewerGL not available: {e}")
-        return None
-
-    frames = []
-    obs = env.reset()
-    sim_time = 0.0
-
-    # Compute forward kinematics
-    newton.eval_fk(env.model, env.model.joint_q, env.model.joint_qd, env.state_0)
-    wp.synchronize()
-
-    # Set up viewer
-    viewer.set_model(env.model)
-    viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
-
-    # Warm-up render
-    viewer.begin_frame(0.0)
-    viewer.log_state(env.state_0)
-    viewer.end_frame()
-    _ = viewer.get_frame()
-    wp.synchronize()
-
-    for step in range(max_steps):
-        action = policy.get_action(obs, deterministic=True)
-        force = float(action[0]) * env.force_max
-
-        viewer.begin_frame(sim_time)
-        viewer.log_state(env.state_0)
-        viewer.end_frame()
-
-        frame_wp = viewer.get_frame()
-        if frame_wp is not None:
-            frames.append(frame_wp.numpy())
-
-        obs, reward, terminated, truncated, _ = env.step(force)
-        sim_time += env.dt
-
-        if terminated or truncated:
-            for _ in range(10):
-                viewer.begin_frame(sim_time)
-                viewer.log_state(env.state_0)
-                viewer.end_frame()
-                frame_wp = viewer.get_frame()
-                if frame_wp is not None:
-                    frames.append(frame_wp.numpy())
-            break
-
-    # Proper cleanup: sync, close, delete, sync, gc
-    wp.synchronize()
-    viewer.close()
-    del viewer
-    wp.synchronize()
-    gc.collect()
-
-    if len(frames) == 0:
-        return None
-
-    return np.stack(frames)
+    return _record_video_subprocess(
+        L_value, policy_state_dict, ctrl_cost_weight, max_steps, width, height
+    )
 
 
 class CartPolePolicy(nn.Module):
