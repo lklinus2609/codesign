@@ -484,7 +484,7 @@ def pghc_codesign_vec(
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
-    num_worlds=4096,
+    num_worlds=1024,
     use_wandb=False,
     video_every_n_iters=100,
 ):
@@ -727,7 +727,7 @@ if __name__ == "__main__":
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--num-worlds", type=int, default=4096, help="Number of parallel worlds")
+    parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel worlds")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
