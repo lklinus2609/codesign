@@ -381,27 +381,38 @@ class CartPoleNewtonVecEnv:
 
     def _get_obs(self) -> np.ndarray:
         """Get observations for all worlds. Returns (num_worlds, 4)."""
-        joint_q = self.model.joint_q.numpy()
-        joint_qd = self.model.joint_qd.numpy()
-
-        # Debug: compare joint_q vs manually computed theta from body_q
-        if self._step_count <= 5:
-            body_q = self.state_0.body_q.numpy()
-            # Body 1 is pole for world 0. Transform is [x,y,z,qx,qy,qz,qw]
-            pole_quat = body_q[1][3:7]  # qx, qy, qz, qw
-            qy, qw = pole_quat[1], pole_quat[3]
-            theta_from_body = 2.0 * np.arctan2(qy, qw)
-            print(f"[DEBUG] step={self._step_count}: joint_q[1]={joint_q[1]:.4f}, theta_from_body={theta_from_body:.4f}, quat={pole_quat}")
+        # Read body state directly (MuJoCo doesn't update model.joint_q)
+        body_q = self.state_0.body_q.numpy()
+        body_qd = self.state_0.body_qd.numpy()
 
         obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
         for i in range(self.num_worlds):
-            x_idx = i * self.num_joints_per_world
-            theta_idx = i * self.num_joints_per_world + 1
+            cart_idx = i * self.num_bodies_per_world + 0
+            pole_idx = i * self.num_bodies_per_world + 1
 
-            obs[i, 0] = joint_q[x_idx]      # x
-            obs[i, 1] = joint_q[theta_idx]   # theta
-            obs[i, 2] = joint_qd[x_idx]      # x_dot
-            obs[i, 3] = joint_qd[theta_idx]  # theta_dot
+            # Cart position: x component minus world offset
+            world_offset = i * 3.0  # worlds spaced 3.0 apart
+            cart_pos = body_q[cart_idx][:3]
+            x = cart_pos[0] - world_offset
+
+            # Pole angle from quaternion (rotation around y-axis)
+            pole_quat = body_q[pole_idx][3:7]  # qx, qy, qz, qw
+            qy, qw = pole_quat[1], pole_quat[3]
+            theta = 2.0 * np.arctan2(qy, qw)
+
+            # Cart velocity (x component of linear velocity)
+            # body_qd is spatial vector [wx, wy, wz, vx, vy, vz]
+            cart_vel = body_qd[cart_idx]
+            x_dot = cart_vel[3]  # linear velocity x
+
+            # Pole angular velocity (y component of angular velocity)
+            pole_vel = body_qd[pole_idx]
+            theta_dot = pole_vel[1]  # angular velocity around y
+
+            obs[i, 0] = x
+            obs[i, 1] = theta
+            obs[i, 2] = x_dot
+            obs[i, 3] = theta_dot
 
         return obs
 
@@ -462,49 +473,30 @@ class CartPoleNewtonVecEnv:
         self.steps += 1
         self._step_count += 1
 
-        # Compute rewards using kernel
-        wp.launch(
-            compute_rewards_kernel,
-            dim=self.num_worlds,
-            inputs=[
-                self.model.joint_q,
-                self.forces_wp,
-                self.force_max,
-                self.ctrl_cost_weight,
-                self.num_joints_per_world,
-            ],
-            outputs=[self.rewards_wp],
-            device=self.device,
-        )
+        # Get observations (computed from body state)
+        obs = self._get_obs()
 
-        # Check termination using kernel (cart position limit, not theta)
-        wp.launch(
-            check_termination_kernel,
-            dim=self.num_worlds,
-            inputs=[
-                self.model.joint_q,
-                2.4,  # x_limit - cart position bounds
-                self.num_joints_per_world,
-            ],
-            outputs=[self.terminated_wp],
-            device=self.device,
-        )
+        # Compute rewards from observations (theta is obs[:, 1])
+        theta = obs[:, 1]
+        forces = self.forces_wp.numpy()
+        balance_reward = np.cos(theta)
+        ctrl_cost = self.ctrl_cost_weight * (forces / self.force_max) ** 2
+        rewards = balance_reward - ctrl_cost
 
-        # Get results
-        rewards = self.rewards_wp.numpy().copy()
-        terminated = self.terminated_wp.numpy().copy()
+        # Check termination (cart position limit)
+        x = obs[:, 0]
+        terminated = np.abs(x) > 2.4
 
         # Check truncation (max steps)
         truncated = self.steps >= self.max_steps
-        dones = (terminated == 1) | truncated
+        dones = terminated | truncated
 
         # Auto-reset terminated worlds
         reset_mask = dones
         if np.any(reset_mask):
             self._reset_worlds(reset_mask)
-
-        # Get observations
-        obs = self._get_obs()
+            # Re-get observations for reset worlds
+            obs = self._get_obs()
 
         infos = {
             "L": self.parametric_model.L,
