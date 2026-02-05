@@ -483,6 +483,8 @@ class CartPoleNewtonVecEnv:
 
         # Scale actions to forces (actions should already be in [-1, 1] from tanh policy)
         forces = actions * self.force_max
+        # DEBUG: zero forces to test if explosion is force-related
+        forces = np.zeros_like(forces)
 
         # Apply forces to control.joint_f ONCE before substep loop (like official Newton tests)
         # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
