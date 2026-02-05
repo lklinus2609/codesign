@@ -49,7 +49,7 @@ class ParametricPendulum:
     def __init__(
         self,
         L_init: float = 0.5,
-        L_min: float = 0.3,
+        L_min: float = 0.4,
         L_max: float = 1.5,
         mass: float = 0.5,
         device: str = "cpu",
@@ -441,7 +441,9 @@ class SimplePendulumPolicy:
     - If energy < target: pump energy into the system
     - If energy ≈ target and near top: balance with PD control
 
-    This doesn't require training and works well for testing co-design.
+    IMPORTANT: For envelope theorem validity, the policy uses a FIXED reference
+    L value for energy calculations, not the current L. This ensures the policy
+    is truly frozen when computing gradients w.r.t. L.
     """
 
     def __init__(
@@ -449,6 +451,7 @@ class SimplePendulumPolicy:
         env: PendulumEnv,
         Kp: float = 10.0,
         Kd: float = 2.0,
+        L_reference: Optional[float] = None,
     ):
         """
         Initialize the policy.
@@ -457,18 +460,26 @@ class SimplePendulumPolicy:
             env: Pendulum environment
             Kp: Proportional gain for balance
             Kd: Derivative gain for balance
+            L_reference: Fixed L for energy calculations. If None, uses current L
+                        at policy creation time. This ensures policy doesn't adapt
+                        when L changes during gradient computation.
         """
         self.env = env
         self.Kp = Kp
         self.Kd = Kd
         self.device = env.device
+        # CRITICAL: Store L at policy creation time, don't query it dynamically
+        self.L_ref = L_reference if L_reference is not None else env.parametric_model.get_L()
+        self.m = env.mass
+        self.g = env.gravity
+        self.torque_max = env.torque_max
 
     def __call__(self, obs: torch.Tensor) -> torch.Tensor:
         """
         Compute action given observation.
 
         Args:
-            obs: Observation [cos(θ), sin(θ), θ̇_normalized]
+            obs: Observation [cos(theta), sin(theta), theta_dot_normalized]
 
         Returns:
             Action (torque)
@@ -480,15 +491,14 @@ class SimplePendulumPolicy:
 
         theta = math.atan2(sin_theta, cos_theta)
 
-        # Compute mechanical energy (normalized)
-        # E = 0.5*m*L²*θ̇² + m*g*L*(1 - cos(θ))
-        # For swing-up, target energy is E_target = 2*m*g*L (energy at top)
-        L = self.env.parametric_model.get_L()
-        m = self.env.mass
-        g = self.env.gravity
+        # Compute mechanical energy using FIXED reference L
+        # This ensures policy is truly frozen w.r.t. L changes
+        L = self.L_ref  # Use fixed reference, NOT current env L
+        m = self.m
+        g = self.g
 
         KE = 0.5 * m * L * L * theta_dot * theta_dot
-        PE = m * g * L * (1 - cos_theta)  # 0 at bottom, 2*m*g*L at top
+        PE = m * g * L * (1 + cos_theta)  # 2*m*g*L at top, 0 at bottom
         E = KE + PE
         E_target = 2 * m * g * L  # Energy at top with zero velocity
 
@@ -502,7 +512,7 @@ class SimplePendulumPolicy:
         else:
             # Swing-up mode: energy pumping
             # Pump energy when moving in the direction that increases E
-            # τ = k * sign(θ̇) * sign(E_error)
+            # torque = k * sign(theta_dot) * sign(E_error)
             # This adds energy when E < E_target and removes when E > E_target
             k = 1.5  # Pump gain
             if E_error < 0:
@@ -513,7 +523,7 @@ class SimplePendulumPolicy:
                 torque = -k * (1.0 if theta_dot >= 0 else -1.0)
 
         # Clamp to torque limits
-        torque = max(-self.env.torque_max, min(self.env.torque_max, torque))
+        torque = max(-self.torque_max, min(self.torque_max, torque))
 
         return torch.tensor([torque], dtype=torch.float64, device=self.device)
 

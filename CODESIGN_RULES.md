@@ -69,11 +69,18 @@ codesign/                          # Repository root
 │   ├── test_gpu_memory.py         # Memory profiling
 │   ├── validate_outer_loop.py     # End-to-end gradient validation
 │   │
-│   ├── # === VERIFICATION ENVIRONMENTS (to be added) ===
+│   ├── # === VERIFICATION ENVIRONMENTS ===
 │   ├── envs/                      # Simplified test environments
-│   │   ├── pendulum/              # Level 1: Inverted pendulum
-│   │   ├── cheetah/               # Level 2: HalfCheetah
-│   │   └── ant/                   # Level 3: Ant
+│   │   ├── __init__.py
+│   │   ├── pendulum/              # Simple pendulum (early experiments)
+│   │   │   ├── __init__.py
+│   │   │   └── pendulum_env.py
+│   │   ├── cartpole/              # Level 1: Cart-pole (current)
+│   │   │   ├── __init__.py
+│   │   │   ├── cartpole_env.py    # Differentiable physics
+│   │   │   └── ppo.py             # PPO implementation
+│   │   ├── cheetah/               # Level 2: HalfCheetah (planned, Warp)
+│   │   └── ant/                   # Level 3: Ant (planned, Warp)
 │   │
 │   ├── # === DOCUMENTATION ===
 │   ├── README.md                  # Quick start guide
@@ -346,21 +353,25 @@ python validate_outer_loop.py
 ### Progression
 
 ```
-Level 0: Component Verification (no physics)
+Level 0: Component Verification (no physics)         [DONE]
     ├── 0A: Gradient pipeline (finite diff vs autograd)
     ├── 0B: Trust region mechanics (synthetic objective)
     └── 0C: Quaternion chain rule
+    Code: test_level0_verification.py
 
-Level 1: Inverted Pendulum (1D analytical)
-    └── Verify envelope theorem with known optimal solution
+Level 1: Cart-Pole (hand-coded PyTorch physics)      [IN PROGRESS]
+    ├── Design parameter: pole length L
+    ├── Inner loop: PPO
+    └── Verify envelope theorem, gradient correctness
+    Code: envs/cartpole/, train_cartpole_ppo.py
 
-Level 2: HalfCheetah (2D benchmark)
-    └── Tune trust region hyperparameters (β, ξ, decay)
+Level 2: HalfCheetah (Warp/Newton physics)           [PLANNED]
+    └── Tune trust region hyperparameters (beta, xi, decay)
 
-Level 3: Ant (3D bridge)
+Level 3: Ant (Warp/Newton physics)                   [PLANNED]
     └── Verify 3D contact handling
 
-Level 4: G1 Humanoid (target)
+Level 4: G1 Humanoid (target)                        [PLANNED]
     └── Full system validation
 ```
 
@@ -485,14 +496,51 @@ Record significant technical decisions here with date and rationale.
 
 ### 2026-02-04: Verification Ladder Approach
 
-**Decision**: Implement 4-level verification (Pendulum → Cheetah → Ant → Humanoid) before full humanoid testing.
+**Decision**: Implement 5-level verification (Level 0 Math → Cart-Pole → Cheetah → Ant → Humanoid) before full humanoid testing.
 
 **Rationale**: Debugging failures on 30-DOF humanoid is impractical. Each level isolates specific algorithm components:
-- Level 1 tests envelope theorem
+- Level 0 tests math correctness (gradients, trust region, quaternion chain rule)
+- Level 1 tests envelope theorem on cart-pole
 - Level 2 tests trust region adaptation
 - Level 3 tests 3D contact handling
 
 **Reference**: `VERIFICATION_PLAN.md`
+
+---
+
+### 2026-02-04: Physics Engine Selection by Level
+
+**Decision**: Use different physics backends per verification level:
+- Level 0: No physics (pure math tests)
+- Level 1: Hand-coded PyTorch (analytical cart-pole dynamics)
+- Level 2+: NVIDIA Warp or Newton (differentiable multi-body physics)
+
+**Rationale**:
+- Level 1 needs differentiable dReturn/dL gradients; standard engines (MuJoCo, Bullet) not differentiable
+- Hand-coded PyTorch sufficient for simple cart-pole (1 joint, 4 state variables)
+- Level 2+ requires real physics engine for complex multi-body dynamics
+- Warp/Newton provide GPU-accelerated differentiable simulation
+
+**Code**: `envs/cartpole/cartpole_env.py` (hand-coded), Newton for Level 2+
+
+---
+
+### 2026-02-04: PPO as Inner Loop Policy Optimizer
+
+**Decision**: Use PPO (Proximal Policy Optimization) for inner loop policy learning at all verification levels.
+
+**Rationale**:
+- Industry standard for continuous control
+- Stable training with clipped surrogate objective
+- Works with both simple (cart-pole) and complex (humanoid) environments
+- Can later extend to PPO+AMP for motion imitation
+
+**Code**: `envs/cartpole/ppo.py`
+
+**Alternatives Considered**:
+- LQR: Only works near equilibrium, no swing-up capability
+- SAC: More sample efficient but more complex to implement
+- Hand-tuned PD: Not generalizable to complex tasks
 
 ---
 
@@ -586,6 +634,6 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ---
 
-*Document Version: 1.0*
+*Document Version: 1.1*
 *Last Updated: 2026-02-04*
 *Maintainer: [Your Name]*
