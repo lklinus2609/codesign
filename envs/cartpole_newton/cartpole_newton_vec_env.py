@@ -400,7 +400,11 @@ class CartPoleNewtonVecEnv:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_1)
         wp.synchronize()
 
-        return self._get_obs()
+        # Debug: check initial state
+        obs = self._get_obs()
+        print(f"[DEBUG] After reset(): x in [{obs[:, 0].min():.2f}, {obs[:, 0].max():.2f}], "
+              f"theta in [{obs[:, 1].min():.2f}, {obs[:, 1].max():.2f}]")
+        return obs
 
     def _get_obs(self) -> np.ndarray:
         """Get observations for all worlds. Returns (num_worlds, 4)."""
@@ -522,9 +526,9 @@ class CartPoleNewtonVecEnv:
         # Debug: check if x is out of bounds on first few steps
         if self._step_count <= 3:
             out_of_bounds = np.abs(x) > self.x_limit
-            print(f"[DEBUG] step={self._step_count}: x in [{x.min():.2f}, {x.max():.2f}], "
-                  f"theta in [{theta.min():.2f}, {theta.max():.2f}], "
-                  f"out_of_bounds={np.sum(out_of_bounds)}/{self.num_worlds}")
+            print(f"[DEBUG] step={self._step_count}: x=[{x.min():.2f}, {x.max():.2f}], "
+                  f"x_dot=[{x_dot.min():.1f}, {x_dot.max():.1f}], "
+                  f"out_of_bounds={np.sum(out_of_bounds)}")
 
         # IsaacLab-style reward structure:
         # (1) Alive bonus: +1.0 per step
@@ -609,7 +613,9 @@ class CartPoleNewtonVecEnv:
         if num_reset > 0 and self._step_count < 10:
             obs_after = self._get_obs()
             x_reset = obs_after[reset_mask, 0]
-            print(f"[DEBUG] Reset {num_reset} worlds: x after reset in [{x_reset.min():.2f}, {x_reset.max():.2f}]")
+            x_dot_reset = obs_after[reset_mask, 2]
+            print(f"[DEBUG] Reset {num_reset} worlds: x=[{x_reset.min():.2f}, {x_reset.max():.2f}], "
+                  f"x_dot=[{x_dot_reset.min():.2f}, {x_dot_reset.max():.2f}]")
 
 
 def test_vec_env():
