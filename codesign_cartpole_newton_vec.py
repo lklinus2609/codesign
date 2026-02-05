@@ -1,0 +1,501 @@
+#!/usr/bin/env python3
+"""
+Level 1.5: PGHC Co-Design for Cart-Pole using Vectorized Newton Physics
+
+Uses N parallel environments on GPU for dramatically faster training.
+
+Run with wandb logging:
+    python codesign_cartpole_newton_vec.py --wandb --num-worlds 64
+"""
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import argparse
+from collections import deque
+
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
+
+import warp as wp
+import newton
+
+from envs.cartpole_newton import CartPoleNewtonVecEnv, CartPoleNewtonEnv, ParametricCartPoleNewton
+
+
+class CartPolePolicy(nn.Module):
+    """Policy network for cart-pole (supports batched inference)."""
+
+    def __init__(self, obs_dim=4, act_dim=1, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, act_dim),
+        )
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
+
+    def forward(self, x):
+        return self.net(x)
+
+    def get_action(self, obs, deterministic=False):
+        """Get action for single observation."""
+        if isinstance(obs, np.ndarray):
+            obs = torch.FloatTensor(obs)
+        with torch.no_grad():
+            mean = self.forward(obs)
+            if deterministic:
+                return mean.numpy()
+            std = torch.exp(self.log_std)
+            action = mean + std * torch.randn_like(mean)
+            return action.numpy()
+
+    def get_actions_batch(self, obs_batch, deterministic=False):
+        """Get actions for batch of observations."""
+        if isinstance(obs_batch, np.ndarray):
+            obs_batch = torch.FloatTensor(obs_batch)
+        with torch.no_grad():
+            mean = self.forward(obs_batch)
+            if deterministic:
+                return mean.numpy()
+            std = torch.exp(self.log_std)
+            actions = mean + std * torch.randn_like(mean)
+            return actions.numpy()
+
+    def get_action_and_log_prob_batch(self, obs_batch):
+        """Get actions and log probs for batch."""
+        mean = self.forward(obs_batch)
+        std = torch.exp(self.log_std)
+        dist = torch.distributions.Normal(mean, std)
+        actions = dist.rsample()
+        log_probs = dist.log_prob(actions).sum(-1)
+        return actions, log_probs
+
+
+def collect_rollout_vec(env, policy, horizon=200):
+    """Collect rollout from vectorized environment."""
+    num_worlds = env.num_worlds
+    obs = env.reset()
+
+    all_obs = []
+    all_actions = []
+    all_rewards = []
+    all_log_probs = []
+    all_dones = []
+
+    for _ in range(horizon):
+        obs_t = torch.FloatTensor(obs)
+        actions, log_probs = policy.get_action_and_log_prob_batch(obs_t)
+
+        actions_np = actions.detach().numpy()
+        next_obs, rewards, dones, _ = env.step(actions_np)
+
+        all_obs.append(obs)
+        all_actions.append(actions.detach())
+        all_rewards.append(rewards)
+        all_log_probs.append(log_probs.detach())
+        all_dones.append(dones)
+
+        obs = next_obs
+
+    # Stack into tensors: (horizon, num_worlds, ...)
+    return {
+        "observations": torch.FloatTensor(np.array(all_obs)),  # (H, N, obs_dim)
+        "actions": torch.stack(all_actions),                    # (H, N, act_dim)
+        "rewards": torch.FloatTensor(np.array(all_rewards)),    # (H, N)
+        "log_probs": torch.stack(all_log_probs),                # (H, N)
+        "dones": torch.FloatTensor(np.array(all_dones)),        # (H, N)
+    }
+
+
+def ppo_update_vec(policy, optimizer, rollout, n_epochs=4, clip_ratio=0.2, gamma=0.99):
+    """PPO update with vectorized rollout data."""
+    # Reshape from (H, N, ...) to (H*N, ...)
+    H, N = rollout["rewards"].shape
+
+    obs = rollout["observations"].reshape(H * N, -1)
+    acts = rollout["actions"].reshape(H * N, -1)
+    old_log_probs = rollout["log_probs"].reshape(H * N)
+    rewards = rollout["rewards"]  # Keep (H, N) for return computation
+    dones = rollout["dones"]
+
+    # Compute returns per trajectory (handle resets)
+    returns = torch.zeros(H, N)
+    running_return = torch.zeros(N)
+
+    for t in reversed(range(H)):
+        # Reset return where episode ended
+        running_return = running_return * (1 - dones[t])
+        running_return = rewards[t] + gamma * running_return
+        returns[t] = running_return
+
+    returns = returns.reshape(H * N)
+
+    # Normalize returns
+    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+
+    for _ in range(n_epochs):
+        # Recompute log probs
+        mean = policy(obs)
+        std = torch.exp(policy.log_std)
+        dist = torch.distributions.Normal(mean, std)
+        log_probs = dist.log_prob(acts).sum(-1)
+
+        # PPO loss
+        ratio = torch.exp(log_probs - old_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
+        loss = -torch.min(ratio * returns, clipped_ratio * returns).mean()
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+        optimizer.step()
+
+
+def evaluate_policy_vec(env, policy, n_episodes=5):
+    """Evaluate policy using vectorized environment."""
+    # Use first n_episodes worlds for evaluation
+    obs = env.reset()
+    episode_returns = np.zeros(env.num_worlds)
+    episode_lengths = np.zeros(env.num_worlds)
+    completed = np.zeros(env.num_worlds, dtype=bool)
+
+    for step in range(env.max_steps):
+        actions = policy.get_actions_batch(obs, deterministic=True)
+        obs, rewards, dones, _ = env.step(actions)
+
+        # Accumulate rewards for incomplete episodes
+        episode_returns += rewards * (~completed)
+        episode_lengths += (~completed).astype(float)
+
+        # Mark completed episodes
+        completed = completed | dones
+
+        # If enough episodes completed, stop
+        if np.sum(completed) >= n_episodes:
+            break
+
+    # Return stats from first n completed episodes
+    return np.mean(episode_returns[:n_episodes]), np.std(episode_returns[:n_episodes])
+
+
+def compute_design_gradient(parametric_model, policy, ctrl_cost_weight, eps=0.02, horizon=200, n_rollouts=3):
+    """Compute dReturn/dL using finite differences with single-env (more accurate)."""
+
+    def eval_at_L(L_val):
+        """Evaluate mean return at a specific L value."""
+        parametric_model.set_L(L_val)
+        # Create single env for gradient evaluation
+        env = CartPoleNewtonEnv(parametric_model=parametric_model, ctrl_cost_weight=ctrl_cost_weight)
+
+        returns = []
+        for _ in range(n_rollouts):
+            obs = env.reset()
+            total_return = 0
+            for _ in range(horizon):
+                action = policy.get_action(obs, deterministic=True)
+                force = float(action[0]) * env.force_max
+                obs, reward, terminated, truncated, _ = env.step(force)
+                total_return += reward
+                if terminated or truncated:
+                    break
+            returns.append(total_return)
+        return np.mean(returns)
+
+    L_current = parametric_model.L
+    wp.synchronize()
+
+    # Evaluate at L - eps
+    return_minus = eval_at_L(L_current - eps)
+    wp.synchronize()
+
+    # Evaluate at L + eps
+    return_plus = eval_at_L(L_current + eps)
+    wp.synchronize()
+
+    # Restore L
+    parametric_model.set_L(L_current)
+
+    gradient = (return_plus - return_minus) / (2 * eps)
+    mean_return = (return_plus + return_minus) / 2
+
+    return mean_return, gradient
+
+
+class StabilityGate:
+    """Stability gating for PGHC inner loop convergence detection."""
+
+    def __init__(self, window_size=10, threshold=0.01, min_iterations=20):
+        self.window_size = window_size
+        self.threshold = threshold
+        self.min_iterations = min_iterations
+        self.returns = deque(maxlen=window_size)
+        self.iteration = 0
+
+    def reset(self):
+        self.returns.clear()
+        self.iteration = 0
+
+    def update(self, mean_return):
+        self.returns.append(mean_return)
+        self.iteration += 1
+
+    def is_converged(self):
+        if self.iteration < self.min_iterations:
+            return False
+        if len(self.returns) < self.window_size:
+            return False
+
+        returns_arr = np.array(self.returns)
+        mean_val = np.mean(returns_arr)
+        if abs(mean_val) < 1e-6:
+            return True
+
+        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / abs(mean_val)
+        return relative_change < self.threshold
+
+    def get_stats(self):
+        if len(self.returns) < 2:
+            return {"mean": 0, "std": 0, "relative_change": 1.0}
+
+        returns_arr = np.array(self.returns)
+        mean_val = np.mean(returns_arr)
+        std_val = np.std(returns_arr)
+        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / max(abs(mean_val), 1e-6)
+
+        return {
+            "mean": mean_val,
+            "std": std_val,
+            "relative_change": relative_change,
+        }
+
+
+def pghc_codesign_vec(
+    n_outer_iterations=15,
+    max_inner_iterations=100,
+    stability_window=10,
+    stability_threshold=0.01,
+    min_inner_iterations=20,
+    design_lr=0.02,
+    max_step=0.1,
+    initial_L=0.6,
+    ctrl_cost_weight=0.5,
+    num_worlds=64,
+    use_wandb=False,
+):
+    """
+    PGHC Co-Design using vectorized environments for fast training.
+    """
+    print("=" * 60)
+    print("PGHC Co-Design (Vectorized Newton Physics)")
+    print("=" * 60)
+
+    # Initialize wandb
+    if use_wandb and WANDB_AVAILABLE:
+        wandb.init(
+            project="pghc-codesign",
+            name=f"cartpole-vec-{num_worlds}w",
+            config={
+                "level": "1.5-vec",
+                "num_worlds": num_worlds,
+                "n_outer_iterations": n_outer_iterations,
+                "stability_threshold": stability_threshold,
+                "design_lr": design_lr,
+                "initial_L": initial_L,
+                "ctrl_cost_weight": ctrl_cost_weight,
+            },
+        )
+        print(f"  [wandb] Logging enabled")
+    elif use_wandb and not WANDB_AVAILABLE:
+        print("  [wandb] Not available")
+        use_wandb = False
+
+    # Initialize parametric model
+    parametric_model = ParametricCartPoleNewton(L_init=initial_L)
+
+    # Create vectorized environment
+    env = CartPoleNewtonVecEnv(
+        num_worlds=num_worlds,
+        parametric_model=parametric_model,
+        ctrl_cost_weight=ctrl_cost_weight,
+    )
+
+    policy = CartPolePolicy()
+    optimizer = optim.Adam(policy.parameters(), lr=3e-4)
+
+    stability_gate = StabilityGate(
+        window_size=stability_window,
+        threshold=stability_threshold,
+        min_iterations=min_inner_iterations,
+    )
+
+    history = {
+        "L": [parametric_model.L],
+        "returns": [],
+        "gradients": [],
+        "inner_iterations": [],
+    }
+
+    global_step = 0
+
+    print(f"\nConfiguration:")
+    print(f"  Num parallel worlds: {num_worlds}")
+    print(f"  Initial L: {parametric_model.L:.3f} m")
+    print(f"  Control cost weight: {ctrl_cost_weight}")
+    print(f"  Stability threshold: {stability_threshold:.1%}")
+
+    for outer_iter in range(n_outer_iterations):
+        print(f"\n{'='*60}")
+        print(f"Outer Iteration {outer_iter + 1}/{n_outer_iterations}")
+        print(f"{'='*60}")
+        print(f"  Current L = {parametric_model.L:.3f} m")
+
+        if use_wandb:
+            wandb.log({
+                "outer/iteration": outer_iter + 1,
+                "outer/L_current": parametric_model.L,
+            }, step=global_step)
+
+        # =============================================
+        # INNER LOOP: Train until convergence
+        # =============================================
+        print(f"\n  [Inner Loop] Training PPO ({num_worlds} parallel envs)...")
+        stability_gate.reset()
+
+        for inner_iter in range(max_inner_iterations):
+            # Collect rollout from all worlds
+            rollout = collect_rollout_vec(env, policy, horizon=200)
+            ppo_update_vec(policy, optimizer, rollout)
+
+            # Evaluate
+            mean_ret, std_ret = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
+            stability_gate.update(mean_ret)
+            stats = stability_gate.get_stats()
+
+            global_step += 1
+
+            if use_wandb:
+                wandb.log({
+                    "inner/return_mean": mean_ret,
+                    "inner/return_std": std_ret,
+                    "inner/relative_change": stats["relative_change"],
+                    "inner/iteration": inner_iter + 1,
+                    "design/L": parametric_model.L,
+                }, step=global_step)
+
+            if (inner_iter + 1) % 5 == 0:
+                samples_per_iter = num_worlds * 200
+                print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, "
+                      f"rel_change={stats['relative_change']:.3f} "
+                      f"({samples_per_iter} samples/iter)")
+
+            if stability_gate.is_converged():
+                print(f"    CONVERGED at iter {inner_iter + 1}")
+                break
+        else:
+            print(f"    MAX ITERATIONS reached")
+
+        # Final evaluation
+        mean_return, std_return = evaluate_policy_vec(env, policy, n_episodes=10)
+        history["returns"].append(mean_return)
+        history["inner_iterations"].append(stability_gate.iteration)
+        print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}")
+
+        # =============================================
+        # OUTER LOOP: Compute design gradient
+        # =============================================
+        print(f"\n  [Outer Loop] Computing dReturn/dL (frozen policy)...")
+        wp.synchronize()
+
+        _, gradient = compute_design_gradient(
+            parametric_model, policy, ctrl_cost_weight,
+            eps=0.02, horizon=200, n_rollouts=3
+        )
+        history["gradients"].append(gradient)
+
+        print(f"  dReturn/dL = {gradient:.4f}")
+
+        # =============================================
+        # Update L (gradient ascent)
+        # =============================================
+        step = np.clip(design_lr * gradient, -max_step, max_step)
+        old_L = parametric_model.L
+        parametric_model.set_L(old_L + step)
+
+        # Rebuild vectorized environment with new L
+        wp.synchronize()
+        env = CartPoleNewtonVecEnv(
+            num_worlds=num_worlds,
+            parametric_model=parametric_model,
+            ctrl_cost_weight=ctrl_cost_weight,
+        )
+        wp.synchronize()
+
+        print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
+        history["L"].append(parametric_model.L)
+
+        if use_wandb:
+            wandb.log({
+                "outer/return_at_convergence": mean_return,
+                "outer/gradient": gradient,
+                "outer/L_step": step,
+                "outer/L_new": parametric_model.L,
+                "outer/inner_iterations_used": stability_gate.iteration,
+            }, step=global_step)
+
+    # =============================================
+    # Final Results
+    # =============================================
+    print("\n" + "=" * 60)
+    print("PGHC Co-Design Complete!")
+    print("=" * 60)
+
+    print(f"\nPole length evolution:")
+    print(f"  Initial: {history['L'][0]:.3f} m")
+    print(f"  Final:   {history['L'][-1]:.3f} m")
+    print(f"  Change:  {history['L'][-1] - history['L'][0]:+.3f} m")
+
+    total_samples = sum(history["inner_iterations"]) * num_worlds * 200
+    print(f"\nTotal training samples: {total_samples:,}")
+    print(f"  ({num_worlds} worlds x 200 steps x {sum(history['inner_iterations'])} iters)")
+
+    if use_wandb:
+        wandb.log({
+            "summary/L_initial": history["L"][0],
+            "summary/L_final": history["L"][-1],
+            "summary/total_samples": total_samples,
+        })
+        wandb.finish()
+
+    return history, policy, parametric_model
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="PGHC Co-Design (Vectorized)")
+    parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
+    parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
+    parser.add_argument("--max-inner-iters", type=int, default=50, help="Max inner iterations")
+    parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
+    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
+    parser.add_argument("--ctrl-cost", type=float, default=0.5, help="Control cost weight")
+    parser.add_argument("--num-worlds", type=int, default=64, help="Number of parallel worlds")
+    args = parser.parse_args()
+
+    history, policy, model = pghc_codesign_vec(
+        n_outer_iterations=args.outer_iters,
+        max_inner_iterations=args.max_inner_iters,
+        stability_window=10,
+        stability_threshold=0.01,
+        min_inner_iterations=15,
+        design_lr=args.design_lr,
+        initial_L=args.initial_L,
+        ctrl_cost_weight=args.ctrl_cost,
+        num_worlds=args.num_worlds,
+        use_wandb=args.wandb,
+    )
