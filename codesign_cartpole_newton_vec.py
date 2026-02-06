@@ -450,10 +450,10 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     return mean_kl
 
 
-def evaluate_policy_vec(env, policy, n_episodes=5):
-    """Evaluate policy using vectorized environment."""
+def evaluate_policy_vec(env, policy):
+    """Evaluate policy across all worlds for a full episode (no early break)."""
     obs = env.reset()
-    episode_returns = np.zeros(env.num_worlds)
+    episode_rewards = np.zeros(env.num_worlds)
     episode_lengths = np.zeros(env.num_worlds)
     completed = np.zeros(env.num_worlds, dtype=bool)
 
@@ -461,41 +461,28 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
         actions = policy.get_actions_batch(obs, deterministic=True)
         obs, rewards, dones, _ = env.step(actions)
 
-        # Accumulate rewards for incomplete episodes
-        episode_returns += rewards * (~completed)
+        # Accumulate rewards only for still-running episodes
+        episode_rewards += rewards * (~completed)
         episode_lengths += (~completed).astype(float)
 
         # Mark completed episodes
         completed = completed | dones
 
-        # If enough episodes completed, stop early
-        if np.sum(completed) >= n_episodes:
-            break
-
     # Restore last_obs so training rollouts continue normally
-    env.last_obs = None  # Force fresh start on next rollout after eval
+    env.last_obs = None
 
-    # Average only COMPLETED episodes (not partial ones)
-    completed_idx = np.where(completed)[0]
-    if len(completed_idx) >= n_episodes:
-        idx = completed_idx[:n_episodes]
-    elif len(completed_idx) > 0:
-        idx = completed_idx
-    else:
-        # No episodes completed — use all worlds (truncated at max_steps)
-        idx = np.arange(min(n_episodes, env.num_worlds))
-
-    mean_return = np.mean(episode_returns[idx])
-    std_return = np.std(episode_returns[idx])
-    mean_length = np.mean(episode_lengths[idx])
-    return mean_return, std_return, mean_length
+    # Average ALL worlds — no selection bias
+    mean_reward = np.mean(episode_rewards)
+    std_reward = np.std(episode_rewards)
+    mean_length = np.mean(episode_lengths)
+    return mean_reward, std_reward, mean_length
 
 
 def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_rollouts=3):
-    """Compute dReturn/dL using finite differences with vec env (num_worlds=1)."""
+    """Compute dReward/dL using finite differences with vec env (num_worlds=1)."""
 
     def eval_at_L(L_val):
-        """Evaluate mean return at a specific L value."""
+        """Evaluate mean reward at a specific L value."""
         parametric_model.set_L(L_val)
         # Create vec env with single world for gradient evaluation
         env = CartPoleNewtonVecEnv(
@@ -506,39 +493,39 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
             start_near_upright=True,
         )
 
-        returns = []
+        rollout_rewards = []
         for _ in range(n_rollouts):
             obs = env.reset()[0]  # Get single world obs
-            total_return = 0
+            total_reward = 0
             for _ in range(horizon):
                 action = policy.get_action(obs, deterministic=True)
                 force = float(action[0]) * env.force_max
                 obs_all, rewards, dones, _ = env.step(np.array([force]))
                 obs = obs_all[0]
-                total_return += rewards[0]
+                total_reward += rewards[0]
                 if dones[0]:
                     break
-            returns.append(total_return)
-        return np.mean(returns)
+            rollout_rewards.append(total_reward)
+        return np.mean(rollout_rewards)
 
     L_current = parametric_model.L
     wp.synchronize()
 
     # Evaluate at L - eps
-    return_minus = eval_at_L(L_current - eps)
+    reward_minus = eval_at_L(L_current - eps)
     wp.synchronize()
 
     # Evaluate at L + eps
-    return_plus = eval_at_L(L_current + eps)
+    reward_plus = eval_at_L(L_current + eps)
     wp.synchronize()
 
     # Restore L
     parametric_model.set_L(L_current)
 
-    gradient = (return_plus - return_minus) / (2 * eps)
-    mean_return = (return_plus + return_minus) / 2
+    gradient = (reward_plus - reward_minus) / (2 * eps)
+    mean_reward = (reward_plus + reward_minus) / 2
 
-    return mean_return, gradient
+    return mean_reward, gradient
 
 
 class StabilityGate:
@@ -548,39 +535,39 @@ class StabilityGate:
         self.window_size = window_size
         self.threshold = threshold
         self.min_iterations = min_iterations
-        self.returns = deque(maxlen=window_size)
+        self.reward_history = deque(maxlen=window_size)
         self.iteration = 0
 
     def reset(self):
-        self.returns.clear()
+        self.reward_history.clear()
         self.iteration = 0
 
-    def update(self, mean_return):
-        self.returns.append(mean_return)
+    def update(self, mean_reward):
+        self.reward_history.append(mean_reward)
         self.iteration += 1
 
     def is_converged(self):
         if self.iteration < self.min_iterations:
             return False
-        if len(self.returns) < self.window_size:
+        if len(self.reward_history) < self.window_size:
             return False
 
-        returns_arr = np.array(self.returns)
-        mean_val = np.mean(returns_arr)
+        rewards_arr = np.array(self.reward_history)
+        mean_val = np.mean(rewards_arr)
         if abs(mean_val) < 1e-6:
             return True
 
-        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / abs(mean_val)
+        relative_change = (np.max(rewards_arr) - np.min(rewards_arr)) / abs(mean_val)
         return relative_change < self.threshold
 
     def get_stats(self):
-        if len(self.returns) < 2:
+        if len(self.reward_history) < 2:
             return {"mean": 0, "std": 0, "relative_change": 1.0}
 
-        returns_arr = np.array(self.returns)
-        mean_val = np.mean(returns_arr)
-        std_val = np.std(returns_arr)
-        relative_change = (np.max(returns_arr) - np.min(returns_arr)) / max(abs(mean_val), 1e-6)
+        rewards_arr = np.array(self.reward_history)
+        mean_val = np.mean(rewards_arr)
+        std_val = np.std(rewards_arr)
+        relative_change = (np.max(rewards_arr) - np.min(rewards_arr)) / max(abs(mean_val), 1e-6)
 
         return {
             "mean": mean_val,
@@ -656,7 +643,7 @@ def pghc_codesign_vec(
 
     history = {
         "L": [parametric_model.L],
-        "returns": [],
+        "rewards": [],
         "gradients": [],
         "inner_iterations": [],
     }
@@ -700,8 +687,8 @@ def pghc_codesign_vec(
 
         eval_every = 50  # Only evaluate every N iters to avoid disrupting rollouts
         inner_iter = 0
-        mean_ret, std_ret, mean_len = 0.0, 0.0, 0.0
-        best_mean_ret = -float('inf')
+        mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
+        best_mean_rew = -float('inf')
         best_policy_state = None
         best_value_state = None
 
@@ -725,19 +712,19 @@ def pghc_codesign_vec(
 
             # Full evaluation only every N iters (avoids resetting training env)
             if (inner_iter + 1) % eval_every == 0:
-                mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
-                stability_gate.update(mean_ret)
+                mean_rew, std_rew, mean_len = evaluate_policy_vec(env, policy)
+                stability_gate.update(mean_rew)
                 stats = stability_gate.get_stats()
 
                 # Save best policy checkpoint
-                if mean_ret > best_mean_ret:
-                    best_mean_ret = mean_ret
+                if mean_rew > best_mean_rew:
+                    best_mean_rew = mean_rew
                     best_policy_state = {k: v.clone() for k, v in policy.state_dict().items()}
                     best_value_state = {k: v.clone() for k, v in value_net.state_dict().items()}
-                    print(f"    [best] New best: mean_return={mean_ret:.1f}")
-                elif mean_ret < best_mean_ret * 0.5 and best_policy_state is not None:
+                    print(f"    [best] New best: mean_reward={mean_rew:.1f}")
+                elif mean_rew < best_mean_rew * 0.5 and best_policy_state is not None:
                     # Catastrophic drop — restore best policy
-                    print(f"    [best] Return dropped to {mean_ret:.1f} (best={best_mean_ret:.1f}). Restoring best policy.")
+                    print(f"    [best] Reward dropped to {mean_rew:.1f} (best={best_mean_rew:.1f}). Restoring best policy.")
                     policy.load_state_dict(best_policy_state)
                     value_net.load_state_dict(best_value_state)
                     env.last_obs = None  # Fresh start after restore
@@ -754,8 +741,8 @@ def pghc_codesign_vec(
                 }
                 if (inner_iter + 1) % eval_every == 0:
                     log_dict.update({
-                        "inner/return_mean": mean_ret,
-                        "inner/return_std": std_ret,
+                        "inner/mean_reward": mean_rew,
+                        "inner/reward_std": std_rew,
                         "inner/episode_length": mean_len,
                         "inner/relative_change": stats["relative_change"],
                     })
@@ -765,7 +752,7 @@ def pghc_codesign_vec(
                 print(f"    Iter {inner_iter + 1}: "
                       f"reward/step={rollout_mean_reward:.2f}, "
                       f"kl={mean_kl:.4f}, lr={current_lr:.1e}"
-                      + (f", mean_return={mean_ret:.1f} ±{std_ret:.1f}, mean_len={mean_len:.0f}"
+                      + (f", mean_reward={mean_rew:.1f} ±{std_rew:.1f}, mean_len={mean_len:.0f}"
                          if (inner_iter + 1) % eval_every == 0 else ""))
 
             # Record video every N inner iterations
@@ -778,7 +765,7 @@ def pghc_codesign_vec(
                         "video/inner_iter": inner_iter + 1,
                         "video/outer_iter": outer_iter + 1,
                         "video/L": parametric_model.L,
-                        "video/return": mean_ret,
+                        "video/reward": mean_rew,
                     }, step=global_step)
 
             total_inner_iterations += 1
@@ -790,15 +777,15 @@ def pghc_codesign_vec(
                 break
 
         # Final evaluation
-        mean_return, std_return, mean_length = evaluate_policy_vec(env, policy, n_episodes=10)
-        history["returns"].append(mean_return)
+        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy)
+        history["rewards"].append(mean_reward)
         history["inner_iterations"].append(stability_gate.iteration)
-        print(f"  Policy converged. Return = {mean_return:.1f} +/- {std_return:.1f}, Length = {mean_length:.0f}")
+        print(f"  Policy converged. Reward = {mean_reward:.1f} +/- {std_reward:.1f}, Length = {mean_length:.0f}")
 
         # =============================================
         # OUTER LOOP: Compute design gradient
         # =============================================
-        print(f"\n  [Outer Loop] Computing dReturn/dL (frozen policy)...")
+        print(f"\n  [Outer Loop] Computing dReward/dL (frozen policy)...")
         wp.synchronize()
 
         _, gradient = compute_design_gradient(
@@ -807,7 +794,7 @@ def pghc_codesign_vec(
         )
         history["gradients"].append(gradient)
 
-        print(f"  dReturn/dL = {gradient:.4f}")
+        print(f"  dReward/dL = {gradient:.4f}")
 
         # =============================================
         # Update L (gradient ascent)
@@ -833,7 +820,7 @@ def pghc_codesign_vec(
 
         if use_wandb:
             wandb.log({
-                "outer/return_at_convergence": mean_return,
+                "outer/reward_at_convergence": mean_reward,
                 "outer/gradient": gradient,
                 "outer/L_step": step,
                 "outer/L_new": parametric_model.L,
