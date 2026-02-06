@@ -19,9 +19,9 @@ We validate PGHC through a systematic progression of increasingly complex enviro
 |-------|-------------|----------------|--------|
 | 0 | Math only | N/A | DONE |
 | 1 | Cart-Pole | PyTorch (hand-coded) | DONE |
-| 1.5 | Cart-Pole | Newton/Warp | CREATED |
+| 1.5 | Cart-Pole | Newton/Warp (vectorized) | DONE |
 | 2 | Ant | Newton/Warp | CREATED |
-| 3 | G1 Humanoid | Newton/Warp | IN PROGRESS |
+| 3 | G1 Humanoid | Newton/Warp | BLOCKED (gradient chain) |
 
 ## Quick Start
 
@@ -96,30 +96,32 @@ conda activate codesign
 codesign/
 ├── envs/
 │   ├── cartpole/
-│   │   ├── cartpole_env.py      # Differentiable cart-pole (PyTorch)
-│   │   └── ppo.py               # PPO implementation
+│   │   ├── cartpole_env.py        # Differentiable cart-pole (PyTorch)
+│   │   └── ppo.py                 # PPO implementation
 │   ├── cartpole_newton/
-│   │   └── cartpole_newton_env.py  # Newton-based cart-pole
+│   │   └── cartpole_newton_vec_env.py  # Vectorized Newton cart-pole (GPU)
 │   ├── ant/
-│   │   └── ant_env.py           # Newton-based Ant with parametric morphology
-│   └── pendulum/                # Simple pendulum (earlier work)
+│   │   └── ant_env.py             # Newton-based Ant with parametric morphology
+│   └── pendulum/                  # Simple pendulum (earlier work)
 │
-├── config/                      # Configuration files for G1
+├── config/                        # Configuration files for G1
 │
-├── test_level0_verification.py  # Math verification tests
-├── test_level15_newton.py       # Newton cart-pole tests
-├── test_level2_ant.py           # Ant environment tests
+├── test_level0_verification.py    # Level 0: Math verification tests
+├── test_level1_pendulum.py        # Level 1: Pendulum/cart-pole tests
+├── test_level15_newton.py         # Level 1.5: Newton cart-pole tests
+├── test_level2_ant.py             # Level 2: Ant environment tests
 │
-├── train_cartpole_ppo.py        # PPO training for cart-pole
-├── codesign_cartpole.py         # Full PGHC with trust region
-├── codesign_cartpole_simple.py  # Simplified PGHC
-├── codesign_ant.py              # PGHC for Ant morphology
-├── find_optimal_L.py            # Grid search for optimal L*
+├── train_cartpole_ppo.py          # PPO training for cart-pole
+├── codesign_cartpole.py           # Level 1: PGHC with trust region
+├── codesign_cartpole_simple.py    # Level 1: Simplified PGHC
+├── codesign_cartpole_newton_vec.py # Level 1.5: Vectorized PGHC
+├── codesign_ant.py                # Level 2: PGHC for Ant morphology
+├── find_optimal_L.py              # Grid search for optimal L*
 │
-├── parametric_g1.py             # Parametric G1 humanoid model
-├── hybrid_agent.py              # Hybrid co-design agent
-├── train_hybrid.py              # G1 training script
-└── diff_rollout.py              # Differentiable rollout
+├── parametric_g1.py               # Parametric G1 humanoid model
+├── hybrid_agent.py                # Hybrid co-design agent (Level 3)
+├── train_hybrid.py                # G1 training script
+└── diff_rollout.py                # Differentiable rollout
 ```
 
 ## Algorithm Details

@@ -62,9 +62,21 @@ codesign/                          # Repository root
 │   │   ├── hybrid_g1_agent.yaml   # Agent hyperparameters
 │   │   └── hybrid_g1_env.yaml     # Environment parameters
 │   │
+│   ├── # === VERIFICATION CO-DESIGN SCRIPTS ===
+│   ├── codesign_cartpole.py         # Level 1: PGHC with trust region
+│   ├── codesign_cartpole_simple.py  # Level 1: Simplified PGHC
+│   ├── codesign_cartpole_newton_vec.py  # Level 1.5: Vectorized Newton PGHC
+│   ├── codesign_ant.py             # Level 2: PGHC for Ant morphology
+│   ├── train_cartpole_ppo.py       # PPO training for cart-pole
+│   ├── find_optimal_L.py           # Grid search for optimal L*
+│   │
 │   ├── # === TESTING ===
 │   ├── run_all_tests.py           # Test runner
-│   ├── test_implementation.py     # Unit tests
+│   ├── test_level0_verification.py # Level 0: Math tests
+│   ├── test_level1_pendulum.py    # Level 1: Pendulum tests
+│   ├── test_level15_newton.py     # Level 1.5: Newton cart-pole tests
+│   ├── test_level2_ant.py         # Level 2: Ant environment tests
+│   ├── test_implementation.py     # Unit tests (G1)
 │   ├── test_checkpoint.py         # Checkpoint/resume tests
 │   ├── test_gpu_memory.py         # Memory profiling
 │   ├── validate_outer_loop.py     # End-to-end gradient validation
@@ -79,8 +91,12 @@ codesign/                          # Repository root
 │   │   │   ├── __init__.py
 │   │   │   ├── cartpole_env.py    # Differentiable physics
 │   │   │   └── ppo.py             # PPO implementation
-│   │   ├── cheetah/               # Level 2: HalfCheetah (planned, Warp)
-│   │   └── ant/                   # Level 3: Ant (planned, Warp)
+│   │   ├── cartpole_newton/        # Level 1.5: Cart-pole with Newton/Warp
+│   │   │   ├── __init__.py
+│   │   │   └── cartpole_newton_vec_env.py  # Vectorized GPU cart-pole
+│   │   └── ant/                   # Level 2: Ant with Newton/Warp
+│   │       ├── __init__.py
+│   │       └── ant_env.py         # Parametric Ant with MJCF generation
 │   │
 │   ├── # === DOCUMENTATION ===
 │   ├── README.md                  # Quick start guide
@@ -359,32 +375,41 @@ Level 0: Component Verification (no physics)         [DONE]
     └── 0C: Quaternion chain rule
     Code: test_level0_verification.py
 
-Level 1: Cart-Pole (hand-coded PyTorch physics)      [IN PROGRESS]
+Level 1: Cart-Pole (hand-coded PyTorch physics)      [DONE]
     ├── Design parameter: pole length L
     ├── Inner loop: PPO
     └── Verify envelope theorem, gradient correctness
-    Code: envs/cartpole/, train_cartpole_ppo.py
+    Code: envs/cartpole/, codesign_cartpole.py
 
-Level 2: HalfCheetah (Warp/Newton physics)           [PLANNED]
-    └── Tune trust region hyperparameters (beta, xi, decay)
+Level 1.5: Cart-Pole (Newton/Warp vectorized)        [DONE]
+    ├── Vectorized GPU environments (1024 worlds)
+    ├── Finite-difference gradients
+    └── Video recording with subprocess
+    Code: envs/cartpole_newton/, codesign_cartpole_newton_vec.py
 
-Level 3: Ant (Warp/Newton physics)                   [PLANNED]
-    └── Verify 3D contact handling
+Level 2: Ant (Newton/Warp)                           [CREATED]
+    ├── Parametric morphology (leg_length, foot_length)
+    ├── Finite-difference gradients
+    └── Multi-body MJCF generation
+    Code: envs/ant/, codesign_ant.py
 
-Level 4: G1 Humanoid (target)                        [PLANNED]
-    └── Full system validation
+Level 3: G1 Humanoid (target)                        [BLOCKED]
+    ├── Full system validation
+    └── BLOCKED: gradient chain broken by numpy conversions
+    Code: parametric_g1.py, hybrid_agent.py
 ```
 
 ### Gate Criteria
 
 **Do not proceed to Level N+1 until Level N passes:**
 
-| Level | Pass Criteria |
-|-------|---------------|
-| 0 | All gradient tests within 1% of finite difference |
-| 1 | Finds pole length within 20% of analytical optimum |
-| 2 | Trust region activates AND performance improves |
-| 3 | Stable 3D locomotion with measurable morphology change |
+| Level | Pass Criteria | Status |
+|-------|---------------|--------|
+| 0 | All gradient tests within 1% of finite difference | PASS |
+| 1 | Finds pole length within 20% of analytical optimum | PASS |
+| 1.5 | Newton cart-pole trains and converges with PGHC | PASS |
+| 2 | Ant achieves stable locomotion with measurable morphology change | PENDING |
+| 3 | G1 humanoid runs with differentiable outer loop | BLOCKED |
 
 See `VERIFICATION_PLAN.md` for detailed test procedures.
 
@@ -496,13 +521,16 @@ Record significant technical decisions here with date and rationale.
 
 ### 2026-02-04: Verification Ladder Approach
 
-**Decision**: Implement 5-level verification (Level 0 Math → Cart-Pole → Cheetah → Ant → Humanoid) before full humanoid testing.
+**Decision**: Implement multi-level verification (Level 0 Math → Cart-Pole → Cart-Pole Newton → Ant → G1 Humanoid) before full humanoid testing.
 
 **Rationale**: Debugging failures on 30-DOF humanoid is impractical. Each level isolates specific algorithm components:
 - Level 0 tests math correctness (gradients, trust region, quaternion chain rule)
-- Level 1 tests envelope theorem on cart-pole
-- Level 2 tests trust region adaptation
-- Level 3 tests 3D contact handling
+- Level 1 tests envelope theorem on cart-pole (PyTorch physics)
+- Level 1.5 tests Newton/Warp integration with vectorized envs
+- Level 2 tests multi-body parametric morphology (Ant)
+- Level 3 tests full humanoid with differentiable gradients
+
+**Note**: Originally planned HalfCheetah at Level 2, skipped directly to Ant as it better tests multi-body dynamics.
 
 **Reference**: `VERIFICATION_PLAN.md`
 
@@ -618,10 +646,10 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 | Parameter | Start | Tune At |
 |-----------|-------|---------|
-| `design_lr` | 0.01 | Level 2 (Cheetah) |
-| `trust_region_threshold` | 0.1 | Level 2 (Cheetah) |
-| `stability_threshold` | 0.05 | Level 1 (Pendulum) |
-| `diff_horizon` | 3 | Level 3 (Ant) |
+| `design_lr` | 0.01-0.02 | Level 2 (Ant) |
+| `trust_region_threshold` | 0.1 | Level 2 (Ant) |
+| `stability_threshold` | 0.01-0.05 | Level 1.5 (Newton) |
+| `diff_horizon` | 3 | Level 3 (G1 Humanoid) |
 
 ### TensorBoard Metrics to Watch
 
@@ -634,6 +662,5 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ---
 
-*Document Version: 1.1*
-*Last Updated: 2026-02-04*
-*Maintainer: [Your Name]*
+*Document Version: 2.0*
+*Last Updated: 2026-02-05*

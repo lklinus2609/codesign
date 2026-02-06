@@ -2,7 +2,8 @@
 Vectorized Newton-based Cart-Pole Environment
 
 Runs N cart-poles in parallel on GPU using Newton's world replication.
-This provides massive speedup for PPO training.
+All per-step computation (forces, obs, rewards, resets) stays GPU-resident
+via Warp kernels — matching Newton's official ArticulationView pattern.
 
 Usage:
     env = CartPoleNewtonVecEnv(num_worlds=64)
@@ -23,159 +24,132 @@ except ImportError:
     print("Warning: Newton/Warp not available.")
 
 
-# Kernel to extract joint positions from body transforms
-# MuJoCo solver updates body_q but not model.joint_q
+# ---------------------------------------------------------------------------
+# Warp kernels — all per-step work stays on GPU
+# ---------------------------------------------------------------------------
+
 @wp.kernel
-def extract_joint_state_kernel(
-    body_q: wp.array(dtype=wp.transform),
-    body_qd: wp.array(dtype=wp.spatial_vector),
-    num_bodies_per_world: int,
-    joint_q_out: wp.array(dtype=float),
-    joint_qd_out: wp.array(dtype=float),
-    num_joints_per_world: int,
-    num_worlds: int,
-):
-    """Extract joint positions/velocities from body transforms."""
-    tid = wp.tid()  # world index
-
-    # Body indices for this world
-    cart_idx = tid * num_bodies_per_world + 0
-    pole_idx = tid * num_bodies_per_world + 1
-
-    # Get body transforms
-    cart_tf = body_q[cart_idx]
-    pole_tf = body_q[pole_idx]
-
-    # Get body velocities (spatial vectors: [angular, linear])
-    cart_vel = body_qd[cart_idx]
-    pole_vel = body_qd[pole_idx]
-
-    # Cart position: x component of cart body position
-    cart_pos = wp.transform_get_translation(cart_tf)
-    # Subtract world offset (worlds are centered around origin)
-    spacing = 3.0
-    first_world_x = -float(num_worlds - 1) * spacing / 2.0
-    world_offset = first_world_x + float(tid) * spacing
-    x = cart_pos[0] - world_offset
-
-    # Pole angle: extract from pole body quaternion
-    # For rotation around y-axis: qy = sin(θ/2), qw = cos(θ/2)
-    pole_quat = wp.transform_get_rotation(pole_tf)
-    qy = pole_quat[1]  # y component
-    qw = pole_quat[3]  # w component
-    theta = 2.0 * wp.atan2(qy, qw)
-
-    # Velocities
-    # Cart x velocity: linear velocity x component
-    x_dot = wp.spatial_bottom(cart_vel)[0]
-
-    # Pole angular velocity around y-axis
-    theta_dot = wp.spatial_top(pole_vel)[1]
-
-    # Write to output arrays
-    x_idx = tid * num_joints_per_world
-    theta_idx = tid * num_joints_per_world + 1
-
-    joint_q_out[x_idx] = x
-    joint_q_out[theta_idx] = theta
-    joint_qd_out[x_idx] = x_dot
-    joint_qd_out[theta_idx] = theta_dot
-
-
-# Warp kernel for computing rewards in parallel
-@wp.kernel
-def compute_rewards_kernel(
-    joint_q: wp.array(dtype=float),
-    forces: wp.array(dtype=float),
+def set_joint_forces_kernel(
+    actions: wp.array(dtype=float),
     force_max: float,
-    ctrl_cost_weight: float,
-    num_joints_per_world: int,
-    rewards: wp.array(dtype=float),
+    joint_f: wp.array2d(dtype=float),
 ):
-    """Compute reward = cos(theta) - ctrl_cost for each world."""
+    """Scale actions [-1,1] to forces and write to cart DOF (index 0)."""
     tid = wp.tid()
-
-    # Get theta (pole angle) for this world
-    # joint_q layout: [x0, theta0, x1, theta1, ...] (2 joints per world)
-    theta_idx = tid * num_joints_per_world + 1
-    theta = joint_q[theta_idx]
-
-    # Balance reward
-    balance_reward = wp.cos(theta)
-
-    # Control cost
-    force = forces[tid]
-    normalized_force = force / force_max
-    ctrl_cost = ctrl_cost_weight * normalized_force * normalized_force
-
-    rewards[tid] = balance_reward - ctrl_cost
+    joint_f[tid, 0] = actions[tid] * force_max
+    joint_f[tid, 1] = 0.0
 
 
 @wp.kernel
-def check_termination_kernel(
-    joint_q: wp.array(dtype=float),
+def extract_obs_kernel(
+    joint_q: wp.array2d(dtype=float),
+    joint_qd: wp.array2d(dtype=float),
+    obs: wp.array2d(dtype=float),
+):
+    """Extract [x, theta, x_dot, theta_dot] from joint state."""
+    tid = wp.tid()
+    obs[tid, 0] = joint_q[tid, 0]
+    obs[tid, 1] = joint_q[tid, 1]
+    obs[tid, 2] = joint_qd[tid, 0]
+    obs[tid, 3] = joint_qd[tid, 1]
+
+
+@wp.kernel
+def step_rewards_done_kernel(
+    obs: wp.array2d(dtype=float),
+    steps: wp.array(dtype=int),
     x_limit: float,
-    num_joints_per_world: int,
-    terminated: wp.array(dtype=int),
+    max_steps: int,
+    rewards: wp.array(dtype=float),
+    dones: wp.array(dtype=int),
 ):
-    """Check if each world has terminated (cart out of bounds)."""
+    """Increment steps, compute IsaacLab-style rewards, check termination/truncation."""
     tid = wp.tid()
 
-    x_idx = tid * num_joints_per_world
-    x = joint_q[x_idx]
+    steps[tid] = steps[tid] + 1
 
-    # Only terminate if cart goes out of bounds (no theta limit for swing-up)
+    x = obs[tid, 0]
+    theta = obs[tid, 1]
+    x_dot = obs[tid, 2]
+    theta_dot = obs[tid, 3]
+
+    # IsaacLab-style reward: alive + cos(theta) - velocity penalties
+    r = 1.0 + wp.cos(theta) - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+
+    # Termination: cart out of bounds
+    terminated = 0
     if wp.abs(x) > x_limit:
-        terminated[tid] = 1
+        terminated = 1
+        r = r - 2.0
+
+    # Truncation: max steps reached
+    truncated = 0
+    if steps[tid] >= max_steps:
+        truncated = 1
+
+    done = 0
+    if terminated == 1 or truncated == 1:
+        done = 1
+
+    rewards[tid] = r
+    dones[tid] = done
+
+
+@wp.kernel
+def reset_done_worlds_kernel(
+    joint_q: wp.array2d(dtype=float),
+    joint_qd: wp.array2d(dtype=float),
+    dones: wp.array(dtype=int),
+    steps: wp.array(dtype=int),
+    seed: int,
+    start_near_upright: int,
+):
+    """Reset worlds where dones==1. Randomizes state on GPU."""
+    tid = wp.tid()
+
+    if dones[tid] == 1:
+        rng = wp.rand_init(seed, tid)
+
+        if start_near_upright == 1:
+            joint_q[tid, 0] = -1.0 + 2.0 * wp.randf(rng)
+            joint_q[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)
+            joint_qd[tid, 0] = -0.5 + 1.0 * wp.randf(rng)
+            joint_qd[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)
+        else:
+            joint_q[tid, 0] = 0.0
+            joint_q[tid, 1] = wp.pi
+            joint_qd[tid, 0] = 0.0
+            joint_qd[tid, 1] = 0.0
+
+        steps[tid] = 0
+
+
+@wp.kernel
+def init_all_worlds_kernel(
+    joint_q: wp.array2d(dtype=float),
+    joint_qd: wp.array2d(dtype=float),
+    seed: int,
+    start_near_upright: int,
+):
+    """Initialize all worlds for full reset."""
+    tid = wp.tid()
+    rng = wp.rand_init(seed, tid)
+
+    if start_near_upright == 1:
+        joint_q[tid, 0] = -1.0 + 2.0 * wp.randf(rng)
+        joint_q[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)
+        joint_qd[tid, 0] = -0.5 + 1.0 * wp.randf(rng)
+        joint_qd[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)
     else:
-        terminated[tid] = 0
+        joint_q[tid, 0] = 0.0
+        joint_q[tid, 1] = wp.pi
+        joint_qd[tid, 0] = 0.0
+        joint_qd[tid, 1] = 0.0
 
 
-@wp.kernel
-def apply_forces_kernel(
-    forces: wp.array(dtype=wp.float32),
-    joint_f: wp.array(dtype=wp.float32),
-    num_dofs_per_world: int,
-):
-    """Apply cart forces to joint_f array for all worlds.
-
-    Uses control.joint_f which directly applies generalized forces to joint DOFs.
-    For prismatic joint (cart), this is a force in the joint axis direction.
-    """
-    tid = wp.tid()
-
-    # Cart is DOF 0 in each world (prismatic joint)
-    # joint_f layout: [cart_x_0, pole_theta_0, cart_x_1, pole_theta_1, ...]
-    cart_dof_idx = tid * num_dofs_per_world
-
-    # Apply force to cart prismatic joint
-    force = forces[tid]
-    joint_f[cart_dof_idx] = force
-
-
-@wp.kernel
-def reset_worlds_kernel(
-    joint_q: wp.array(dtype=float),
-    joint_qd: wp.array(dtype=float),
-    terminated: wp.array(dtype=int),
-    num_joints_per_world: int,
-    rng_seed: int,
-):
-    """Reset terminated worlds - pole starts pointing down (theta = π) for swing-up."""
-    tid = wp.tid()
-
-    if terminated[tid] == 1:
-        x_idx = tid * num_joints_per_world
-        theta_idx = tid * num_joints_per_world + 1
-
-        # Position: cart at center, pole pointing down for swing-up
-        joint_q[x_idx] = 0.0
-        joint_q[theta_idx] = 3.14159265359  # π - pointing down
-
-        # Velocity: zero
-        joint_qd[x_idx] = 0.0
-        joint_qd[theta_idx] = 0.0
-
+# ---------------------------------------------------------------------------
+# Parametric model (unchanged)
+# ---------------------------------------------------------------------------
 
 class ParametricCartPoleNewton:
     """Parametric cart-pole model for Newton."""
@@ -204,6 +178,10 @@ class ParametricCartPoleNewton:
     def pole_mass(self) -> float:
         return self.pole_linear_density * 2.0 * self.L
 
+
+# ---------------------------------------------------------------------------
+# Vectorized environment
+# ---------------------------------------------------------------------------
 
 class CartPoleNewtonVecEnv:
     """
@@ -255,11 +233,9 @@ class CartPoleNewtonVecEnv:
         self.obs_dim = 4
         self.act_dim = 1
 
-        # Episode tracking per world
         self.max_steps = 500
-        self.steps = np.zeros(num_worlds, dtype=np.int32)
 
-        # Allocate GPU arrays for intermediate computations
+        # Allocate GPU arrays for all per-step computation
         self._alloc_buffers()
 
         # Step counter for random seed
@@ -364,68 +340,63 @@ class CartPoleNewtonVecEnv:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
     def _alloc_buffers(self):
-        """Allocate GPU buffers for parallel computation."""
-        self.forces_wp = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
-        self.rewards_wp = wp.zeros(self.num_worlds, dtype=wp.float32, device=self.device)
-        self.terminated_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
+        """Allocate GPU buffers for all per-step computation."""
+        self.obs_wp = wp.zeros((self.num_worlds, self.obs_dim), dtype=float, device=self.device)
+        self.rewards_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
+        self.dones_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
+        self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
+
+    @property
+    def steps(self):
+        """Step counts per world (GPU->CPU transfer on access)."""
+        return self.steps_wp.numpy()
+
+    def _extract_obs_to_gpu(self):
+        """Extract observations into self.obs_wp on GPU (no CPU transfer)."""
+        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+        wp.launch(extract_obs_kernel, dim=self.num_worlds,
+                  inputs=[joint_q, joint_qd, self.obs_wp])
+
+    def _get_obs(self) -> np.ndarray:
+        """Get observations as numpy (extracts on GPU, then transfers once)."""
+        self._extract_obs_to_gpu()
+        return self.obs_wp.numpy()
 
     def reset(self) -> np.ndarray:
-        """Reset all environments using Newton's official ArticulationView pattern."""
+        """Reset all environments using Warp kernels (GPU-resident)."""
         wp.synchronize()
 
-        self.steps[:] = 0
+        self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
         self._step_count = 0
 
-        # Get current joint state via ArticulationView (returns (num_worlds, num_dofs) array)
+        # Get joint state arrays via ArticulationView
         joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
         joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
 
-        # Convert to numpy for modification
-        joint_q_np = joint_q.numpy()
-        joint_qd_np = joint_qd.numpy()
+        # Initialize all worlds via kernel (no CPU round-trip)
+        wp.launch(init_all_worlds_kernel, dim=self.num_worlds,
+                  inputs=[joint_q, joint_qd, 42, int(self.start_near_upright)])
 
-        for i in range(self.num_worlds):
-            if self.start_near_upright:
-                # IsaacLab style: random start near upright for BALANCE task
-                joint_q_np[i, 0] = np.random.uniform(-1.0, 1.0)      # cart x
-                joint_q_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)  # pole angle
-                joint_qd_np[i, 0] = np.random.uniform(-0.5, 0.5)     # cart velocity
-                joint_qd_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)  # pole angular vel
-            else:
-                # Swing-up task: pole starts pointing down
-                joint_q_np[i, 0] = 0.0
-                joint_q_np[i, 1] = np.pi
-                joint_qd_np[i, 0] = 0.0
-                joint_qd_np[i, 1] = 0.0
+        # Write back to both states
+        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q)
+        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd)
+        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q)
+        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd)
 
-        # Set state via ArticulationView (like Newton's official examples)
-        joint_q_wp = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
-        joint_qd_wp = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
-        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q_wp)
-        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd_wp)
-
-        # Also set on state_1 to avoid stale data
-        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q_wp)
-        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd_wp)
-
-        # Propagate reset state by running one simulate step (like test_anymal_reset.py)
-        # This ensures MuJoCo's internal state is properly initialized
+        # Propagate reset state through MuJoCo solver internals
         self._propagate_state()
         wp.synchronize()
 
-        obs = self._get_obs()
-        return obs
+        return self._get_obs()
 
     def _propagate_state(self):
         """Run one simulation step to propagate state through solver (Newton pattern)."""
         wp.synchronize()
 
-        # Use zero control for propagation
-        joint_f = self.cartpoles.get_attribute("joint_f", self.control)
-        joint_f_np = joint_f.numpy()
-        joint_f_np[:] = 0.0
-        joint_f_wp = wp.array(joint_f_np, dtype=wp.float32, device=self.device)
-        self.cartpoles.set_attribute("joint_f", self.control, joint_f_wp)
+        # Zero forces via a fresh array (no CPU round-trip)
+        zero_f = wp.zeros((self.num_worlds, self.num_dofs_per_world), dtype=float, device=self.device)
+        self.cartpoles.set_attribute("joint_f", self.control, zero_f)
 
         # Run one substep to propagate
         self.state_0.clear_forces()
@@ -434,27 +405,13 @@ class CartPoleNewtonVecEnv:
 
         wp.synchronize()
 
-    def _get_obs(self) -> np.ndarray:
-        """Get observations for all worlds using ArticulationView (Newton's pattern)."""
-        # Get joint state via ArticulationView (handles mapping automatically)
-        # Returns (num_worlds, num_dofs) where num_dofs=2: [cart_x, pole_theta]
-        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
-        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
-
-        joint_q_np = joint_q.numpy()
-        joint_qd_np = joint_qd.numpy()
-
-        obs = np.zeros((self.num_worlds, self.obs_dim), dtype=np.float32)
-        obs[:, 0] = joint_q_np[:, 0]   # cart x
-        obs[:, 1] = joint_q_np[:, 1]   # pole theta
-        obs[:, 2] = joint_qd_np[:, 0]  # cart x_dot
-        obs[:, 3] = joint_qd_np[:, 1]  # pole theta_dot
-
-        return obs
-
     def step(self, actions: np.ndarray):
         """
-        Step all environments in parallel using Newton's official pattern.
+        Step all environments in parallel.
+
+        All per-step computation (forces, physics, obs, rewards, resets)
+        runs on GPU via Warp kernels. Only one CPU->GPU transfer (actions)
+        and one GPU->CPU transfer (obs + rewards + dones) per step.
 
         Args:
             actions: (num_worlds,) or (num_worlds, 1) forces in [-1, 1]
@@ -465,135 +422,60 @@ class CartPoleNewtonVecEnv:
             dones: (num_worlds,) bool
             infos: dict
         """
-        # Flatten actions if needed
+        # --- Single CPU -> GPU transfer: actions ---
         actions = np.asarray(actions, dtype=np.float32).flatten()
         assert len(actions) == self.num_worlds
+        actions_wp = wp.array(actions, dtype=float, device=self.device)
 
-        # Scale actions to forces (actions should already be in [-1, 1] from tanh policy)
-        forces = actions * self.force_max
-
-        # Set forces via ArticulationView (like selection_cartpole.py)
-        # joint_f shape: (num_worlds, num_dofs_per_world)
+        # --- GPU: set forces via kernel ---
         joint_f = self.cartpoles.get_attribute("joint_f", self.control)
-        joint_f_np = joint_f.numpy()
-        joint_f_np[:, 0] = forces  # Apply force to cart DOF only (index 0)
-        joint_f_np[:, 1] = 0.0     # No torque on pole joint
-        joint_f_wp = wp.array(joint_f_np, dtype=wp.float32, device=self.device)
-        self.cartpoles.set_attribute("joint_f", self.control, joint_f_wp)
+        wp.launch(set_joint_forces_kernel, dim=self.num_worlds,
+                  inputs=[actions_wp, self.force_max, joint_f])
+        self.cartpoles.set_attribute("joint_f", self.control, joint_f)
 
-        # Simulate substeps using Newton's official pattern:
-        # clear_forces() INSIDE the loop, BEFORE each solver.step()
+        # --- GPU: physics substeps ---
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
-        # Synchronize to prevent warp state corruption
-        wp.synchronize()
+        # --- GPU: extract observations ---
+        self._extract_obs_to_gpu()
 
-        self.steps += 1
+        # --- GPU: compute rewards, increment steps, check done ---
+        wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
+                  inputs=[self.obs_wp, self.steps_wp, self.x_limit, self.max_steps,
+                          self.rewards_wp, self.dones_wp])
+
         self._step_count += 1
 
-        # Get observations (computed from body state)
-        obs = self._get_obs()
+        # --- GPU: auto-reset done worlds ---
+        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
+        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+        wp.launch(reset_done_worlds_kernel, dim=self.num_worlds,
+                  inputs=[joint_q, joint_qd, self.dones_wp, self.steps_wp,
+                          self._step_count, int(self.start_near_upright)])
+        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q)
+        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd)
+        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q)
+        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd)
 
-        # Compute rewards from observations
-        theta = obs[:, 1]
-        x = obs[:, 0]
-        x_dot = obs[:, 2]
-        theta_dot = obs[:, 3]
+        # --- GPU: re-extract obs (reset worlds now have fresh initial state) ---
+        self._extract_obs_to_gpu()
 
-        # Check for NaN/Inf (physics instability)
-        invalid = np.isnan(x) | np.isinf(x) | np.isnan(theta) | np.isinf(theta)
-        if np.any(invalid):
-            x = np.where(invalid, 0.0, x)
-            theta = np.where(invalid, np.pi, theta)
-            x_dot = np.where(invalid, 0.0, x_dot)
-            theta_dot = np.where(invalid, 0.0, theta_dot)
-
-        # IsaacLab-style reward structure:
-        # (1) Alive bonus: +1.0 per step
-        alive_reward = 1.0
-
-        # (2) Pole position: penalize angle from upright (theta=0)
-        # IsaacLab uses -1.0 * L2, we use cos which is similar
-        # cos(theta) = 1 at upright, -1 at down
-        pole_pos_reward = np.cos(theta)
-
-        # (3) Cart velocity penalty (small) - IsaacLab uses -0.01 * L1
-        cart_vel_penalty = 0.01 * np.abs(x_dot)
-
-        # (4) Pole angular velocity penalty (small) - IsaacLab uses -0.005 * L1
-        pole_vel_penalty = 0.005 * np.abs(theta_dot)
-
-        rewards = alive_reward + pole_pos_reward - cart_vel_penalty - pole_vel_penalty
-
-        # Check termination (cart position limit or invalid state)
-        terminated = (np.abs(x) > self.x_limit) | invalid
-
-        # Termination penalty: -2.0 (same as IsaacLab)
-        rewards[terminated] -= 2.0
-
-        # Check truncation (max steps)
-        truncated = self.steps >= self.max_steps
-        dones = terminated | truncated
-
-        # Auto-reset terminated worlds
-        reset_mask = dones
-        if np.any(reset_mask):
-            self._reset_worlds(reset_mask)
-            # Re-get observations for reset worlds
-            obs = self._get_obs()
+        # --- Single GPU -> CPU transfer: obs, rewards, dones ---
+        wp.synchronize()
+        obs_np = self.obs_wp.numpy()
+        rewards_np = self.rewards_wp.numpy()
+        dones_np = self.dones_wp.numpy().astype(bool)
 
         infos = {
             "L": self.parametric_model.L,
-            "mean_reward": np.mean(rewards),
-            "num_dones": np.sum(dones),
+            "mean_reward": float(np.mean(rewards_np)),
+            "num_dones": int(np.sum(dones_np)),
         }
 
-        return obs, rewards, dones, infos
-
-    def _reset_worlds(self, reset_mask: np.ndarray):
-        """Reset specific worlds that terminated using ArticulationView pattern."""
-        num_reset = np.sum(reset_mask)
-        if num_reset == 0:
-            return
-
-        # Get current joint state via ArticulationView
-        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
-        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
-
-        joint_q_np = joint_q.numpy()
-        joint_qd_np = joint_qd.numpy()
-
-        for i in range(self.num_worlds):
-            if reset_mask[i]:
-                if self.start_near_upright:
-                    # IsaacLab style: random start near upright
-                    joint_q_np[i, 0] = np.random.uniform(-1.0, 1.0)
-                    joint_q_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
-                    joint_qd_np[i, 0] = np.random.uniform(-0.5, 0.5)
-                    joint_qd_np[i, 1] = np.random.uniform(-0.25 * np.pi, 0.25 * np.pi)
-                else:
-                    # Swing-up: pole starts pointing down
-                    joint_q_np[i, 0] = 0.0
-                    joint_q_np[i, 1] = np.pi
-                    joint_qd_np[i, 0] = 0.0
-                    joint_qd_np[i, 1] = 0.0
-
-                self.steps[i] = 0
-
-        # Set state via ArticulationView (like Newton's official examples)
-        joint_q_wp = wp.array(joint_q_np, dtype=wp.float32, device=self.device)
-        joint_qd_wp = wp.array(joint_qd_np, dtype=wp.float32, device=self.device)
-        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q_wp)
-        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd_wp)
-        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q_wp)
-        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd_wp)
-
-        # Note: Don't call _propagate_state() here - we're inside step()
-        # ArticulationView.set_attribute handles the state synchronization
-        wp.synchronize()
+        return obs_np, rewards_np, dones_np, infos
 
 
 def test_vec_env():

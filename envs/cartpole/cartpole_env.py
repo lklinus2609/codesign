@@ -210,8 +210,8 @@ class CartPoleEnv:
 
     @property
     def total_mass(self) -> float:
-        """Total mass."""
-        return self.parametric_model.total_mass
+        """Total mass (cart + pole)."""
+        return self.parametric_model.cart_mass + self.parametric_model.pole_mass
 
     def reset(self, noise_scale: float = 0.01) -> torch.Tensor:
         """

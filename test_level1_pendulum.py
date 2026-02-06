@@ -456,7 +456,7 @@ def run_all_tests():
     print("# LEVEL 1 VERIFICATION TESTS - Inverted Pendulum")
     print("#"*60)
     print("\nThese tests verify the envelope theorem and co-design convergence.")
-    print("All tests must pass before proceeding to Level 2 (HalfCheetah).\n")
+    print("All tests must pass before proceeding to Level 2 (Ant).\n")
 
     # Run test suites
     test_1A_environment_physics()
@@ -475,11 +475,11 @@ def run_all_tests():
 
     if TESTS_FAILED == 0:
         print("\nAll Level 1 tests PASSED!")
-        print("Envelope theorem validated. Ready to proceed to Level 2 (HalfCheetah).")
+        print("Envelope theorem validated. Ready to proceed to Level 2 (Ant).")
         return 0
     else:
         print(f"\n{TESTS_FAILED} test(s) FAILED!")
-        print("Debug envelope theorem issues before proceeding to Level 2.")
+        print("Debug envelope theorem issues before proceeding.")
         return 1
 
 

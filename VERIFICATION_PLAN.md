@@ -8,13 +8,13 @@ This document outlines a systematic verification strategy for the Performance-Ga
 
 **Solution**: A 4-level verification ladder, each level isolating specific algorithm components:
 
-| Level | Environment | DOF | What It Tests | Time/Iter |
-|-------|-------------|-----|---------------|-----------|
-| 0 | Synthetic | 1 | Gradient & trust region correctness | ~1s |
-| 1 | Inverted Pendulum | 2 | Envelope theorem validity | ~10s |
-| 2 | HalfCheetah | 18 | Trust region adaptation under instability | ~30s |
-| 3 | Ant | 29 | 3D contact dynamics | ~1min |
-| 4 | G1 Humanoid | 37 | Full system | ~5min |
+| Level | Environment | DOF | What It Tests | Time/Iter | Status |
+|-------|-------------|-----|---------------|-----------|--------|
+| 0 | Synthetic | 1 | Gradient & trust region correctness | ~1s | DONE |
+| 1 | Cart-Pole | 2 | Envelope theorem validity | ~10s | DONE |
+| 1.5 | Cart-Pole (Newton) | 2 | Newton/Warp integration, vectorized envs | ~5s | DONE |
+| 2 | Ant | 27 | Multi-body dynamics, parametric morphology | ~30s | CREATED |
+| 3 | G1 Humanoid | 37 | Full system | ~5min | BLOCKED |
 
 **Key Insight**: If Level N fails, do not proceed to Level N+1. Each level is designed so that failure indicates a specific bug class.
 
@@ -227,155 +227,77 @@ codesign/
 
 ---
 
-## Level 2: HalfCheetah (2D Benchmark)
+## Level 2: Ant (Multi-Body Locomotion)
 
 ### Purpose
-Test the adaptive trust region under realistic instability. HalfCheetah is sensitive to leg proportions—small changes can break the gait.
+Test PGHC on a multi-body 3D locomotion task with parametric morphology using Newton/Warp physics. Ant has 4 legs with 8 actuated joints, providing a meaningful step up from cart-pole.
 
 ### Environment Specification
 
-**Morphology Parameters** (4D):
+**Morphology Parameters** (3D):
 | Parameter | Range | Default | Notes |
 |-----------|-------|---------|-------|
-| Torso length | [0.3, 0.8] | 0.5 | Affects CoM position |
-| Thigh length | [0.1, 0.3] | 0.2 | Front and back legs symmetric |
-| Shin length | [0.1, 0.3] | 0.2 | Critical for ground clearance |
-| Foot length | [0.05, 0.2] | 0.1 | Affects contact stability |
+| leg_length | [0.15, 0.4] | 0.28 | Upper leg segment length |
+| foot_length | [0.3, 0.7] | 0.57 | Lower leg segment length |
+| torso_radius | [0.15, 0.35] | 0.25 | Torso sphere radius |
 
-**Objective**: Maximize forward velocity (simpler than CoT for this test)
+**State Space**: 27D (z, quaternion(4), joints(8), velocities(6), joint_velocities(8))
+**Action Space**: 8 joint torques (4 hips + 4 ankles), range [-1, 1]
+**Objective**: Forward velocity + healthy bonus - control cost
 
-### Why HalfCheetah Tests Trust Region
+### Why Ant Tests Multi-Body Co-Design
 
-The HalfCheetah gait is **locally optimal but globally fragile**:
-- A trained policy exploits the current morphology's resonance frequency
-- Change leg length by 20% → Policy fails catastrophically
-- This is exactly the scenario the trust region should handle
+The Ant is **complex enough to validate the full pipeline** while being forgiving:
+- 4-legged → inherently stable (wide support polygon)
+- 8 actuated joints → exercises parametric MJCF generation
+- Morphology changes require model rebuild → tests finite difference pipeline
+- Reward is forward velocity → clear optimization signal
 
 ### Test Procedure
 
-**Phase 1: Baseline**
-1. Train policy on default morphology to convergence
-2. Record velocity achieved (typically 5-8 m/s for well-tuned PPO)
+**Phase 1: Environment Validation**
+1. Verify MJCF generation with different parameters
+2. Step environment with random actions, check stability
+3. Verify observation/action dimensions
 
-**Phase 2: Co-Design with Aggressive LR**
-1. Set initial `design_lr = 0.5` (intentionally too high)
-2. Run co-design
-3. **Expected**: Trust region should reject most updates, decay LR rapidly
+**Phase 2: Gradient Computation**
+1. Compute dReturn/d(leg_length) via finite differences
+2. Compute dReturn/d(foot_length) via finite differences
+3. Verify gradients are finite and reasonable
 
-**Phase 3: Co-Design with Conservative LR**
-1. Set initial `design_lr = 0.01`
-2. Run co-design for 50 outer loop iterations
-3. Record morphology trajectory and performance
-
-### Success Criteria
-
-| Metric | Threshold | Notes |
-|--------|-----------|-------|
-| Trust region activation | > 0 | Should trigger at least once |
-| LR adaptation observed | Yes | Should see decay/growth in logs |
-| Final velocity | > baseline | Improvement, even if small |
-| No catastrophic policy failure | 0 occurrences | Should never drop below 50% baseline |
-
-### Failure Analysis
-
-| Symptom | Likely Cause | Fix |
-|---------|--------------|-----|
-| Trust region never triggers | LR too conservative or ξ too large | Increase design_lr or decrease ξ |
-| Always rejects, LR → min | ξ too small or gradients too noisy | Increase ξ, add gradient smoothing |
-| Policy collapses | Trust region not catching degradation | Bug in evaluation, or ξ way too large |
-
-### Key Insight: β Tuning
-
-This level is primarily for tuning the trust region hyperparameters:
-- `design_lr_init` (β₀): Starting learning rate
-- `lr_decay_factor`: How much to shrink on violation
-- `lr_growth_factor`: How much to grow on success
-- `trust_region_threshold` (ξ): Acceptable degradation
-
-**Recommended Sweep**:
-```yaml
-design_lr_init: [0.001, 0.01, 0.1]
-trust_region_threshold: [0.05, 0.1, 0.2]
-lr_decay_factor: [0.3, 0.5, 0.7]
-```
-
----
-
-## Level 3: Ant (3D Bridge)
-
-### Purpose
-Introduce 3D contact dynamics before the full humanoid. Ant has 4 legs → inherently more stable than bipedal.
-
-### Environment Specification
-
-**Morphology Parameters** (4D symmetric):
-| Parameter | Range | Default | Notes |
-|-----------|-------|---------|-------|
-| Hip offset | [0.1, 0.3] | 0.2 | Distance from torso center |
-| Thigh length | [0.15, 0.35] | 0.25 | Upper leg segment |
-| Shin length | [0.15, 0.35] | 0.25 | Lower leg segment |
-| Foot radius | [0.02, 0.08] | 0.04 | Contact surface |
-
-**Symmetry**: All 4 legs share the same parameters (reduces to 4 DOF from 16)
-
-**Objective**: Forward velocity OR energy efficiency
-
-### Why Ant Before Humanoid
-
-| Challenge | Ant | Humanoid |
-|-----------|-----|----------|
-| 3D dynamics | ✓ | ✓ |
-| Multiple contacts | 4 legs | 2 legs |
-| Balance difficulty | Low (wide base) | High |
-| Fall frequency | Rare | Common |
-| Debug time | Moderate | Extreme |
-
-### Test Procedure
-
-**Phase 1: Verify Differentiable Rollout in 3D**
-1. Run short rollouts (H=10 steps) with gradient computation
-2. Verify no NaN gradients
-3. Compare gradients with finite difference
-
-**Phase 2: Full Co-Design**
+**Phase 3: Full Co-Design**
 1. Initialize with default morphology
-2. Enable outer loop
-3. Run for 30+ outer loop iterations
+2. Run PGHC with PPO inner loop
+3. Observe morphology trajectory and performance
 
 ### Success Criteria
 
 | Metric | Threshold | Notes |
 |--------|-----------|-------|
-| NaN-free gradients | 100% | Critical for 3D contact |
-| Stable locomotion | > 90% episodes | Should rarely fall |
+| Environment steps without crash | 500+ | Basic stability |
+| Finite gradients | 100% | No NaN/Inf in gradient computation |
 | Morphology change | Measurable | Should move from initial |
-| Performance vs baseline | ≥ baseline | At least no worse |
+| Performance vs baseline | >= baseline | At least no worse |
 
-### Known Challenge: Contact Gradient Instability
+### Implementation
 
-Your current implementation limits horizon to H=3 due to contact instabilities. For Ant:
-- Expect similar issues with ground contact
-- May need contact smoothing or shorter horizons
-- This is a research problem, not just a bug
-
-**Mitigation Options**:
-1. Use randomized smoothing on contact forces
-2. Limit BPTT to flight phases only
-3. Use finite-difference for contact-heavy steps
+- **Environment**: `envs/ant/ant_env.py` - Newton-based with MJCF generation
+- **Co-design script**: `codesign_ant.py` - PGHC with PPO inner loop
+- **Tests**: `test_level2_ant.py` - Environment and gradient verification
 
 ---
 
-## Level 4: G1 Humanoid (Target)
+## Level 3: G1 Humanoid (Target)
 
 ### Purpose
 Full system validation on the target robot.
 
 ### Only Proceed Here If
 
-- [ ] Level 0: All gradient and trust region tests pass
-- [ ] Level 1: Pendulum finds near-optimal length
-- [ ] Level 2: HalfCheetah improves with trust region active
-- [ ] Level 3: Ant achieves stable 3D locomotion with co-design
+- [x] Level 0: All gradient and trust region tests pass
+- [x] Level 1: Cart-pole finds near-optimal length with PGHC
+- [x] Level 1.5: Newton/Warp cart-pole vectorized environment works
+- [ ] Level 2: Ant achieves stable locomotion with co-design
 
 ### Expected Challenges
 
@@ -385,41 +307,47 @@ Full system validation on the target robot.
 | Frequent falls | Increase stability_threshold, more warmup iterations |
 | High-dimensional morphology | Start with hip angles only (current setup) |
 | Mode collapse | Multiple random seeds, curriculum learning |
+| Gradient chain broken by numpy | Implement quaternion math as Warp kernels (see G1_DIFFERENTIABILITY.md) |
 
 ---
 
 ## Implementation Checklist
 
-### Level 0 (Estimated: 1-2 days)
-- [ ] Create `tests/test_gradient_pipeline.py`
-- [ ] Create `tests/test_trust_region.py`
-- [ ] Create `tests/test_quaternion_grad.py`
-- [ ] All tests pass
+### Level 0: Math Verification — DONE
+- [x] Gradient pipeline verification (autograd vs finite difference)
+- [x] Trust region mechanics (accept/reject logic)
+- [x] Quaternion chain rule
+- Code: `test_level0_verification.py`
 
-### Level 1 (Estimated: 3-5 days)
-- [ ] Implement `ParametricPendulumModel`
-- [ ] Implement `PendulumEnv` (Gym-compatible)
-- [ ] Create pendulum config files
-- [ ] Integrate with simplified agent (no AMP)
-- [ ] Run verification, document results
+### Level 1: Cart-Pole (PyTorch physics) — DONE
+- [x] Implement `ParametricCartPole` and `CartPoleEnv`
+- [x] Implement PPO inner loop
+- [x] Verify envelope theorem (autograd vs FD gradients match)
+- [x] Run PGHC co-design, verify L converges toward optimum
+- Code: `envs/cartpole/`, `codesign_cartpole.py`, `codesign_cartpole_simple.py`
 
-### Level 2 (Estimated: 3-5 days)
-- [ ] Implement `ParametricHalfCheetahModel`
-- [ ] Adapt MuJoCo HalfCheetah or use existing Newton model
-- [ ] Create config files
-- [ ] Run trust region tuning sweep
-- [ ] Document optimal hyperparameters
+### Level 1.5: Cart-Pole (Newton/Warp) — DONE
+- [x] Implement vectorized Newton cart-pole environment
+- [x] Verify PPO training with vectorized envs
+- [x] Run PGHC with finite-difference gradients
+- [x] Video recording with subprocess (OpenGL workaround)
+- Code: `envs/cartpole_newton/`, `codesign_cartpole_newton_vec.py`
 
-### Level 3 (Estimated: 5-7 days)
-- [ ] Implement `ParametricAntModel`
-- [ ] Handle 3D contact in differentiable rollout
-- [ ] Debug gradient instabilities
-- [ ] Run full co-design, document results
+### Level 2: Ant (Newton/Warp) — CREATED, NOT VALIDATED
+- [x] Implement `ParametricAnt` with MJCF generation
+- [x] Implement `AntEnv` with Newton physics
+- [x] Implement finite-difference gradient computation
+- [x] Write co-design script (`codesign_ant.py`)
+- [ ] Run and validate PGHC on Ant (requires Newton GPU machine)
+- Code: `envs/ant/`, `codesign_ant.py`, `test_level2_ant.py`
 
-### Level 4 (Ongoing)
-- [ ] Transfer tuned hyperparameters from Levels 2-3
-- [ ] Run on G1 Humanoid
-- [ ] Iterate based on results
+### Level 3: G1 Humanoid — BLOCKED
+- [x] Implement `ParametricG1Model` with joint angle parameterization
+- [x] Implement `HybridAMPAgent` with outer loop
+- [x] Implement differentiable rollout infrastructure
+- [ ] Fix gradient chain (numpy breaks backprop — see G1_DIFFERENTIABILITY.md)
+- [ ] Run and validate PGHC on G1
+- Code: `parametric_g1.py`, `hybrid_agent.py`, `train_hybrid.py`
 
 ---
 
@@ -481,12 +409,12 @@ This avoids MimicKit dependency while reusing your outer loop logic.
 ## Appendix C: Hyperparameter Reference
 
 ### Inner Loop (Policy Learning)
-| Parameter | Pendulum | Cheetah | Ant | Humanoid |
-|-----------|----------|---------|-----|----------|
+| Parameter | Cart-Pole | Cart-Pole (Newton) | Ant | G1 Humanoid |
+|-----------|-----------|---------------------|-----|-------------|
 | `learning_rate` | 3e-4 | 3e-4 | 3e-4 | 5e-5 |
-| `num_envs` | 32 | 256 | 512 | 2048 |
-| `ppo_epochs` | 10 | 10 | 10 | 5 |
-| `min_iters_for_stability` | 500 | 2000 | 3000 | 5000 |
+| `num_envs` | 1 | 1024 | 1 | 2048 |
+| `ppo_epochs` | 10 | 4 | 4 | 5 |
+| `min_iters_for_stability` | 50 | 20 | 30 | 5000 |
 
 ### Outer Loop (Morphology)
 | Parameter | Start | Tune At Level |
@@ -501,37 +429,26 @@ This avoids MimicKit dependency while reusing your outer loop logic.
 ## Summary: Decision Tree
 
 ```
-Start at Level 0
+Level 0: Math Verification ──────────── DONE ✓
     │
-    ├── All tests pass? ────No───→ Fix gradient/trust region bugs
-    │         │
-    │        Yes
-    │         ↓
-    ├── Level 1: Pendulum
-    │         │
-    │   Finds optimal L? ────No───→ Debug envelope theorem, check convergence
-    │         │
-    │        Yes
-    │         ↓
-    ├── Level 2: HalfCheetah
-    │         │
-    │   Trust region works? ──No──→ Tune ξ, β, decay factors
-    │         │
-    │        Yes
-    │         ↓
-    ├── Level 3: Ant
-    │         │
-    │   3D stable? ───────────No──→ Debug contact gradients, smoothing
-    │         │
-    │        Yes
-    │         ↓
-    └── Level 4: Humanoid
-              │
-        Ready for thesis experiments
+Level 1: Cart-Pole (PyTorch) ────────── DONE ✓
+    │   Envelope theorem validated, PGHC converges
+    │
+Level 1.5: Cart-Pole (Newton/Warp) ──── DONE ✓
+    │   Vectorized envs, finite-diff gradients, video recording
+    │
+Level 2: Ant (Newton/Warp) ──────────── YOU ARE HERE
+    │   Created but not validated on GPU
+    │   Need: Run codesign_ant.py on Newton machine
+    │
+Level 3: G1 Humanoid ────────────────── BLOCKED
+    │   Gradient chain broken by numpy conversions
+    │   Need: Implement Warp kernels for quaternion math
+    │
+    └── Ready for thesis experiments
 ```
 
 ---
 
-*Document Version: 1.0*
-*Last Updated: 2026-02-04*
-*Author: Generated for PGHC Algorithm Verification*
+*Document Version: 2.0*
+*Last Updated: 2026-02-05*
