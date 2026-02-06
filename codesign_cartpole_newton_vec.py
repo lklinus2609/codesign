@@ -330,7 +330,7 @@ def collect_rollout_vec(env, policy, value_net, horizon=200):
 
 
 def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=4, clip_ratio=0.2,
-                   gamma=0.99, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.01):
+                   gamma=0.99, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.05):
     """PPO update with GAE advantages, value loss, and entropy bonus."""
     H, N = rollout["rewards"].shape
 
@@ -579,7 +579,7 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
+        list(policy.parameters()) + list(value_net.parameters()), lr=1e-4
     )
 
     stability_gate = StabilityGate(
