@@ -92,7 +92,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=15.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -435,7 +435,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
             num_worlds=1,
-            force_max=100.0,
+            force_max=15.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -555,7 +555,7 @@ def pghc_codesign_vec(
                 "stability_threshold": stability_threshold,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
-                "force_max": 100.0,
+                "force_max": 15.0,
                 "x_limit": 3.0,
             },
         )
@@ -571,7 +571,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=30.0,  # 30N on 1kg = 30 m/s², reasonable for swing-up
+        force_max=15.0,  # 15N on 1kg = 15 m/s², reasonable for balance
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -655,14 +655,14 @@ def pghc_codesign_vec(
                     "design/L": parametric_model.L,
                 }, step=global_step)
 
+            # Per-step mean reward from rollout (all worlds, all timesteps)
+            rollout_mean_reward = rollout["rewards"].mean().item()
+
             if (inner_iter + 1) % 5 == 0:
-                samples_per_iter = num_worlds * 200
-                # Debug: check action distribution
-                test_obs = torch.FloatTensor(env.reset())
-                with torch.no_grad():
-                    test_actions = policy.get_actions_batch(test_obs)
-                print(f"    Iter {inner_iter + 1}: return={mean_ret:.1f}, len={mean_len:.0f}, "
-                      f"actions=[{test_actions.min():.2f}, {test_actions.max():.2f}]")
+                print(f"    Iter {inner_iter + 1}: "
+                      f"mean_return={mean_ret:.1f} ±{std_ret:.1f}, "
+                      f"mean_len={mean_len:.0f}, "
+                      f"reward/step={rollout_mean_reward:.2f}")
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
@@ -717,7 +717,7 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            force_max=100.0,
+            force_max=15.0,
             x_limit=3.0,
             start_near_upright=True,
         )

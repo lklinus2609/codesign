@@ -73,8 +73,9 @@ def step_rewards_done_kernel(
     x_dot = obs[tid, 2]
     theta_dot = obs[tid, 3]
 
-    # IsaacLab-style reward: alive + cos(theta) - velocity penalties
-    r = 1.0 + wp.cos(theta) - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+    # Reward: alive + pole upright + cart centering - velocity penalties
+    cart_penalty = (x / x_limit) * (x / x_limit)  # 0 at center, 1 at boundary
+    r = 1.0 + wp.cos(theta) - 0.5 * cart_penalty - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
 
     # Termination: cart out of bounds
     terminated = 0
