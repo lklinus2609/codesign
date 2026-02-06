@@ -441,7 +441,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
     elif mean_kl < desired_kl / 2.0:
-        new_lr = min(current_lr * 1.5, 3e-3)
+        new_lr = min(current_lr * 1.5, 1e-3)
     else:
         new_lr = current_lr
     for pg in optimizer.param_groups:
@@ -694,6 +694,9 @@ def pghc_codesign_vec(
         eval_every = 50  # Only evaluate every N iters to avoid disrupting rollouts
         inner_iter = 0
         mean_ret, std_ret, mean_len = 0.0, 0.0, 0.0
+        best_mean_ret = -float('inf')
+        best_policy_state = None
+        best_value_state = None
 
         while True:
             # Collect rollout from all worlds
@@ -718,6 +721,19 @@ def pghc_codesign_vec(
                 mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
                 stability_gate.update(mean_ret)
                 stats = stability_gate.get_stats()
+
+                # Save best policy checkpoint
+                if mean_ret > best_mean_ret:
+                    best_mean_ret = mean_ret
+                    best_policy_state = {k: v.clone() for k, v in policy.state_dict().items()}
+                    best_value_state = {k: v.clone() for k, v in value_net.state_dict().items()}
+                    print(f"    [best] New best: mean_return={mean_ret:.1f}")
+                elif mean_ret < best_mean_ret * 0.5 and best_policy_state is not None:
+                    # Catastrophic drop — restore best policy
+                    print(f"    [best] Return dropped to {mean_ret:.1f} (best={best_mean_ret:.1f}). Restoring best policy.")
+                    policy.load_state_dict(best_policy_state)
+                    value_net.load_state_dict(best_value_state)
+                    env.last_obs = None  # Fresh start after restore
             else:
                 stats = stability_gate.get_stats()
 
