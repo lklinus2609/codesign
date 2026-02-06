@@ -697,7 +697,14 @@ def pghc_codesign_vec(
 
         while True:
             # Collect rollout from all worlds
-            rollout = collect_rollout_vec(env, policy, value_net, horizon=16)
+            try:
+                rollout = collect_rollout_vec(env, policy, value_net, horizon=16)
+            except Exception as e:
+                print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting env...")
+                wp.synchronize()
+                env.last_obs = None
+                env.reset()
+                continue
             mean_kl = ppo_update_vec(policy, value_net, optimizer, rollout)
 
             global_step += 1
