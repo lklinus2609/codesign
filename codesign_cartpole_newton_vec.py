@@ -216,8 +216,8 @@ class CartPolePolicy(nn.Module):
             nn.ELU(),
             nn.Linear(hidden_dim, act_dim),
         )
-        # init_noise_std=1.0 → log(1.0)=0.0
-        self.log_std = nn.Parameter(torch.zeros(act_dim))
+        # init_noise_std=0.5 → log(0.5)≈-0.7 (enough exploration without drowning signal)
+        self.log_std = nn.Parameter(torch.ones(act_dim) * -0.7)
 
         # Small random init for final layer
         nn.init.uniform_(self.net[-1].weight, -0.1, 0.1)
@@ -441,7 +441,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
     elif mean_kl < desired_kl / 2.0:
-        new_lr = min(current_lr * 1.5, 1e-2)
+        new_lr = min(current_lr * 1.5, 3e-3)
     else:
         new_lr = current_lr
     for pg in optimizer.param_groups:
