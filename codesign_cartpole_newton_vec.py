@@ -579,7 +579,7 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=1e-4
+        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
     )
 
     stability_gate = StabilityGate(
