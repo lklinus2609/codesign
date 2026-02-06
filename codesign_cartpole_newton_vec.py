@@ -92,7 +92,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=20.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -494,7 +494,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
             num_worlds=1,
-            force_max=100.0,
+            force_max=20.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -614,7 +614,7 @@ def pghc_codesign_vec(
                 "stability_threshold": stability_threshold,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
-                "force_max": 100.0,
+                "force_max": 20.0,
                 "x_limit": 3.0,
             },
         )
@@ -630,7 +630,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=100.0,  # IsaacLab uses 100N action_scale
+        force_max=20.0,  # IsaacLab uses 100N action_scale
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -779,7 +779,7 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            force_max=100.0,
+            force_max=20.0,
             x_limit=3.0,
             start_near_upright=True,
         )
