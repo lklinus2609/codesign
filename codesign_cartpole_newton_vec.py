@@ -92,7 +92,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=15.0, x_limit=3.0, start_near_upright=True)
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -207,17 +207,17 @@ def record_episode_video(L_value, policy, max_steps=200, width=640, height=480):
 class CartPolePolicy(nn.Module):
     """Policy network for cart-pole (supports batched inference)."""
 
-    def __init__(self, obs_dim=4, act_dim=1, hidden_dim=64):
+    def __init__(self, obs_dim=4, act_dim=1, hidden_dim=32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ELU(),
             nn.Linear(hidden_dim, act_dim),
         )
-        # Moderate exploration (exp(-0.5) ≈ 0.6)
-        self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
+        # init_noise_std=1.0 → log(1.0)=0.0
+        self.log_std = nn.Parameter(torch.zeros(act_dim))
 
         # Small random init for final layer
         nn.init.uniform_(self.net[-1].weight, -0.1, 0.1)
@@ -270,13 +270,13 @@ class CartPolePolicy(nn.Module):
 class CartPoleValue(nn.Module):
     """Value network for cart-pole (baseline for PPO advantage estimation)."""
 
-    def __init__(self, obs_dim=4, hidden_dim=64):
+    def __init__(self, obs_dim=4, hidden_dim=32):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ELU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Tanh(),
+            nn.ELU(),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -284,12 +284,14 @@ class CartPoleValue(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def collect_rollout_vec(env, policy, value_net, horizon=200):
-    """Collect rollout from vectorized environment."""
+def collect_rollout_vec(env, policy, value_net, horizon=16):
+    """Collect rollout from vectorized environment (no reset between rollouts)."""
     wp.synchronize()  # Ensure clean state before rollout
 
     num_worlds = env.num_worlds
-    obs = env.reset()
+    # NOTE: no env.reset() here — continue from where we left off
+    # The env auto-resets individual worlds when they terminate
+    obs = env.last_obs if hasattr(env, 'last_obs') and env.last_obs is not None else env.reset()
 
     all_obs = []
     all_actions = []
@@ -316,7 +318,14 @@ def collect_rollout_vec(env, policy, value_net, horizon=200):
 
         obs = next_obs
 
+    # Store last obs for next rollout (no unnecessary resets)
+    env.last_obs = obs
+
     wp.synchronize()  # Ensure all GPU operations complete
+
+    # Bootstrap value at last observation (critical for short rollouts)
+    with torch.no_grad():
+        last_value = value_net(torch.FloatTensor(obs))
 
     # Stack into tensors: (horizon, num_worlds, ...)
     return {
@@ -326,26 +335,32 @@ def collect_rollout_vec(env, policy, value_net, horizon=200):
         "log_probs": torch.stack(all_log_probs),                # (H, N)
         "dones": torch.FloatTensor(np.array(all_dones)),        # (H, N)
         "values": torch.stack(all_values),                      # (H, N)
+        "last_value": last_value,                               # (N,) bootstrap
     }
 
 
-def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=4, clip_ratio=0.2,
-                   gamma=0.99, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.05):
-    """PPO update with GAE advantages, value loss, and entropy bonus."""
+def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
+                   gamma=0.99, gae_lambda=0.95, value_coeff=1.0, entropy_coeff=0.005,
+                   num_mini_batches=4, desired_kl=0.01):
+    """PPO update with GAE, mini-batches, and adaptive LR (RSL-RL style).
+
+    Returns mean KL divergence for logging and LR adaptation.
+    """
     H, N = rollout["rewards"].shape
 
-    rewards = rollout["rewards"]   # (H, N)
-    dones = rollout["dones"]       # (H, N)
-    values = rollout["values"]     # (H, N)
+    rewards = rollout["rewards"]       # (H, N)
+    dones = rollout["dones"]           # (H, N)
+    values = rollout["values"]         # (H, N)
+    last_value = rollout["last_value"] # (N,) bootstrap value
 
-    # --- Compute GAE advantages ---
+    # --- Compute GAE advantages with bootstrap ---
     with torch.no_grad():
         advantages = torch.zeros(H, N)
         last_gae = torch.zeros(N)
 
         for t in reversed(range(H)):
             if t == H - 1:
-                next_value = torch.zeros(N)
+                next_value = last_value  # Bootstrap from value estimate
             else:
                 next_value = values[t + 1]
 
@@ -356,48 +371,89 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=4, clip_ratio
         returns = advantages + values
 
     # Reshape for updates
-    obs_flat = rollout["observations"].reshape(H * N, -1)
-    acts_flat = rollout["actions"].reshape(H * N, -1)
-    old_log_probs_flat = rollout["log_probs"].reshape(H * N)
-    advantages_flat = advantages.reshape(H * N)
-    returns_flat = returns.reshape(H * N)
+    total_samples = H * N
+    obs_flat = rollout["observations"].reshape(total_samples, -1)
+    acts_flat = rollout["actions"].reshape(total_samples, -1)
+    old_log_probs_flat = rollout["log_probs"].reshape(total_samples)
+    advantages_flat = advantages.reshape(total_samples)
+    returns_flat = returns.reshape(total_samples)
 
-    # Normalize advantages (not returns — advantages only)
+    # Normalize advantages
     advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8)
 
     all_params = list(policy.parameters()) + list(value_net.parameters())
+    mini_batch_size = total_samples // num_mini_batches
+    mean_kl = 0.0
 
-    for _ in range(n_epochs):
-        # Policy: recompute log probs and entropy
-        mean = policy(obs_flat)
-        std = torch.exp(policy.log_std)
-        dist = torch.distributions.Normal(mean, std)
-        log_probs = dist.log_prob(acts_flat).sum(-1)
-        entropy = dist.entropy().sum(-1).mean()
+    for epoch in range(n_epochs):
+        # Shuffle indices for mini-batches
+        perm = torch.randperm(total_samples)
 
-        # Value prediction
-        values_pred = value_net(obs_flat)
+        for mb in range(num_mini_batches):
+            idx = perm[mb * mini_batch_size : (mb + 1) * mini_batch_size]
 
-        # PPO clipped policy loss
-        ratio = torch.exp(log_probs - old_log_probs_flat)
-        clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-        policy_loss = -torch.min(ratio * advantages_flat, clipped_ratio * advantages_flat).mean()
+            obs_mb = obs_flat[idx]
+            acts_mb = acts_flat[idx]
+            old_lp_mb = old_log_probs_flat[idx]
+            adv_mb = advantages_flat[idx]
+            ret_mb = returns_flat[idx]
 
-        # Value loss
-        value_loss = nn.functional.mse_loss(values_pred, returns_flat)
+            # Policy: recompute log probs and entropy
+            mean = policy(obs_mb)
+            std = torch.exp(policy.log_std)
+            dist = torch.distributions.Normal(mean, std)
+            log_probs = dist.log_prob(acts_mb).sum(-1)
+            entropy = dist.entropy().sum(-1).mean()
 
-        # Total loss = policy + value - entropy
-        loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+            # Value prediction
+            values_pred = value_net(obs_mb)
 
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(all_params, 0.5)
-        optimizer.step()
+            # PPO clipped policy loss
+            ratio = torch.exp(log_probs - old_lp_mb)
+            clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
+            policy_loss = -torch.min(ratio * adv_mb, clipped_ratio * adv_mb).mean()
+
+            # Value loss
+            value_loss = nn.functional.mse_loss(values_pred, ret_mb)
+
+            # Total loss
+            loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
+
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(all_params, 1.0)
+            optimizer.step()
+
+        # Track KL after each epoch (approximate KL)
+        with torch.no_grad():
+            mean_all = policy(obs_flat)
+            std_all = torch.exp(policy.log_std)
+            dist_all = torch.distributions.Normal(mean_all, std_all)
+            new_lp = dist_all.log_prob(acts_flat).sum(-1)
+            mean_kl = (old_log_probs_flat - new_lp).mean().item()
+
+        # Early stop if KL too large (RSL-RL style)
+        if mean_kl > 2.0 * desired_kl:
+            break
+
+    # Adaptive LR (RSL-RL style)
+    current_lr = optimizer.param_groups[0]['lr']
+    if mean_kl > 2.0 * desired_kl:
+        new_lr = max(current_lr / 1.5, 1e-5)
+    elif mean_kl < desired_kl / 2.0:
+        new_lr = min(current_lr * 1.5, 1e-2)
+    else:
+        new_lr = current_lr
+    for pg in optimizer.param_groups:
+        pg['lr'] = new_lr
+
+    return mean_kl
 
 
 def evaluate_policy_vec(env, policy, n_episodes=5):
     """Evaluate policy using vectorized environment."""
-    # Use first n_episodes worlds for evaluation
+    # Save last_obs so evaluation doesn't disrupt training rollouts
+    saved_obs = getattr(env, 'last_obs', None)
     obs = env.reset()
     episode_returns = np.zeros(env.num_worlds)
     episode_lengths = np.zeros(env.num_worlds)
@@ -418,6 +474,9 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
         if np.sum(completed) >= n_episodes:
             break
 
+    # Restore last_obs so training rollouts continue normally
+    env.last_obs = None  # Force fresh start on next rollout after eval
+
     # Return stats from first n completed episodes
     mean_return = np.mean(episode_returns[:n_episodes])
     std_return = np.std(episode_returns[:n_episodes])
@@ -435,7 +494,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
             num_worlds=1,
-            force_max=15.0,
+            force_max=100.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -555,7 +614,7 @@ def pghc_codesign_vec(
                 "stability_threshold": stability_threshold,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
-                "force_max": 15.0,
+                "force_max": 100.0,
                 "x_limit": 3.0,
             },
         )
@@ -571,7 +630,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=15.0,  # 15N on 1kg = 15 m/s², reasonable for balance
+        force_max=100.0,  # IsaacLab uses 100N action_scale
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -579,7 +638,7 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
+        list(policy.parameters()) + list(value_net.parameters()), lr=1e-3
     )
 
     stability_gate = StabilityGate(
@@ -635,8 +694,8 @@ def pghc_codesign_vec(
         inner_iter = 0
         while True:
             # Collect rollout from all worlds
-            rollout = collect_rollout_vec(env, policy, value_net, horizon=200)
-            ppo_update_vec(policy, value_net, optimizer, rollout)
+            rollout = collect_rollout_vec(env, policy, value_net, horizon=16)
+            mean_kl = ppo_update_vec(policy, value_net, optimizer, rollout)
 
             # Evaluate
             mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
@@ -645,6 +704,10 @@ def pghc_codesign_vec(
 
             global_step += 1
 
+            # Per-step mean reward from rollout (all worlds, all timesteps)
+            rollout_mean_reward = rollout["rewards"].mean().item()
+            current_lr = optimizer.param_groups[0]['lr']
+
             if use_wandb:
                 wandb.log({
                     "inner/return_mean": mean_ret,
@@ -652,17 +715,16 @@ def pghc_codesign_vec(
                     "inner/episode_length": mean_len,
                     "inner/relative_change": stats["relative_change"],
                     "inner/iteration": inner_iter + 1,
+                    "inner/kl": mean_kl,
+                    "inner/lr": current_lr,
                     "design/L": parametric_model.L,
                 }, step=global_step)
-
-            # Per-step mean reward from rollout (all worlds, all timesteps)
-            rollout_mean_reward = rollout["rewards"].mean().item()
-
             if (inner_iter + 1) % 5 == 0:
                 print(f"    Iter {inner_iter + 1}: "
                       f"mean_return={mean_ret:.1f} ±{std_ret:.1f}, "
                       f"mean_len={mean_len:.0f}, "
-                      f"reward/step={rollout_mean_reward:.2f}")
+                      f"reward/step={rollout_mean_reward:.2f}, "
+                      f"kl={mean_kl:.4f}, lr={current_lr:.1e}")
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
@@ -717,10 +779,11 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            force_max=15.0,
+            force_max=100.0,
             x_limit=3.0,
             start_near_upright=True,
         )
+        env.last_obs = None  # Force fresh reset on next rollout
         wp.synchronize()
 
         print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
@@ -747,9 +810,9 @@ def pghc_codesign_vec(
     print(f"  Final:   {history['L'][-1]:.3f} m")
     print(f"  Change:  {history['L'][-1] - history['L'][0]:+.3f} m")
 
-    total_samples = sum(history["inner_iterations"]) * num_worlds * 200
+    total_samples = sum(history["inner_iterations"]) * num_worlds * 16
     print(f"\nTotal training samples: {total_samples:,}")
-    print(f"  ({num_worlds} worlds x 200 steps x {sum(history['inner_iterations'])} iters)")
+    print(f"  ({num_worlds} worlds x 16 steps x {sum(history['inner_iterations'])} iters)")
 
     if use_wandb:
         # Record final video
