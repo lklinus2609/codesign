@@ -261,13 +261,30 @@ class CartPolePolicy(nn.Module):
         std = torch.exp(self.log_std)
         dist = torch.distributions.Normal(mean, std)
         actions_raw = dist.rsample()
-        log_probs = dist.log_prob(actions_raw).sum(-1)
-        # Clip actions to [-1, 1]
         actions = torch.clamp(actions_raw, -1.0, 1.0)
+        # Evaluate log_prob at CLAMPED actions so it matches PPO update
+        log_probs = dist.log_prob(actions).sum(-1)
         return actions, log_probs
 
 
-def collect_rollout_vec(env, policy, horizon=200):
+class CartPoleValue(nn.Module):
+    """Value network for cart-pole (baseline for PPO advantage estimation)."""
+
+    def __init__(self, obs_dim=4, hidden_dim=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.Tanh(),
+            nn.Linear(hidden_dim, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def collect_rollout_vec(env, policy, value_net, horizon=200):
     """Collect rollout from vectorized environment."""
     wp.synchronize()  # Ensure clean state before rollout
 
@@ -279,10 +296,13 @@ def collect_rollout_vec(env, policy, horizon=200):
     all_rewards = []
     all_log_probs = []
     all_dones = []
+    all_values = []
 
     for _ in range(horizon):
         obs_t = torch.FloatTensor(obs)
         actions, log_probs = policy.get_action_and_log_prob_batch(obs_t)
+        with torch.no_grad():
+            values = value_net(obs_t)
 
         actions_np = actions.detach().numpy()
         next_obs, rewards, dones, _ = env.step(actions_np)
@@ -292,6 +312,7 @@ def collect_rollout_vec(env, policy, horizon=200):
         all_rewards.append(rewards)
         all_log_probs.append(log_probs.detach())
         all_dones.append(dones)
+        all_values.append(values)
 
         obs = next_obs
 
@@ -304,50 +325,73 @@ def collect_rollout_vec(env, policy, horizon=200):
         "rewards": torch.FloatTensor(np.array(all_rewards)),    # (H, N)
         "log_probs": torch.stack(all_log_probs),                # (H, N)
         "dones": torch.FloatTensor(np.array(all_dones)),        # (H, N)
+        "values": torch.stack(all_values),                      # (H, N)
     }
 
 
-def ppo_update_vec(policy, optimizer, rollout, n_epochs=4, clip_ratio=0.2, gamma=0.99):
-    """PPO update with vectorized rollout data."""
-    # Reshape from (H, N, ...) to (H*N, ...)
+def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=4, clip_ratio=0.2,
+                   gamma=0.99, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.01):
+    """PPO update with GAE advantages, value loss, and entropy bonus."""
     H, N = rollout["rewards"].shape
 
-    obs = rollout["observations"].reshape(H * N, -1)
-    acts = rollout["actions"].reshape(H * N, -1)
-    old_log_probs = rollout["log_probs"].reshape(H * N)
-    rewards = rollout["rewards"]  # Keep (H, N) for return computation
-    dones = rollout["dones"]
+    rewards = rollout["rewards"]   # (H, N)
+    dones = rollout["dones"]       # (H, N)
+    values = rollout["values"]     # (H, N)
 
-    # Compute returns per trajectory (handle resets)
-    returns = torch.zeros(H, N)
-    running_return = torch.zeros(N)
+    # --- Compute GAE advantages ---
+    with torch.no_grad():
+        advantages = torch.zeros(H, N)
+        last_gae = torch.zeros(N)
 
-    for t in reversed(range(H)):
-        # Reset return where episode ended
-        running_return = running_return * (1 - dones[t])
-        running_return = rewards[t] + gamma * running_return
-        returns[t] = running_return
+        for t in reversed(range(H)):
+            if t == H - 1:
+                next_value = torch.zeros(N)
+            else:
+                next_value = values[t + 1]
 
-    returns = returns.reshape(H * N)
+            delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
+            last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
+            advantages[t] = last_gae
 
-    # Normalize returns
-    returns = (returns - returns.mean()) / (returns.std() + 1e-8)
+        returns = advantages + values
+
+    # Reshape for updates
+    obs_flat = rollout["observations"].reshape(H * N, -1)
+    acts_flat = rollout["actions"].reshape(H * N, -1)
+    old_log_probs_flat = rollout["log_probs"].reshape(H * N)
+    advantages_flat = advantages.reshape(H * N)
+    returns_flat = returns.reshape(H * N)
+
+    # Normalize advantages (not returns — advantages only)
+    advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8)
+
+    all_params = list(policy.parameters()) + list(value_net.parameters())
 
     for _ in range(n_epochs):
-        # Recompute log probs
-        mean = policy(obs)
+        # Policy: recompute log probs and entropy
+        mean = policy(obs_flat)
         std = torch.exp(policy.log_std)
         dist = torch.distributions.Normal(mean, std)
-        log_probs = dist.log_prob(acts).sum(-1)
+        log_probs = dist.log_prob(acts_flat).sum(-1)
+        entropy = dist.entropy().sum(-1).mean()
 
-        # PPO loss
-        ratio = torch.exp(log_probs - old_log_probs)
+        # Value prediction
+        values_pred = value_net(obs_flat)
+
+        # PPO clipped policy loss
+        ratio = torch.exp(log_probs - old_log_probs_flat)
         clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-        loss = -torch.min(ratio * returns, clipped_ratio * returns).mean()
+        policy_loss = -torch.min(ratio * advantages_flat, clipped_ratio * advantages_flat).mean()
+
+        # Value loss
+        value_loss = nn.functional.mse_loss(values_pred, returns_flat)
+
+        # Total loss = policy + value - entropy
+        loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
 
         optimizer.zero_grad()
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(policy.parameters(), 0.5)
+        torch.nn.utils.clip_grad_norm_(all_params, 0.5)
         optimizer.step()
 
 
@@ -533,7 +577,10 @@ def pghc_codesign_vec(
     )
 
     policy = CartPolePolicy()
-    optimizer = optim.Adam(policy.parameters(), lr=3e-4)
+    value_net = CartPoleValue()
+    optimizer = optim.Adam(
+        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
+    )
 
     stability_gate = StabilityGate(
         window_size=stability_window,
@@ -588,8 +635,8 @@ def pghc_codesign_vec(
         inner_iter = 0
         while True:
             # Collect rollout from all worlds
-            rollout = collect_rollout_vec(env, policy, horizon=200)
-            ppo_update_vec(policy, optimizer, rollout)
+            rollout = collect_rollout_vec(env, policy, value_net, horizon=200)
+            ppo_update_vec(policy, value_net, optimizer, rollout)
 
             # Evaluate
             mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
