@@ -161,7 +161,7 @@ class ParametricCartPoleNewton:
         L_min: float = 0.3,
         L_max: float = 1.2,
         cart_mass: float = 1.0,
-        pole_linear_density: float = 0.3,
+        pole_linear_density: float = 0.2,
     ):
         self.L = L_init
         self.L_min = L_min
