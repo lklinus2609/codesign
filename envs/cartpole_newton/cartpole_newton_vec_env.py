@@ -77,11 +77,14 @@ def step_rewards_done_kernel(
     cart_penalty = (x / x_limit) * (x / x_limit)  # 0 at center, 1 at boundary
     r = 1.0 + wp.cos(theta) - 0.5 * cart_penalty - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
 
-    # Termination: cart out of bounds
+    # Termination: cart out of bounds OR pole past ±90°
     terminated = 0
     if wp.abs(x) > x_limit:
         terminated = 1
         r = r - 2.0
+    if wp.abs(theta) > 1.5708:  # π/2 ≈ 1.5708
+        terminated = 1
+        r = r - 1.0
 
     # Truncation: max steps reached
     truncated = 0
