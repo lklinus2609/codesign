@@ -452,8 +452,6 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
 
 def evaluate_policy_vec(env, policy, n_episodes=5):
     """Evaluate policy using vectorized environment."""
-    # Save last_obs so evaluation doesn't disrupt training rollouts
-    saved_obs = getattr(env, 'last_obs', None)
     obs = env.reset()
     episode_returns = np.zeros(env.num_worlds)
     episode_lengths = np.zeros(env.num_worlds)
@@ -470,17 +468,26 @@ def evaluate_policy_vec(env, policy, n_episodes=5):
         # Mark completed episodes
         completed = completed | dones
 
-        # If enough episodes completed, stop
+        # If enough episodes completed, stop early
         if np.sum(completed) >= n_episodes:
             break
 
     # Restore last_obs so training rollouts continue normally
     env.last_obs = None  # Force fresh start on next rollout after eval
 
-    # Return stats from first n completed episodes
-    mean_return = np.mean(episode_returns[:n_episodes])
-    std_return = np.std(episode_returns[:n_episodes])
-    mean_length = np.mean(episode_lengths[:n_episodes])
+    # Average only COMPLETED episodes (not partial ones)
+    completed_idx = np.where(completed)[0]
+    if len(completed_idx) >= n_episodes:
+        idx = completed_idx[:n_episodes]
+    elif len(completed_idx) > 0:
+        idx = completed_idx
+    else:
+        # No episodes completed — use all worlds (truncated at max_steps)
+        idx = np.arange(min(n_episodes, env.num_worlds))
+
+    mean_return = np.mean(episode_returns[idx])
+    std_return = np.std(episode_returns[idx])
+    mean_length = np.mean(episode_lengths[idx])
     return mean_return, std_return, mean_length
 
 
