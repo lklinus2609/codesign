@@ -691,16 +691,14 @@ def pghc_codesign_vec(
         print(f"\n  [Inner Loop] Training PPO ({num_worlds} parallel envs)...")
         stability_gate.reset()
 
+        eval_every = 50  # Only evaluate every N iters to avoid disrupting rollouts
         inner_iter = 0
+        mean_ret, std_ret, mean_len = 0.0, 0.0, 0.0
+
         while True:
             # Collect rollout from all worlds
             rollout = collect_rollout_vec(env, policy, value_net, horizon=16)
             mean_kl = ppo_update_vec(policy, value_net, optimizer, rollout)
-
-            # Evaluate
-            mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
-            stability_gate.update(mean_ret)
-            stats = stability_gate.get_stats()
 
             global_step += 1
 
@@ -708,23 +706,37 @@ def pghc_codesign_vec(
             rollout_mean_reward = rollout["rewards"].mean().item()
             current_lr = optimizer.param_groups[0]['lr']
 
+            # Full evaluation only every N iters (avoids resetting training env)
+            if (inner_iter + 1) % eval_every == 0:
+                mean_ret, std_ret, mean_len = evaluate_policy_vec(env, policy, n_episodes=min(10, num_worlds))
+                stability_gate.update(mean_ret)
+                stats = stability_gate.get_stats()
+            else:
+                stats = stability_gate.get_stats()
+
             if use_wandb:
-                wandb.log({
-                    "inner/return_mean": mean_ret,
-                    "inner/return_std": std_ret,
-                    "inner/episode_length": mean_len,
-                    "inner/relative_change": stats["relative_change"],
+                log_dict = {
+                    "inner/reward_per_step": rollout_mean_reward,
                     "inner/iteration": inner_iter + 1,
                     "inner/kl": mean_kl,
                     "inner/lr": current_lr,
                     "design/L": parametric_model.L,
-                }, step=global_step)
+                }
+                if (inner_iter + 1) % eval_every == 0:
+                    log_dict.update({
+                        "inner/return_mean": mean_ret,
+                        "inner/return_std": std_ret,
+                        "inner/episode_length": mean_len,
+                        "inner/relative_change": stats["relative_change"],
+                    })
+                wandb.log(log_dict, step=global_step)
+
             if (inner_iter + 1) % 5 == 0:
                 print(f"    Iter {inner_iter + 1}: "
-                      f"mean_return={mean_ret:.1f} ±{std_ret:.1f}, "
-                      f"mean_len={mean_len:.0f}, "
                       f"reward/step={rollout_mean_reward:.2f}, "
-                      f"kl={mean_kl:.4f}, lr={current_lr:.1e}")
+                      f"kl={mean_kl:.4f}, lr={current_lr:.1e}"
+                      + (f", mean_return={mean_ret:.1f} ±{std_ret:.1f}, mean_len={mean_len:.0f}"
+                         if (inner_iter + 1) % eval_every == 0 else ""))
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
