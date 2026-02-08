@@ -18,7 +18,6 @@ import torch.nn as nn
 import torch.optim as optim
 import argparse
 from collections import deque
-import gc
 
 try:
     import wandb
@@ -529,40 +528,59 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
 
 
 class StabilityGate:
-    """Stability gating for PGHC inner loop convergence detection."""
+    """Stability gating for PGHC inner loop convergence detection.
 
-    def __init__(self, window_size=10, threshold=0.01, min_iterations=20):
-        self.window_size = window_size
+    Tracks consecutive inner iterations where reward is stable (below threshold).
+    Converges when stable for `stable_iters_required` consecutive inner iterations.
+    """
+
+    def __init__(self, threshold=0.01, min_inner_iters=1000, stable_iters_required=50):
         self.threshold = threshold
-        self.min_iterations = min_iterations
-        self.reward_history = deque(maxlen=window_size)
-        self.iteration = 0
+        self.min_inner_iters = min_inner_iters
+        self.stable_iters_required = stable_iters_required
+        self.reward_history = deque(maxlen=5)  # small window for relative change
+        self.total_inner_iters = 0
+        self.stable_count = 0  # consecutive inner iters while stable
 
     def reset(self):
         self.reward_history.clear()
-        self.iteration = 0
+        self.total_inner_iters = 0
+        self.stable_count = 0
 
     def update(self, mean_reward):
+        """Called on eval iterations with new mean_reward."""
         self.reward_history.append(mean_reward)
-        self.iteration += 1
 
-    def is_converged(self):
-        if self.iteration < self.min_iterations:
-            return False
-        if len(self.reward_history) < self.window_size:
-            return False
+    def tick(self, n_iters=1):
+        """Called every inner iteration to count total and stable iters."""
+        self.total_inner_iters += n_iters
+        if self._is_stable():
+            self.stable_count += n_iters
+        else:
+            self.stable_count = 0
 
+    def _is_stable(self):
+        if len(self.reward_history) < 2:
+            return False
         rewards_arr = np.array(self.reward_history)
         mean_val = np.mean(rewards_arr)
         if abs(mean_val) < 1e-6:
             return True
-
         relative_change = (np.max(rewards_arr) - np.min(rewards_arr)) / abs(mean_val)
         return relative_change < self.threshold
 
+    def is_converged(self):
+        # Must train at least min_inner_iters first
+        if self.total_inner_iters < self.min_inner_iters:
+            return False
+        # Then need 50 consecutive stable iters AFTER the minimum
+        if self.stable_count >= self.stable_iters_required:
+            return True
+        return False
+
     def get_stats(self):
         if len(self.reward_history) < 2:
-            return {"mean": 0, "std": 0, "relative_change": 1.0}
+            return {"mean": 0, "std": 0, "relative_change": 1.0, "stable_count": 0}
 
         rewards_arr = np.array(self.reward_history)
         mean_val = np.mean(rewards_arr)
@@ -573,15 +591,13 @@ class StabilityGate:
             "mean": mean_val,
             "std": std_val,
             "relative_change": relative_change,
+            "stable_count": self.stable_count,
         }
 
 
 def pghc_codesign_vec(
     n_outer_iterations=15,
-    stability_window=10,
     stability_threshold=0.01,
-    min_inner_iterations=20,
-    outer_loop_start_iter=1000,  # Skip outer loop until this many total inner iters
     design_lr=0.02,
     max_step=0.1,
     initial_L=0.6,
@@ -624,7 +640,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=20.0,  # IsaacLab uses 100N action_scale
+        force_max=20.0,
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -636,9 +652,9 @@ def pghc_codesign_vec(
     )
 
     stability_gate = StabilityGate(
-        window_size=stability_window,
         threshold=stability_threshold,
-        min_iterations=min_inner_iterations,
+        min_inner_iters=1000,
+        stable_iters_required=50,
     )
 
     history = {
@@ -649,7 +665,6 @@ def pghc_codesign_vec(
     }
 
     global_step = 0
-    total_inner_iterations = 0  # Track total inner iters across all outer loops
 
     print(f"\nConfiguration:")
     print(f"  Num parallel worlds: {num_worlds}")
@@ -658,7 +673,6 @@ def pghc_codesign_vec(
     print(f"  Cart bounds: (-{env.x_limit}, {env.x_limit})")
     print(f"  Start near upright: {env.start_near_upright}")
     print(f"  Stability threshold: {stability_threshold:.1%}")
-    print(f"  Outer loop starts after: {outer_loop_start_iter} inner iterations")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
@@ -768,18 +782,17 @@ def pghc_codesign_vec(
                         "video/reward": mean_rew,
                     }, step=global_step)
 
-            total_inner_iterations += 1
+            stability_gate.tick()
             inner_iter += 1
 
-            # Only allow convergence break AFTER we've trained enough
-            if total_inner_iterations >= outer_loop_start_iter and stability_gate.is_converged():
-                print(f"    CONVERGED at iter {inner_iter} (total: {total_inner_iterations})")
+            if stability_gate.is_converged():
+                print(f"    CONVERGED at iter {inner_iter} (stable for {stability_gate.stable_count} iters)")
                 break
 
         # Final evaluation
         mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy)
         history["rewards"].append(mean_reward)
-        history["inner_iterations"].append(stability_gate.iteration)
+        history["inner_iterations"].append(stability_gate.total_inner_iters)
         print(f"  Policy converged. Reward = {mean_reward:.1f} +/- {std_reward:.1f}, Length = {mean_length:.0f}")
 
         # =============================================
@@ -824,7 +837,7 @@ def pghc_codesign_vec(
                 "outer/gradient": gradient,
                 "outer/L_step": step,
                 "outer/L_new": parametric_model.L,
-                "outer/inner_iterations_used": stability_gate.iteration,
+                "outer/inner_iterations_used": stability_gate.total_inner_iters,
             }, step=global_step)
 
     # =============================================
@@ -876,9 +889,7 @@ if __name__ == "__main__":
 
     history, policy, model = pghc_codesign_vec(
         n_outer_iterations=args.outer_iters,
-        stability_window=10,
         stability_threshold=0.01,
-        min_inner_iterations=15,
         design_lr=args.design_lr,
         initial_L=args.initial_L,
         num_worlds=args.num_worlds,
