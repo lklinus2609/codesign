@@ -779,16 +779,19 @@ def pghc_codesign_vec(
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
-                print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
-                video = record_episode_video(parametric_model.L, policy, max_steps=250)
-                if video is not None:
-                    wandb.log({
-                        "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=50, format="mp4"),
-                        "video/inner_iter": inner_iter + 1,
-                        "video/outer_iter": outer_iter + 1,
-                        "video/L": parametric_model.L,
-                        "video/reward": mean_rew,
-                    }, step=global_step)
+                try:
+                    print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
+                    video = record_episode_video(parametric_model.L, policy, max_steps=500)
+                    if video is not None:
+                        wandb.log({
+                            "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=50, format="mp4"),
+                            "video/inner_iter": inner_iter + 1,
+                            "video/outer_iter": outer_iter + 1,
+                            "video/L": parametric_model.L,
+                            "video/reward": mean_rew,
+                        }, step=global_step)
+                except Exception as e:
+                    print(f"    [wandb] Video recording failed: {type(e).__name__}. Skipping.")
 
             stability_gate.tick()
             inner_iter += 1
