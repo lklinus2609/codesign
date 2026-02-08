@@ -355,7 +355,7 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
 
 def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
                    gamma=0.99, gae_lambda=0.95, value_coeff=1.0, entropy_coeff=0.005,
-                   num_mini_batches=4, desired_kl=0.01):
+                   num_mini_batches=8, desired_kl=0.005):
     """PPO update with GAE, mini-batches, and adaptive LR (RSL-RL style).
 
     Returns mean KL divergence for logging and LR adaptation.
@@ -455,7 +455,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
     elif mean_kl < desired_kl / 2.0:
-        new_lr = min(current_lr * 1.5, 1e-3)
+        new_lr = min(current_lr * 1.5, 3e-4)
     else:
         new_lr = current_lr
     for pg in optimizer.param_groups:
@@ -645,7 +645,7 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=1e-3
+        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
     )
 
     stability_gate = StabilityGate(
