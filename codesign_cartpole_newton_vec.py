@@ -107,7 +107,7 @@ wp.synchronize()
 
 # Setup viewer
 viewer.set_model(env.model)
-viewer.set_camera(pos=wp.vec3(0.0, -3.0, 1.0), pitch=-10.0, yaw=90.0)
+viewer.set_camera(pos=wp.vec3(0.0, -5.0, 2.0), pitch=-10.0, yaw=90.0)
 
 # Warm-up
 viewer.begin_frame(0.0)
@@ -592,7 +592,7 @@ class StabilityGate:
 
 
 def pghc_codesign_vec(
-    n_outer_iterations=15,
+    n_outer_iterations=50,
     design_lr=0.02,
     max_step=0.01,
     initial_L=0.6,
@@ -871,7 +871,7 @@ def pghc_codesign_vec(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PGHC Co-Design (Vectorized)")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
+    parser.add_argument("--outer-iters", type=int, default=50, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel worlds")
