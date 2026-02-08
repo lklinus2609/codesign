@@ -73,11 +73,9 @@ def step_rewards_done_kernel(
     x_dot = obs[tid, 2]
     theta_dot = obs[tid, 3]
 
-    # Termination: cart out of bounds OR pole past ±90°
+    # Termination: cart out of bounds only (allow pole to swing freely)
     terminated = 0
     if wp.abs(x) > x_limit:
-        terminated = 1
-    if wp.abs(theta) > 1.5708:  # π/2
         terminated = 1
 
     # IsaacLab-style reward: alive(conditional) + termination penalty + pole angle + velocity penalties
