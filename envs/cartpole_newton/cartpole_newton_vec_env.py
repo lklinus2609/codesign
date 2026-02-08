@@ -58,6 +58,7 @@ def extract_obs_kernel(
 def step_rewards_done_kernel(
     obs: wp.array2d(dtype=float),
     actions: wp.array(dtype=float),
+    prev_actions: wp.array(dtype=float),
     steps: wp.array(dtype=int),
     x_limit: float,
     max_steps: int,
@@ -74,6 +75,8 @@ def step_rewards_done_kernel(
     x_dot = obs[tid, 2]
     theta_dot = obs[tid, 3]
     action = actions[tid]
+    prev_action = prev_actions[tid]
+    action_diff = action - prev_action
 
     # Termination: cart out of bounds only (allow pole to swing freely)
     terminated = 0
@@ -86,9 +89,13 @@ def step_rewards_done_kernel(
     #   angle penalty:  -θ²  (upright = 0 penalty)
     #   position:       -0.1*x²  (stay near center)
     #   energy:         -0.01*action²  (minimize force usage)
+    #   smoothness:     -0.1*(action - prev_action)²  (reward smooth control)
     #   velocity:       -0.01*|ẋ| - 0.005*|θ̇|
     terminated_f = float(terminated)
-    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.1 * x * x - 0.01 * action * action - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.1 * x * x - 0.01 * action * action - 0.1 * action_diff * action_diff - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+
+    # Update prev_actions for next step
+    prev_actions[tid] = action
 
     # Truncation: max steps reached
     truncated = 0
@@ -355,6 +362,7 @@ class CartPoleNewtonVecEnv:
         self.rewards_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
         self.dones_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
         self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
+        self.prev_actions_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
 
     @property
     def steps(self):
@@ -454,7 +462,7 @@ class CartPoleNewtonVecEnv:
 
         # --- GPU: compute rewards, increment steps, check done ---
         wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
-                  inputs=[self.obs_wp, actions_wp, self.steps_wp, self.x_limit, self.max_steps,
+                  inputs=[self.obs_wp, actions_wp, self.prev_actions_wp, self.steps_wp, self.x_limit, self.max_steps,
                           self.rewards_wp, self.dones_wp])
 
         self._step_count += 1
