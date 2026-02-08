@@ -709,7 +709,7 @@ def pghc_codesign_vec(
         while True:
             # Collect rollout from all worlds
             try:
-                rollout = collect_rollout_vec(env, policy, value_net, horizon=16)
+                rollout = collect_rollout_vec(env, policy, value_net, horizon=32)
             except Exception as e:
                 print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting env...")
                 wp.synchronize()
@@ -883,7 +883,7 @@ if __name__ == "__main__":
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel worlds")
+    parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel worlds")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
