@@ -728,9 +728,6 @@ def pghc_codesign_vec(
         log_every = 10  # Print/log stats every N iters
         inner_iter = 0
         mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
-        best_mean_rew = -float('inf')
-        best_policy_state = None
-        best_value_state = None
 
         # Rolling buffer of completed episodes (RSL-RL style)
         reward_buffer = deque(maxlen=200)
@@ -768,22 +765,9 @@ def pghc_codesign_vec(
                 std_rew = np.std(reward_buffer)
                 mean_len = np.mean(length_buffer)
 
-            # Update stability gate and best policy every log_every iters
+            # Update stability gate every log_every iters
             if (inner_iter + 1) % log_every == 0 and len(reward_buffer) > 0:
                 stability_gate.update(mean_rew)
-
-                # Save best policy checkpoint
-                if mean_rew > best_mean_rew:
-                    best_mean_rew = mean_rew
-                    best_policy_state = {k: v.clone() for k, v in policy.state_dict().items()}
-                    best_value_state = {k: v.clone() for k, v in value_net.state_dict().items()}
-                    print(f"    [best] New best: mean_reward={mean_rew:.1f}")
-                elif mean_rew < best_mean_rew * 0.5 and best_policy_state is not None:
-                    # Catastrophic drop — restore best policy
-                    print(f"    [best] Reward dropped to {mean_rew:.1f} (best={best_mean_rew:.1f}). Restoring best policy.")
-                    policy.load_state_dict(best_policy_state)
-                    value_net.load_state_dict(best_value_state)
-                    env.last_obs = None  # Fresh start after restore
 
             if use_wandb:
                 log_dict = {
