@@ -705,7 +705,7 @@ def pghc_codesign_vec(
         print("\n  [wandb] Recording initial policy video...")
         video = record_episode_video(parametric_model.L, policy, max_steps=200)
         if video is not None:
-            wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4")}, step=0)
+            wandb.log({"video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=50, format="mp4")}, step=0)
 
     for outer_iter in range(n_outer_iterations):
         print(f"\n{'='*60}")
@@ -794,7 +794,7 @@ def pghc_codesign_vec(
                 video = record_episode_video(parametric_model.L, policy, max_steps=250)
                 if video is not None:
                     wandb.log({
-                        "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                        "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=50, format="mp4"),
                         "video/inner_iter": inner_iter + 1,
                         "video/outer_iter": outer_iter + 1,
                         "video/L": parametric_model.L,
@@ -880,7 +880,7 @@ def pghc_codesign_vec(
             video = record_episode_video(parametric_model.L, policy, max_steps=300)
             if video is not None:
                 wandb.log({
-                    "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
+                    "video/final": wandb.Video(video.transpose(0, 3, 1, 2), fps=50, format="mp4"),
                     "video/L_final": parametric_model.L,
                 })
 
