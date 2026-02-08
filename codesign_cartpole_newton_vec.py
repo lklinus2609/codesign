@@ -455,7 +455,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
     elif mean_kl < desired_kl / 2.0:
-        new_lr = min(current_lr * 1.5, 1e-4)
+        new_lr = min(current_lr * 1.5, 2e-4)
     else:
         new_lr = current_lr
     for pg in optimizer.param_groups:
@@ -645,7 +645,7 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=1e-4
+        list(policy.parameters()) + list(value_net.parameters()), lr=2e-4
     )
 
     stability_gate = StabilityGate(
