@@ -114,7 +114,7 @@ def reset_done_worlds_kernel(
         if start_near_upright == 1:
             # IsaacLab style: only randomize pole angle, cart centered, zero velocities
             joint_q[tid, 0] = 0.0
-            joint_q[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)  # ±45°
+            joint_q[tid, 1] = -wp.pi / 18.0 + wp.pi / 9.0 * wp.randf(rng)  # ±10°
             joint_qd[tid, 0] = 0.0
             joint_qd[tid, 1] = 0.0
         else:
@@ -140,7 +140,7 @@ def init_all_worlds_kernel(
     if start_near_upright == 1:
         # IsaacLab style: only randomize pole angle, cart centered, zero velocities
         joint_q[tid, 0] = 0.0
-        joint_q[tid, 1] = -wp.pi / 4.0 + wp.pi / 2.0 * wp.randf(rng)  # ±45°
+        joint_q[tid, 1] = -wp.pi / 18.0 + wp.pi / 9.0 * wp.randf(rng)  # ±10°
         joint_qd[tid, 0] = 0.0
         joint_qd[tid, 1] = 0.0
     else:
