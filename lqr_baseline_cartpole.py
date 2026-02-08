@@ -163,7 +163,7 @@ def simulate_episode(L, K, initial_state, max_steps=MAX_STEPS):
 
     for step in range(max_steps):
         # LQR control: u = -K @ state, clipped to force limits
-        F = float(-K @ state)
+        F = float((-K @ state).item())
         F = np.clip(F, -FORCE_MAX, FORCE_MAX)
 
         # Normalized action (matching RL: action in [-1,1], force = action * FORCE_MAX)
@@ -273,7 +273,7 @@ def main():
 
     # Dense sweep
     L_values = np.linspace(0.3, 1.2, 50)
-    n_episodes = 50
+    n_episodes = 200
 
     print(f"\nSweeping L in [{L_values[0]:.2f}, {L_values[-1]:.2f}] m "
           f"({len(L_values)} points, {n_episodes} episodes each)...")

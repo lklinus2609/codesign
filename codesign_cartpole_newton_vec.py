@@ -650,7 +650,7 @@ def pghc_codesign_vec(
 
     stability_gate = StabilityGate(
         rel_threshold=0.02,
-        min_inner_iters=500,
+        min_inner_iters=0,
         stable_iters_required=50,
     )
 
