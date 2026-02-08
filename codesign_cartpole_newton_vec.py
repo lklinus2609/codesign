@@ -545,34 +545,45 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
 class StabilityGate:
     """Stability gating for PGHC inner loop convergence detection.
 
-    Converges when reward std < std_threshold for `stable_iters_required`
-    consecutive iterations, after at least `min_inner_iters` total iterations.
+    Converges when mean reward changes less than `rel_threshold` (1%) over
+    a window of recent evaluations, for `stable_iters_required` consecutive
+    iterations, after at least `min_inner_iters` total iterations.
     """
 
-    def __init__(self, std_threshold=5.0, min_inner_iters=500, stable_iters_required=50):
-        self.std_threshold = std_threshold
+    def __init__(self, rel_threshold=0.01, min_inner_iters=500, stable_iters_required=50, window=5):
+        self.rel_threshold = rel_threshold
         self.min_inner_iters = min_inner_iters
         self.stable_iters_required = stable_iters_required
+        self.reward_history = deque(maxlen=window)
         self.total_inner_iters = 0
         self.stable_count = 0
-        self.last_std = float('inf')
 
     def reset(self):
+        self.reward_history.clear()
         self.total_inner_iters = 0
         self.stable_count = 0
-        self.last_std = float('inf')
 
-    def update(self, reward_std):
-        """Called periodically with the current reward std."""
-        self.last_std = reward_std
+    def update(self, mean_reward):
+        """Called periodically with the current mean reward."""
+        self.reward_history.append(mean_reward)
 
     def tick(self, n_iters=1):
         """Called every inner iteration to count total and stable iters."""
         self.total_inner_iters += n_iters
-        if self.last_std < self.std_threshold:
+        if self._is_plateau():
             self.stable_count += n_iters
         else:
             self.stable_count = 0
+
+    def _is_plateau(self):
+        if len(self.reward_history) < 2:
+            return False
+        rewards = np.array(self.reward_history)
+        mean_val = np.mean(rewards)
+        if abs(mean_val) < 1e-6:
+            return True
+        relative_change = (np.max(rewards) - np.min(rewards)) / abs(mean_val)
+        return relative_change < self.rel_threshold
 
     def is_converged(self):
         if self.total_inner_iters < self.min_inner_iters:
@@ -584,7 +595,7 @@ def pghc_codesign_vec(
     n_outer_iterations=15,
     design_lr=0.02,
     max_step=0.01,
-    initial_L=1.0,
+    initial_L=0.6,
     num_worlds=1024,
     use_wandb=False,
     video_every_n_iters=100,
@@ -605,10 +616,12 @@ def pghc_codesign_vec(
                 "level": "1.5-vec",
                 "num_worlds": num_worlds,
                 "n_outer_iterations": n_outer_iterations,
-                "stability_std_threshold": 5.0,
+                "convergence": "reward plateau (1% rel change, window=5)",
+                "min_inner_iters": 500,
+                "stable_iters_required": 50,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
-                "force_max": 20.0,
+                "force_max": 30.0,
                 "x_limit": 3.0,
             },
         )
@@ -636,7 +649,7 @@ def pghc_codesign_vec(
     )
 
     stability_gate = StabilityGate(
-        std_threshold=5.0,
+        rel_threshold=0.01,
         min_inner_iters=500,
         stable_iters_required=50,
     )
@@ -656,7 +669,7 @@ def pghc_codesign_vec(
     print(f"  Force max: {env.force_max} N")
     print(f"  Cart bounds: (-{env.x_limit}, {env.x_limit})")
     print(f"  Start near upright: {env.start_near_upright}")
-    print(f"  Convergence: std < 5.0 for 50 iters (after 500 min)")
+    print(f"  Convergence: reward plateau (<1% change, window=5, 50 stable iters after 500 min)")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
@@ -725,7 +738,7 @@ def pghc_codesign_vec(
 
             # Update stability gate every log_every iters
             if (inner_iter + 1) % log_every == 0 and len(reward_buffer) > 0:
-                stability_gate.update(std_rew)
+                stability_gate.update(mean_rew)
 
             if use_wandb:
                 log_dict = {
@@ -860,7 +873,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=10, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
-    parser.add_argument("--initial-L", type=float, default=1.0, help="Initial pole length")
+    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
     parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel worlds")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
