@@ -78,9 +78,10 @@ def step_rewards_done_kernel(
     if wp.abs(x) > x_limit:
         terminated = 1
 
-    # IsaacLab-style reward: alive(conditional) + termination penalty + pole angle + velocity penalties
+    # Reward: cos(θ) clamped to [0,1] + termination penalty + velocity penalties
     terminated_f = float(terminated)
-    r = 1.0 * (1.0 - terminated_f) - 100.0 * terminated_f - 1.0 * theta * theta - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+    angle_reward = wp.max(wp.cos(theta), 0.0)
+    r = angle_reward - 100.0 * terminated_f - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
 
     # Truncation: max steps reached
     truncated = 0
