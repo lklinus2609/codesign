@@ -54,7 +54,7 @@ codesign/                          # Repository root
 │   ├── parametric_g1.py           # G1 morphology parameterization
 │   │
 │   ├── # === TRAINING ===
-│   ├── train_hybrid.py            # Main entry point
+│   ├── train_hybrid.py            # Main entry point (Level 3)
 │   ├── video_recorder.py          # Headless video recording for wandb
 │   │
 │   ├── # === CONFIGURATION ===
@@ -63,17 +63,13 @@ codesign/                          # Repository root
 │   │   └── hybrid_g1_env.yaml     # Environment parameters
 │   │
 │   ├── # === VERIFICATION CO-DESIGN SCRIPTS ===
-│   ├── codesign_cartpole.py         # Level 1: PGHC with trust region
-│   ├── codesign_cartpole_simple.py  # Level 1: Simplified PGHC
+│   ├── codesign_cartpole.py             # Level 1: PGHC with trust region
 │   ├── codesign_cartpole_newton_vec.py  # Level 1.5: Vectorized Newton PGHC
-│   ├── codesign_ant.py             # Level 2: PGHC for Ant morphology
-│   ├── train_cartpole_ppo.py       # PPO training for cart-pole
-│   ├── find_optimal_L.py           # Grid search for optimal L*
+│   ├── codesign_ant.py                  # Level 2: PGHC for Ant morphology
 │   │
 │   ├── # === TESTING ===
 │   ├── run_all_tests.py           # Test runner
 │   ├── test_level0_verification.py # Level 0: Math tests
-│   ├── test_level1_pendulum.py    # Level 1: Pendulum tests
 │   ├── test_level15_newton.py     # Level 1.5: Newton cart-pole tests
 │   ├── test_level2_ant.py         # Level 2: Ant environment tests
 │   ├── test_implementation.py     # Unit tests (G1)
@@ -84,14 +80,11 @@ codesign/                          # Repository root
 │   ├── # === VERIFICATION ENVIRONMENTS ===
 │   ├── envs/                      # Simplified test environments
 │   │   ├── __init__.py
-│   │   ├── pendulum/              # Simple pendulum (early experiments)
-│   │   │   ├── __init__.py
-│   │   │   └── pendulum_env.py
-│   │   ├── cartpole/              # Level 1: Cart-pole (current)
+│   │   ├── cartpole/              # Level 1: Cart-pole (PyTorch)
 │   │   │   ├── __init__.py
 │   │   │   ├── cartpole_env.py    # Differentiable physics
 │   │   │   └── ppo.py             # PPO implementation
-│   │   ├── cartpole_newton/        # Level 1.5: Cart-pole with Newton/Warp
+│   │   ├── cartpole_newton/       # Level 1.5: Cart-pole with Newton/Warp
 │   │   │   ├── __init__.py
 │   │   │   └── cartpole_newton_vec_env.py  # Vectorized GPU cart-pole
 │   │   └── ant/                   # Level 2: Ant with Newton/Warp
@@ -114,10 +107,10 @@ codesign/                          # Repository root
 
 ### Rules for Adding New Files
 
-1. **New environments** → `envs/<env_name>/`
-2. **New parametric models** → `parametric_<robot>.py` in root
-3. **New test files** → `test_<feature>.py` in root
-4. **Configuration** → `config/<robot>_<type>.yaml`
+1. **New environments** -> `envs/<env_name>/`
+2. **New parametric models** -> `parametric_<robot>.py` in root
+3. **New test files** -> `test_<feature>.py` in root
+4. **Configuration** -> `config/<robot>_<type>.yaml`
 
 ---
 
@@ -130,9 +123,10 @@ codesign/                          # Repository root
 | `train_*.py` | Training entry points | `train_hybrid.py` |
 | `test_*.py` | Test files (pytest compatible) | `test_implementation.py` |
 | `validate_*.py` | End-to-end validation scripts | `validate_outer_loop.py` |
+| `codesign_*.py` | PGHC co-design scripts | `codesign_cartpole_newton_vec.py` |
 | `parametric_*.py` | Morphology parameterization | `parametric_g1.py` |
 | `*_agent.py` | Agent implementations | `hybrid_agent.py` |
-| `*_env.py` | Environment wrappers | `pendulum_env.py` |
+| `*_env.py` | Environment wrappers | `ant_env.py` |
 
 ### Configuration Files
 
@@ -148,7 +142,7 @@ codesign/                          # Repository root
 | `Parametric*Model` | Morphology parameterization | `ParametricG1Model` |
 | `*Agent` | Training agent | `HybridAMPAgent` |
 | `*AgentBase` | Mixin/base class | `HybridAMPAgentBase` |
-| `*Env` | Gym-style environment | `PendulumEnv` |
+| `*Env` | Gym-style environment | `CartPoleNewtonVecEnv` |
 
 ---
 
@@ -215,14 +209,13 @@ Map thesis notation to code variables consistently:
 
 | Thesis | Code Variable | Description |
 |--------|---------------|-------------|
-| θ (theta) | `design_theta` | Morphology parameters |
-| φ (phi) | `policy_params` | Policy network weights |
-| β (beta) | `design_lr` | Design learning rate |
-| ξ (xi) | `trust_region_threshold` | Trust region threshold |
+| theta | `design_theta` | Morphology parameters |
+| phi | `policy_params` | Policy network weights |
+| beta | `design_lr` | Design learning rate |
+| xi | `trust_region_threshold` | Trust region threshold |
 | H | `diff_horizon` | BPTT horizon |
 | W | `stability_window` | Moving average window |
-| δ_conv | `stability_threshold` | Convergence threshold |
-| J(θ) | `objective` / `loss` | Outer loop objective |
+| J(theta) | `objective` / `loss` | Outer loop objective |
 | D | `improvement` | Performance change |
 
 ---
@@ -233,13 +226,13 @@ Map thesis notation to code variables consistently:
 
 ```
 ALGORITHM 1 (Thesis)              CODE LOCATION
-─────────────────────────────────────────────────────────────────
+-------------------------------------------------------------
 Lines 1-5: Initialization         hybrid_agent.py: __init__()
 Lines 6-11: Main loop             hybrid_agent.py: _train_iter()
 Lines 12-18: Stability gating     hybrid_agent.py: _should_run_outer_loop()
-Lines 19-23: Gradient computation hybrid_agent.py: _outer_loop_update()
-                                  diff_rollout.py: forward(), compute_loss()
-Lines 24-35: Trust region         hybrid_agent.py: _outer_loop_update()
+Lines 19-23: Gradient computation  hybrid_agent.py: _outer_loop_update()
+                                   diff_rollout.py: forward(), compute_loss()
+Lines 24-35: Trust region          hybrid_agent.py: _outer_loop_update()
 ```
 
 ### Key Methods
@@ -382,8 +375,9 @@ Level 1: Cart-Pole (hand-coded PyTorch physics)      [DONE]
     Code: envs/cartpole/, codesign_cartpole.py
 
 Level 1.5: Cart-Pole (Newton/Warp vectorized)        [DONE]
-    ├── Vectorized GPU environments (1024 worlds)
+    ├── Vectorized GPU environments (2048 worlds)
     ├── Finite-difference gradients
+    ├── RSL-RL style episode tracking
     └── Video recording with subprocess
     Code: envs/cartpole_newton/, codesign_cartpole_newton_vec.py
 
@@ -422,7 +416,7 @@ See `VERIFICATION_PLAN.md` for detailed test procedures.
 | Pattern | Use For | Example |
 |---------|---------|---------|
 | `main` | Stable, tested code | - |
-| `feature/<name>` | New features | `feature/pendulum-env` |
+| `feature/<name>` | New features | `feature/ant-env` |
 | `fix/<name>` | Bug fixes | `fix/gradient-sign` |
 | `exp/<name>` | Experiments (may not merge) | `exp/contact-smoothing` |
 
@@ -471,7 +465,7 @@ Types:
 
 ```python
 # Algorithm 1, Line 27: Check trust region violation
-# D < -ξ * |J(φ_k)| indicates unacceptable performance degradation
+# D < -xi * |J(phi_k)| indicates unacceptable performance degradation
 if improvement < -self.trust_region_threshold * abs(current_objective):
     ...
 
@@ -521,16 +515,9 @@ Record significant technical decisions here with date and rationale.
 
 ### 2026-02-04: Verification Ladder Approach
 
-**Decision**: Implement multi-level verification (Level 0 Math → Cart-Pole → Cart-Pole Newton → Ant → G1 Humanoid) before full humanoid testing.
+**Decision**: Implement multi-level verification (Level 0 Math -> Cart-Pole -> Cart-Pole Newton -> Ant -> G1 Humanoid) before full humanoid testing.
 
-**Rationale**: Debugging failures on 30-DOF humanoid is impractical. Each level isolates specific algorithm components:
-- Level 0 tests math correctness (gradients, trust region, quaternion chain rule)
-- Level 1 tests envelope theorem on cart-pole (PyTorch physics)
-- Level 1.5 tests Newton/Warp integration with vectorized envs
-- Level 2 tests multi-body parametric morphology (Ant)
-- Level 3 tests full humanoid with differentiable gradients
-
-**Note**: Originally planned HalfCheetah at Level 2, skipped directly to Ant as it better tests multi-body dynamics.
+**Rationale**: Debugging failures on 30-DOF humanoid is impractical. Each level isolates specific algorithm components.
 
 **Reference**: `VERIFICATION_PLAN.md`
 
@@ -543,11 +530,7 @@ Record significant technical decisions here with date and rationale.
 - Level 1: Hand-coded PyTorch (analytical cart-pole dynamics)
 - Level 2+: NVIDIA Warp or Newton (differentiable multi-body physics)
 
-**Rationale**:
-- Level 1 needs differentiable dReturn/dL gradients; standard engines (MuJoCo, Bullet) not differentiable
-- Hand-coded PyTorch sufficient for simple cart-pole (1 joint, 4 state variables)
-- Level 2+ requires real physics engine for complex multi-body dynamics
-- Warp/Newton provide GPU-accelerated differentiable simulation
+**Rationale**: Level 1 needs differentiable dReturn/dL gradients; standard engines not differentiable. Hand-coded PyTorch sufficient for simple cart-pole. Level 2+ requires real physics engine.
 
 **Code**: `envs/cartpole/cartpole_env.py` (hand-coded), Newton for Level 2+
 
@@ -555,20 +538,11 @@ Record significant technical decisions here with date and rationale.
 
 ### 2026-02-04: PPO as Inner Loop Policy Optimizer
 
-**Decision**: Use PPO (Proximal Policy Optimization) for inner loop policy learning at all verification levels.
+**Decision**: Use PPO for inner loop policy learning at all verification levels.
 
-**Rationale**:
-- Industry standard for continuous control
-- Stable training with clipped surrogate objective
-- Works with both simple (cart-pole) and complex (humanoid) environments
-- Can later extend to PPO+AMP for motion imitation
+**Rationale**: Industry standard for continuous control. Stable training with clipped surrogate objective. Works with both simple and complex environments.
 
-**Code**: `envs/cartpole/ppo.py`
-
-**Alternatives Considered**:
-- LQR: Only works near equilibrium, no swing-up capability
-- SAC: More sample efficient but more complex to implement
-- Hand-tuned PD: Not generalizable to complex tasks
+**Code**: `envs/cartpole/ppo.py`, `codesign_cartpole_newton_vec.py`
 
 ---
 
@@ -576,10 +550,7 @@ Record significant technical decisions here with date and rationale.
 
 **Decision**: Use two separate physics models - MuJoCo for inner loop, SemiImplicit for outer loop.
 
-**Rationale**:
-- Inner loop needs stable, fast simulation (MuJoCo)
-- Outer loop needs differentiability (SemiImplicit)
-- Syncing `joint_X_p` between them after each outer loop update
+**Rationale**: Inner loop needs stable, fast simulation. Outer loop needs differentiability. Sync `joint_X_p` between them after each outer loop update.
 
 **Code**: `hybrid_agent.py: _sync_design_to_inner_model()`
 
@@ -591,8 +562,6 @@ Record significant technical decisions here with date and rationale.
 
 **Rationale**: SolverSemiImplicit has numerical instability with ground contact forces. Robot makes contact around step 3-4, causing NaN gradients.
 
-**Future Work**: Investigate contact smoothing or randomized smoothing for longer horizons.
-
 **Code**: `config/hybrid_g1_agent.yaml: diff_horizon: 3`
 
 ---
@@ -601,9 +570,39 @@ Record significant technical decisions here with date and rationale.
 
 **Decision**: Default to `gating_mode: "stability"` instead of fixed warmup + frequency.
 
-**Rationale**: Fixed schedule doesn't guarantee policy convergence before morphology update. Stability gating enforces the Envelope Theorem assumption (frozen policy at optimum).
+**Rationale**: Fixed schedule doesn't guarantee policy convergence before morphology update. Stability gating enforces the Envelope Theorem assumption.
 
 **Code**: `hybrid_agent.py: _should_run_outer_loop()`
+
+---
+
+### 2026-02-07: RSL-RL Style Episode Tracking
+
+**Decision**: Track episode stats from training rollouts using per-world accumulators instead of running separate evaluation episodes.
+
+**Rationale**: Separate evaluation resets the environment, disrupting training. RSL-RL tracks completed episodes during rollout collection, providing continuous monitoring with zero overhead.
+
+**Code**: `codesign_cartpole_newton_vec.py: collect_rollout_vec()`
+
+---
+
+### 2026-02-07: Reward Plateau Convergence
+
+**Decision**: Use reward plateau detection (<1% relative change over window of 5 evaluations) instead of reward std threshold for inner loop convergence.
+
+**Rationale**: Reward std never reliably drops below a fixed threshold due to bimodal failure/success distribution. Reward plateau detects when PPO has stopped improving.
+
+**Code**: `codesign_cartpole_newton_vec.py: StabilityGate`
+
+---
+
+### 2026-02-08: Conservative PPO Updates
+
+**Decision**: Cap max LR at 3e-4 (from 1e-3), lower desired_kl to 0.005, increase mini-batches to 8.
+
+**Rationale**: Policy periodically destabilized (mean_reward dropping from 485 to 452 with std spiking to 114). Root cause: adaptive LR bouncing to 1e-3 caused destructive updates. Conservative settings prevent this while still allowing convergence.
+
+**Code**: `codesign_cartpole_newton_vec.py: ppo_update_vec()`
 
 ---
 
@@ -628,8 +627,8 @@ Record significant technical decisions here with date and rationale.
 ### Common Commands
 
 ```bash
-# Training
-python train_hybrid.py --agent_config config/hybrid_g1_agent.yaml --env_config config/hybrid_g1_env.yaml
+# Training (Level 1.5 - main active script)
+python codesign_cartpole_newton_vec.py --wandb --num-worlds 2048
 
 # Testing
 python run_all_tests.py
@@ -638,17 +637,20 @@ pytest test_implementation.py -v -k "test_gradient"
 # Validation
 python validate_outer_loop.py
 
+# Level 3 Training
+python train_hybrid.py --agent_config config/hybrid_g1_agent.yaml --env_config config/hybrid_g1_env.yaml
+
 # Resume from checkpoint
 python train_hybrid.py --resume output/hybrid_g1/model.pt
 ```
 
 ### Key Hyperparameters to Tune
 
-| Parameter | Start | Tune At |
-|-----------|-------|---------|
-| `design_lr` | 0.01-0.02 | Level 2 (Ant) |
-| `trust_region_threshold` | 0.1 | Level 2 (Ant) |
-| `stability_threshold` | 0.01-0.05 | Level 1.5 (Newton) |
+| Parameter | Current | Tune At |
+|-----------|---------|---------|
+| `design_lr` | 0.02 | Level 2 (Ant) |
+| `max_step` | 0.01 | Level 2 (Ant) |
+| `desired_kl` | 0.005 | Level 1.5 (Newton) |
 | `diff_horizon` | 3 | Level 3 (G1 Humanoid) |
 
 ### TensorBoard Metrics to Watch
@@ -662,5 +664,5 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ---
 
-*Document Version: 2.0*
-*Last Updated: 2026-02-05*
+*Document Version: 3.0*
+*Last Updated: 2026-02-08*

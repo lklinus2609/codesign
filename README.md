@@ -33,26 +33,21 @@ Verifies gradient computation, trust region logic, and quaternion chain rule.
 
 ### Level 1: Cart-Pole (PyTorch Physics)
 ```bash
-# Train PPO on cart-pole
-python train_cartpole_ppo.py
-
 # Run PGHC co-design (full trust region)
 python codesign_cartpole.py
-
-# Run simplified PGHC (trusts gradient)
-python codesign_cartpole_simple.py
-
-# Find optimal pole length via grid search
-python find_optimal_L.py
 ```
 
-### Level 1.5 & 2: Newton-Based Environments
-Requires Newton/Warp installation (see Installation below).
-
+### Level 1.5: Cart-Pole (Newton/Warp Vectorized)
 ```bash
+# Run PGHC with vectorized GPU environments
+python codesign_cartpole_newton_vec.py --wandb --num-worlds 2048
+
 # Test Newton cart-pole
 python test_level15_newton.py
+```
 
+### Level 2: Ant (Newton/Warp)
+```bash
 # Test Ant environment
 python test_level2_ant.py
 
@@ -96,32 +91,35 @@ conda activate codesign
 codesign/
 ├── envs/
 │   ├── cartpole/
-│   │   ├── cartpole_env.py        # Differentiable cart-pole (PyTorch)
-│   │   └── ppo.py                 # PPO implementation
+│   │   ├── cartpole_env.py             # Differentiable cart-pole (PyTorch)
+│   │   └── ppo.py                      # PPO implementation
 │   ├── cartpole_newton/
 │   │   └── cartpole_newton_vec_env.py  # Vectorized Newton cart-pole (GPU)
-│   ├── ant/
-│   │   └── ant_env.py             # Newton-based Ant with parametric morphology
-│   └── pendulum/                  # Simple pendulum (earlier work)
+│   └── ant/
+│       └── ant_env.py                  # Newton-based Ant with parametric morphology
 │
-├── config/                        # Configuration files for G1
+├── config/                             # Configuration files for G1
+│   ├── hybrid_g1_agent.yaml
+│   └── hybrid_g1_env.yaml
 │
-├── test_level0_verification.py    # Level 0: Math verification tests
-├── test_level1_pendulum.py        # Level 1: Pendulum/cart-pole tests
-├── test_level15_newton.py         # Level 1.5: Newton cart-pole tests
-├── test_level2_ant.py             # Level 2: Ant environment tests
+├── codesign_cartpole.py                # Level 1: PGHC with trust region
+├── codesign_cartpole_newton_vec.py     # Level 1.5: Vectorized PGHC (main active script)
+├── codesign_ant.py                     # Level 2: PGHC for Ant morphology
 │
-├── train_cartpole_ppo.py          # PPO training for cart-pole
-├── codesign_cartpole.py           # Level 1: PGHC with trust region
-├── codesign_cartpole_simple.py    # Level 1: Simplified PGHC
-├── codesign_cartpole_newton_vec.py # Level 1.5: Vectorized PGHC
-├── codesign_ant.py                # Level 2: PGHC for Ant morphology
-├── find_optimal_L.py              # Grid search for optimal L*
+├── parametric_g1.py                    # Parametric G1 humanoid model
+├── hybrid_agent.py                     # Hybrid co-design agent (Level 3)
+├── train_hybrid.py                     # G1 training script
+├── diff_rollout.py                     # Differentiable rollout
+├── video_recorder.py                   # Headless video recording
 │
-├── parametric_g1.py               # Parametric G1 humanoid model
-├── hybrid_agent.py                # Hybrid co-design agent (Level 3)
-├── train_hybrid.py                # G1 training script
-└── diff_rollout.py                # Differentiable rollout
+├── test_level0_verification.py         # Level 0: Math verification tests
+├── test_level15_newton.py              # Level 1.5: Newton cart-pole tests
+├── test_level2_ant.py                  # Level 2: Ant environment tests
+├── test_implementation.py              # Unit tests (G1)
+├── test_checkpoint.py                  # Checkpoint/resume tests
+├── test_gpu_memory.py                  # Memory profiling
+├── validate_outer_loop.py              # End-to-end gradient validation
+└── run_all_tests.py                    # Test runner
 ```
 
 ## Algorithm Details
@@ -129,33 +127,48 @@ codesign/
 ### PGHC Algorithm
 
 ```
-Initialize: morphology θ, policy π
+Initialize: morphology theta, policy pi
 
 for outer_iteration in range(N):
     # INNER LOOP: Optimize policy at current morphology
-    for inner_iteration in range(M):
-        Collect rollouts with π in environment(θ)
-        Update π using PPO
+    for inner_iteration until convergence:
+        Collect rollouts with pi in environment(theta)
+        Update pi using PPO
 
     # OUTER LOOP: Optimize morphology
-    Compute gradient: g = dReturn/dθ (with π FROZEN)
+    Compute gradient: g = dReturn/d_theta (with pi FROZEN)
+    theta = theta + clip(lr * g, -max_step, max_step)
+```
 
-    # Trust Region (optional)
-    θ_candidate = θ + lr * g
-    Train π at θ_candidate
-    if Return(θ_candidate) > Return(θ) - ξ:
-        Accept: θ = θ_candidate
-    else:
-        Reject: restore θ, decay lr
+### Level 1.5 Hyperparameters (Current)
+
+| Parameter | Value | Description |
+|-----------|-------|-------------|
+| `num_worlds` | 2048 | Parallel environments |
+| `horizon` | 32 | Rollout steps per update |
+| `force_max` | 30 N | Cart force limit |
+| `max_steps` | 500 | Episode length (10s at 50Hz) |
+| `initial_L` | 0.6 m | Initial pole length |
+| `max_step` | 0.01 m | Max design parameter step per outer iter |
+| `desired_kl` | 0.005 | KL target for adaptive LR |
+| `max_lr` | 3e-4 | Learning rate ceiling |
+| `mini_batches` | 8 | Mini-batches per PPO epoch |
+| `convergence` | Reward plateau (<1% change, window=5) | Inner loop stopping criterion |
+
+### Reward Function (Level 1.5)
+
+```
+r = 1.0*(alive) - 2.0*(terminated) - theta^2 - 0.1*x^2 - 0.01*action^2
+    - 0.1*(action - prev_action)^2 - 0.01*|x_dot| - 0.005*|theta_dot|
 ```
 
 ### Environment Specifications
 
-**Cart-Pole (Level 1)**
+**Cart-Pole (Level 1/1.5)**
 - State: `[x, theta, x_dot, theta_dot]`
-- Action: Force on cart `[-10, 10]` N
-- Design: Pole length `L ∈ [0.3, 1.2]` m
-- Physics: Mass scales with length (`m = ρ × 2L`)
+- Action: Force on cart `[-30, 30]` N
+- Design: Pole length `L`
+- Termination: Cart out of bounds (`|x| > 3.0m`)
 
 **Ant (Level 2)**
 - State: 27D (torso pose + joint angles + velocities)
@@ -172,57 +185,31 @@ for outer_iteration in range(N):
 ## Key Implementation Notes
 
 ### Envelope Theorem
-When computing `dReturn/dθ`, the policy π must be FROZEN at its optimized state. The gradient flows through the physics dynamics, not the policy.
-
-### Shaped Rewards
-Binary rewards (e.g., +1 if balanced) have zero gradient. Use shaped rewards (e.g., `cos(theta)`) for gradient flow.
+When computing `dReturn/d_theta`, the policy pi must be FROZEN at its optimized state. The gradient flows through the physics dynamics, not the policy.
 
 ### Finite Difference Gradients
 For Newton-based environments, morphology changes require model rebuilding. We use finite difference:
 ```
-dReturn/dθ ≈ (Return(θ+ε) - Return(θ-ε)) / (2ε)
+dReturn/d_theta = (Return(theta+eps) - Return(theta-eps)) / (2*eps)
 ```
 
-### Trust Region
-The full PGHC uses accept/reject logic to validate gradient steps:
-- Accept if performance improves (or doesn't degrade much)
-- Reject and decay learning rate if performance drops significantly
-- Simplified version trusts gradient with small step sizes
-
-## Configuration
-
-Key parameters in `config/hybrid_g1_agent.yaml`:
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `warmup_iters` | 10000 | Inner loop only before outer loop activates |
-| `outer_loop_freq` | 200 | Outer loop runs every N inner iterations |
-| `design_learning_rate` | 0.01 | Morphology optimization learning rate |
-| `diff_horizon` | 3 | Differentiable rollout horizon |
+### RSL-RL Style Episode Tracking
+Episode stats are tracked from training rollouts using per-world accumulators. No separate evaluation environment is needed.
 
 ## Monitoring
 
-Training logs design parameters to TensorBoard/WandB:
-- `Design_Theta`: Current morphology parameter
-- `Outer_Loop_Loss`: Outer loop objective
-- `Outer_Loop_Grad`: Design parameter gradient
-- `Return`: Episode return
+Training logs design parameters to WandB:
 
 ```bash
-# TensorBoard
-tensorboard --logdir output/
-
-# Weights & Biases
-python train_hybrid.py --logger wandb
+python codesign_cartpole_newton_vec.py --wandb --num-worlds 2048
 ```
 
 ## Known Limitations
 
 1. **Newton contact instability**: Differentiable simulation has contact issues. Workaround: short horizon before ground contact.
-
 2. **Model rebuild cost**: Changing morphology in Newton requires full model rebuild (expensive for gradient computation).
-
-3. **Local optima**: PGHC finds local optima. Results depend on initialization.
+3. **G1 gradient chain broken**: numpy in parametric_g1.py breaks warp's autograd. Needs Warp kernels for quaternion math.
+4. **Local optima**: PGHC finds local optima. Results depend on initialization.
 
 ## References
 

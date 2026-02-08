@@ -88,11 +88,11 @@ def step_rewards_done_kernel(
     #   termination:    -2.0 (cart out of bounds)
     #   angle penalty:  -θ²  (upright = 0 penalty)
     #   position:       -0.1*x²  (stay near center)
-    #   energy:         -0.01*action²  (minimize force usage)
+    #   energy:         -0.2*action²  (minimize force usage)
     #   smoothness:     -0.1*(action - prev_action)²  (reward smooth control)
     #   velocity:       -0.01*|ẋ| - 0.005*|θ̇|
     terminated_f = float(terminated)
-    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.1 * x * x - 0.01 * action * action - 0.1 * action_diff * action_diff - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.1 * x * x - 0.2 * action * action - 0.1 * action_diff * action_diff - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
 
     # Update prev_actions for next step
     prev_actions[tid] = action
