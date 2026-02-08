@@ -91,7 +91,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=20.0, x_limit=3.0, start_near_upright=True)
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -283,8 +283,12 @@ class CartPoleValue(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def collect_rollout_vec(env, policy, value_net, horizon=16):
-    """Collect rollout from vectorized environment (no reset between rollouts)."""
+def collect_rollout_vec(env, policy, value_net, horizon=32):
+    """Collect rollout from vectorized environment (no reset between rollouts).
+
+    Tracks per-world episode accumulators so completed episode stats
+    are returned alongside rollout data (RSL-RL style, no separate eval).
+    """
     wp.synchronize()  # Ensure clean state before rollout
 
     num_worlds = env.num_worlds
@@ -292,12 +296,20 @@ def collect_rollout_vec(env, policy, value_net, horizon=16):
     # The env auto-resets individual worlds when they terminate
     obs = env.last_obs if hasattr(env, 'last_obs') and env.last_obs is not None else env.reset()
 
+    # Initialize episode accumulators if not present
+    if not hasattr(env, 'ep_reward_accum'):
+        env.ep_reward_accum = np.zeros(num_worlds)
+        env.ep_length_accum = np.zeros(num_worlds)
+
     all_obs = []
     all_actions = []
     all_rewards = []
     all_log_probs = []
     all_dones = []
     all_values = []
+
+    completed_rewards = []
+    completed_lengths = []
 
     for _ in range(horizon):
         obs_t = torch.FloatTensor(obs)
@@ -314,6 +326,18 @@ def collect_rollout_vec(env, policy, value_net, horizon=16):
         all_log_probs.append(log_probs.detach())
         all_dones.append(dones)
         all_values.append(values)
+
+        # Track episode stats
+        env.ep_reward_accum += rewards
+        env.ep_length_accum += 1
+
+        # Record completed episodes and reset their accumulators
+        done_indices = np.where(dones)[0]
+        for idx in done_indices:
+            completed_rewards.append(env.ep_reward_accum[idx])
+            completed_lengths.append(env.ep_length_accum[idx])
+            env.ep_reward_accum[idx] = 0.0
+            env.ep_length_accum[idx] = 0.0
 
         obs = next_obs
 
@@ -335,6 +359,8 @@ def collect_rollout_vec(env, policy, value_net, horizon=16):
         "dones": torch.FloatTensor(np.array(all_dones)),        # (H, N)
         "values": torch.stack(all_values),                      # (H, N)
         "last_value": last_value,                               # (N,) bootstrap
+        "completed_rewards": completed_rewards,
+        "completed_lengths": completed_lengths,
     }
 
 
@@ -487,7 +513,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
             num_worlds=1,
-            force_max=20.0,
+            force_max=100.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -599,7 +625,7 @@ def pghc_codesign_vec(
     n_outer_iterations=15,
     stability_threshold=0.01,
     design_lr=0.02,
-    max_step=0.1,
+    max_step=0.01,
     initial_L=0.6,
     num_worlds=1024,
     use_wandb=False,
@@ -640,7 +666,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=20.0,
+        force_max=100.0,
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -699,12 +725,16 @@ def pghc_codesign_vec(
         print(f"\n  [Inner Loop] Training PPO ({num_worlds} parallel envs)...")
         stability_gate.reset()
 
-        eval_every = 50  # Only evaluate every N iters to avoid disrupting rollouts
+        log_every = 10  # Print/log stats every N iters
         inner_iter = 0
         mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
         best_mean_rew = -float('inf')
         best_policy_state = None
         best_value_state = None
+
+        # Rolling buffer of completed episodes (RSL-RL style)
+        reward_buffer = deque(maxlen=200)
+        length_buffer = deque(maxlen=200)
 
         while True:
             # Collect rollout from all worlds
@@ -714,6 +744,10 @@ def pghc_codesign_vec(
                 print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting env...")
                 wp.synchronize()
                 env.last_obs = None
+                env.ep_reward_accum = None
+                env.ep_length_accum = None
+                delattr(env, 'ep_reward_accum')
+                delattr(env, 'ep_length_accum')
                 env.reset()
                 continue
             mean_kl = ppo_update_vec(policy, value_net, optimizer, rollout)
@@ -724,11 +758,19 @@ def pghc_codesign_vec(
             rollout_mean_reward = rollout["rewards"].mean().item()
             current_lr = optimizer.param_groups[0]['lr']
 
-            # Full evaluation only every N iters (avoids resetting training env)
-            if (inner_iter + 1) % eval_every == 0:
-                mean_rew, std_rew, mean_len = evaluate_policy_vec(env, policy)
+            # Track completed episodes from training rollouts
+            reward_buffer.extend(rollout["completed_rewards"])
+            length_buffer.extend(rollout["completed_lengths"])
+
+            # Update stats from buffer
+            if len(reward_buffer) > 0:
+                mean_rew = np.mean(reward_buffer)
+                std_rew = np.std(reward_buffer)
+                mean_len = np.mean(length_buffer)
+
+            # Update stability gate and best policy every log_every iters
+            if (inner_iter + 1) % log_every == 0 and len(reward_buffer) > 0:
                 stability_gate.update(mean_rew)
-                stats = stability_gate.get_stats()
 
                 # Save best policy checkpoint
                 if mean_rew > best_mean_rew:
@@ -742,8 +784,6 @@ def pghc_codesign_vec(
                     policy.load_state_dict(best_policy_state)
                     value_net.load_state_dict(best_value_state)
                     env.last_obs = None  # Fresh start after restore
-            else:
-                stats = stability_gate.get_stats()
 
             if use_wandb:
                 log_dict = {
@@ -751,28 +791,23 @@ def pghc_codesign_vec(
                     "inner/iteration": inner_iter + 1,
                     "inner/kl": mean_kl,
                     "inner/lr": current_lr,
+                    "inner/mean_reward": mean_rew,
+                    "inner/reward_std": std_rew,
+                    "inner/episode_length": mean_len,
                     "design/L": parametric_model.L,
                 }
-                if (inner_iter + 1) % eval_every == 0:
-                    log_dict.update({
-                        "inner/mean_reward": mean_rew,
-                        "inner/reward_std": std_rew,
-                        "inner/episode_length": mean_len,
-                        "inner/relative_change": stats["relative_change"],
-                    })
                 wandb.log(log_dict, step=global_step)
 
-            if (inner_iter + 1) % 5 == 0:
+            if (inner_iter + 1) % log_every == 0:
                 print(f"    Iter {inner_iter + 1}: "
                       f"reward/step={rollout_mean_reward:.2f}, "
-                      f"kl={mean_kl:.4f}, lr={current_lr:.1e}"
-                      + (f", mean_reward={mean_rew:.1f} ±{std_rew:.1f}, mean_len={mean_len:.0f}"
-                         if (inner_iter + 1) % eval_every == 0 else ""))
+                      f"kl={mean_kl:.4f}, lr={current_lr:.1e}, "
+                      f"mean_reward={mean_rew:.1f} ±{std_rew:.1f}, mean_len={mean_len:.0f}")
 
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
                 print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
-                video = record_episode_video(parametric_model.L, policy, max_steps=200)
+                video = record_episode_video(parametric_model.L, policy, max_steps=250)
                 if video is not None:
                     wandb.log({
                         "video/episode": wandb.Video(video.transpose(0, 3, 1, 2), fps=30, format="mp4"),
@@ -789,11 +824,9 @@ def pghc_codesign_vec(
                 print(f"    CONVERGED at iter {inner_iter} (stable for {stability_gate.stable_count} iters)")
                 break
 
-        # Final evaluation
-        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy)
-        history["rewards"].append(mean_reward)
+        history["rewards"].append(mean_rew)
         history["inner_iterations"].append(stability_gate.total_inner_iters)
-        print(f"  Policy converged. Reward = {mean_reward:.1f} +/- {std_reward:.1f}, Length = {mean_length:.0f}")
+        print(f"  Policy converged. Reward = {mean_rew:.1f} +/- {std_rew:.1f}, Length = {mean_len:.0f}")
 
         # =============================================
         # OUTER LOOP: Compute design gradient
@@ -821,7 +854,7 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            force_max=20.0,
+            force_max=100.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -833,7 +866,7 @@ def pghc_codesign_vec(
 
         if use_wandb:
             wandb.log({
-                "outer/reward_at_convergence": mean_reward,
+                "outer/reward_at_convergence": mean_rew,
                 "outer/gradient": gradient,
                 "outer/L_step": step,
                 "outer/L_new": parametric_model.L,
