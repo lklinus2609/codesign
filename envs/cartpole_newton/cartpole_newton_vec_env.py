@@ -323,10 +323,11 @@ class CartPoleNewtonVecEnv:
 
     def cleanup(self):
         """Free GPU resources before rebuilding."""
-        for attr in ('state_0', 'state_1', 'control', 'solver', 'cartpoles',
+        for attr in ('_joint_q', '_joint_qd', '_joint_f',
+                     'state_0', 'state_1', 'control', 'solver', 'cartpoles',
                      'model', 'obs_wp', 'rewards_wp', 'dones_wp',
                      'steps_wp', 'prev_actions_wp',
-                     '_actions_cpu', '_actions_gpu', '_zero_f'):
+                     '_actions_cpu', '_actions_gpu'):
             if hasattr(self, attr):
                 delattr(self, attr)
         import gc
@@ -382,7 +383,16 @@ class CartPoleNewtonVecEnv:
         # Pre-allocated transfer buffers (reused every step to avoid GPU alloc accumulation)
         self._actions_cpu = wp.zeros(self.num_worlds, dtype=float, device="cpu")
         self._actions_gpu = wp.zeros(self.num_worlds, dtype=float, device=self.device)
-        self._zero_f = wp.zeros((self.num_worlds, self.num_dofs_per_world), dtype=float, device=self.device)
+
+        # Cache ArticulationView attribute views to avoid per-step allocations.
+        # We have two state objects that get swapped; cache views for both.
+        s0, s1 = self.state_0, self.state_1
+        self._joint_q = {id(s0): self.cartpoles.get_attribute("joint_q", s0),
+                         id(s1): self.cartpoles.get_attribute("joint_q", s1)}
+        self._joint_qd = {id(s0): self.cartpoles.get_attribute("joint_qd", s0),
+                          id(s1): self.cartpoles.get_attribute("joint_qd", s1)}
+        self._joint_f = self.cartpoles.get_attribute("joint_f", self.control)
+        self._gc_counter = 0
 
     @property
     def steps(self):
@@ -391,8 +401,8 @@ class CartPoleNewtonVecEnv:
 
     def _extract_obs_to_gpu(self):
         """Extract observations into self.obs_wp on GPU (no CPU transfer)."""
-        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
-        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+        joint_q = self._joint_q[id(self.state_0)]
+        joint_qd = self._joint_qd[id(self.state_0)]
         wp.launch(extract_obs_kernel, dim=self.num_worlds,
                   inputs=[joint_q, joint_qd, self.obs_wp])
 
@@ -408,19 +418,19 @@ class CartPoleNewtonVecEnv:
         self.steps_wp.zero_()
         self._step_count = 0
 
-        # Get joint state arrays via ArticulationView
-        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
-        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+        # Get cached joint state views
+        joint_q = self._joint_q[id(self.state_0)]
+        joint_qd = self._joint_qd[id(self.state_0)]
 
         # Initialize all worlds via kernel (no CPU round-trip)
         wp.launch(init_all_worlds_kernel, dim=self.num_worlds,
                   inputs=[joint_q, joint_qd, 42, int(self.start_near_upright)])
 
-        # Write back to both states
-        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q)
-        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd)
-        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q)
-        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd)
+        # Copy initial state to state_1 as well
+        joint_q_1 = self._joint_q[id(self.state_1)]
+        joint_qd_1 = self._joint_qd[id(self.state_1)]
+        wp.copy(joint_q_1, joint_q)
+        wp.copy(joint_qd_1, joint_qd)
 
         # Propagate reset state through MuJoCo solver internals
         self._propagate_state()
@@ -433,8 +443,7 @@ class CartPoleNewtonVecEnv:
         wp.synchronize()
 
         # Zero forces via pre-allocated buffer (no allocation)
-        self._zero_f.zero_()
-        self.cartpoles.set_attribute("joint_f", self.control, self._zero_f)
+        self._joint_f.zero_()
 
         # Run one substep to propagate
         self.state_0.clear_forces()
@@ -466,11 +475,9 @@ class CartPoleNewtonVecEnv:
         self._actions_cpu.numpy()[:] = actions
         wp.copy(self._actions_gpu, self._actions_cpu)
 
-        # --- GPU: set forces via kernel ---
-        joint_f = self.cartpoles.get_attribute("joint_f", self.control)
+        # --- GPU: set forces via kernel (cached joint_f view, no allocation) ---
         wp.launch(set_joint_forces_kernel, dim=self.num_worlds,
-                  inputs=[self._actions_gpu, self.force_max, joint_f])
-        self.cartpoles.set_attribute("joint_f", self.control, joint_f)
+                  inputs=[self._actions_gpu, self.force_max, self._joint_f])
 
         # --- GPU: physics substeps ---
         for _ in range(self.num_substeps):
@@ -488,16 +495,15 @@ class CartPoleNewtonVecEnv:
 
         self._step_count += 1
 
-        # --- GPU: auto-reset done worlds ---
-        joint_q = self.cartpoles.get_attribute("joint_q", self.state_0)
-        joint_qd = self.cartpoles.get_attribute("joint_qd", self.state_0)
+        # --- GPU: auto-reset done worlds (cached views, no allocation) ---
+        joint_q = self._joint_q[id(self.state_0)]
+        joint_qd = self._joint_qd[id(self.state_0)]
         wp.launch(reset_done_worlds_kernel, dim=self.num_worlds,
                   inputs=[joint_q, joint_qd, self.dones_wp, self.steps_wp,
                           self._step_count, int(self.start_near_upright)])
-        self.cartpoles.set_attribute("joint_q", self.state_0, joint_q)
-        self.cartpoles.set_attribute("joint_qd", self.state_0, joint_qd)
-        self.cartpoles.set_attribute("joint_q", self.state_1, joint_q)
-        self.cartpoles.set_attribute("joint_qd", self.state_1, joint_qd)
+        # Copy reset state to state_1 as well
+        wp.copy(self._joint_q[id(self.state_1)], joint_q)
+        wp.copy(self._joint_qd[id(self.state_1)], joint_qd)
 
         # --- GPU: re-extract obs (reset worlds now have fresh initial state) ---
         self._extract_obs_to_gpu()
@@ -513,6 +519,12 @@ class CartPoleNewtonVecEnv:
             "mean_reward": float(np.mean(rewards_np)),
             "num_dones": int(np.sum(dones_np)),
         }
+
+        # Periodic GC to free any residual temporaries (every ~100 steps)
+        self._gc_counter += 1
+        if self._gc_counter % 100 == 0:
+            import gc
+            gc.collect()
 
         return obs_np, rewards_np, dones_np, infos
 
