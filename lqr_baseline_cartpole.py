@@ -78,8 +78,10 @@ def nonlinear_dynamics(state, F, L):
         m * g * l * sin_th - b_theta * theta_dot,
     ])
 
-    acc = scipy_solve(A_mat, rhs)
-    x_dd, theta_dd = acc
+    # Cramer's rule for 2x2 (avoids scipy overhead on 80M calls)
+    det = A_mat[0, 0] * A_mat[1, 1] - A_mat[0, 1] * A_mat[1, 0]
+    x_dd = (rhs[0] * A_mat[1, 1] - rhs[1] * A_mat[0, 1]) / det
+    theta_dd = (A_mat[0, 0] * rhs[1] - A_mat[1, 0] * rhs[0]) / det
 
     return np.array([x_dot, theta_dot, x_dd, theta_dd])
 
@@ -250,9 +252,8 @@ def sweep_pole_length(L_values, n_episodes=50):
         mean_rewards[i] = np.mean(episode_rewards)
         std_rewards[i] = np.std(episode_rewards)
 
-        if (i + 1) % 10 == 0 or i == 0:
-            print(f"  L={L:.3f}m: reward={mean_rewards[i]:.1f} ±{std_rewards[i]:.1f}, "
-                  f"||K||={gain_norms[i]:.2f}")
+        print(f"  [{i+1}/{len(L_values)}] L={L:.3f}m: reward={mean_rewards[i]:.1f} ±{std_rewards[i]:.1f}, "
+              f"||K||={gain_norms[i]:.2f}")
 
     return mean_rewards, std_rewards, gain_norms
 

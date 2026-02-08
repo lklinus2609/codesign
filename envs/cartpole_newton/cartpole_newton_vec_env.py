@@ -325,7 +325,8 @@ class CartPoleNewtonVecEnv:
         """Free GPU resources before rebuilding."""
         for attr in ('state_0', 'state_1', 'control', 'solver', 'cartpoles',
                      'model', 'obs_wp', 'rewards_wp', 'dones_wp',
-                     'steps_wp', 'prev_actions_wp'):
+                     'steps_wp', 'prev_actions_wp',
+                     '_actions_cpu', '_actions_gpu', '_zero_f'):
             if hasattr(self, attr):
                 delattr(self, attr)
         import gc
@@ -368,12 +369,20 @@ class CartPoleNewtonVecEnv:
         newton.eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
     def _alloc_buffers(self):
-        """Allocate GPU buffers for all per-step computation."""
+        """Allocate GPU buffers for all per-step computation.
+
+        All buffers are pre-allocated once and reused every step() call
+        to avoid per-step GPU allocations that accumulate and cause OOM/segfault.
+        """
         self.obs_wp = wp.zeros((self.num_worlds, self.obs_dim), dtype=float, device=self.device)
         self.rewards_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
         self.dones_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
         self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
         self.prev_actions_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
+        # Pre-allocated transfer buffers (reused every step to avoid GPU alloc accumulation)
+        self._actions_cpu = wp.zeros(self.num_worlds, dtype=float, device="cpu")
+        self._actions_gpu = wp.zeros(self.num_worlds, dtype=float, device=self.device)
+        self._zero_f = wp.zeros((self.num_worlds, self.num_dofs_per_world), dtype=float, device=self.device)
 
     @property
     def steps(self):
@@ -396,7 +405,7 @@ class CartPoleNewtonVecEnv:
         """Reset all environments using Warp kernels (GPU-resident)."""
         wp.synchronize()
 
-        self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
+        self.steps_wp.zero_()
         self._step_count = 0
 
         # Get joint state arrays via ArticulationView
@@ -423,9 +432,9 @@ class CartPoleNewtonVecEnv:
         """Run one simulation step to propagate state through solver (Newton pattern)."""
         wp.synchronize()
 
-        # Zero forces via a fresh array (no CPU round-trip)
-        zero_f = wp.zeros((self.num_worlds, self.num_dofs_per_world), dtype=float, device=self.device)
-        self.cartpoles.set_attribute("joint_f", self.control, zero_f)
+        # Zero forces via pre-allocated buffer (no allocation)
+        self._zero_f.zero_()
+        self.cartpoles.set_attribute("joint_f", self.control, self._zero_f)
 
         # Run one substep to propagate
         self.state_0.clear_forces()
@@ -451,15 +460,16 @@ class CartPoleNewtonVecEnv:
             dones: (num_worlds,) bool
             infos: dict
         """
-        # --- Single CPU -> GPU transfer: actions ---
-        actions = np.asarray(actions, dtype=np.float32).flatten()
+        # --- Single CPU -> GPU transfer: actions (zero-alloc via pre-allocated buffers) ---
+        actions = np.asarray(actions, dtype=np.float64).flatten()
         assert len(actions) == self.num_worlds
-        actions_wp = wp.array(actions, dtype=float, device=self.device)
+        self._actions_cpu.numpy()[:] = actions
+        wp.copy(self._actions_gpu, self._actions_cpu)
 
         # --- GPU: set forces via kernel ---
         joint_f = self.cartpoles.get_attribute("joint_f", self.control)
         wp.launch(set_joint_forces_kernel, dim=self.num_worlds,
-                  inputs=[actions_wp, self.force_max, joint_f])
+                  inputs=[self._actions_gpu, self.force_max, joint_f])
         self.cartpoles.set_attribute("joint_f", self.control, joint_f)
 
         # --- GPU: physics substeps ---
@@ -473,7 +483,7 @@ class CartPoleNewtonVecEnv:
 
         # --- GPU: compute rewards, increment steps, check done ---
         wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
-                  inputs=[self.obs_wp, actions_wp, self.prev_actions_wp, self.steps_wp, self.x_limit, self.max_steps,
+                  inputs=[self.obs_wp, self._actions_gpu, self.prev_actions_wp, self.steps_wp, self.x_limit, self.max_steps,
                           self.rewards_wp, self.dones_wp])
 
         self._step_count += 1
