@@ -16,7 +16,9 @@
       "Bash(python3:*)",
       "Bash(npm update:*)",
       "WebSearch",
-      "Bash(ls -la \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\codesign\\\\config\"\" 2>/dev/null || ls -la \"C:UserslinusDesktopcodesigncodesignconfig* \")"
+      "Bash(ls -la \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\codesign\\\\config\"\" 2>/dev/null || ls -la \"C:UserslinusDesktopcodesigncodesignconfig* \")",
+      "WebFetch(domain:nvidia.github.io)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }
