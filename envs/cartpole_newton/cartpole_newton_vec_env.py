@@ -57,13 +57,14 @@ def extract_obs_kernel(
 @wp.kernel
 def step_rewards_done_kernel(
     obs: wp.array2d(dtype=float),
+    actions: wp.array(dtype=float),
     steps: wp.array(dtype=int),
     x_limit: float,
     max_steps: int,
     rewards: wp.array(dtype=float),
     dones: wp.array(dtype=int),
 ):
-    """Increment steps, compute IsaacLab-style rewards, check termination/truncation."""
+    """Increment steps, compute rewards, check termination/truncation."""
     tid = wp.tid()
 
     steps[tid] = steps[tid] + 1
@@ -72,15 +73,22 @@ def step_rewards_done_kernel(
     theta = obs[tid, 1]
     x_dot = obs[tid, 2]
     theta_dot = obs[tid, 3]
+    action = actions[tid]
 
     # Termination: cart out of bounds only (allow pole to swing freely)
     terminated = 0
     if wp.abs(x) > x_limit:
         terminated = 1
 
-    # Reward: alive bonus + termination penalty + angle penalty + velocity penalties
+    # Reward components:
+    #   alive bonus:    +1.0 (when not terminated)
+    #   termination:    -2.0 (cart out of bounds)
+    #   angle penalty:  -θ²  (upright = 0 penalty)
+    #   position:       -0.1*x²  (stay near center)
+    #   energy:         -0.01*action²  (minimize force usage)
+    #   velocity:       -0.01*|ẋ| - 0.005*|θ̇|
     terminated_f = float(terminated)
-    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
+    r = 1.0 * (1.0 - terminated_f) - 2.0 * terminated_f - 1.0 * theta * theta - 0.1 * x * x - 0.01 * action * action - 0.01 * wp.abs(x_dot) - 0.005 * wp.abs(theta_dot)
 
     # Truncation: max steps reached
     truncated = 0
@@ -113,7 +121,7 @@ def reset_done_worlds_kernel(
         if start_near_upright == 1:
             # IsaacLab style: only randomize pole angle, cart centered, zero velocities
             joint_q[tid, 0] = 0.0
-            joint_q[tid, 1] = -wp.pi / 18.0 + wp.pi / 9.0 * wp.randf(rng)  # ±10°
+            joint_q[tid, 1] = -wp.pi / 9.0 + 2.0 * wp.pi / 9.0 * wp.randf(rng)  # ±20°
             joint_qd[tid, 0] = 0.0
             joint_qd[tid, 1] = 0.0
         else:
@@ -139,7 +147,7 @@ def init_all_worlds_kernel(
     if start_near_upright == 1:
         # IsaacLab style: only randomize pole angle, cart centered, zero velocities
         joint_q[tid, 0] = 0.0
-        joint_q[tid, 1] = -wp.pi / 18.0 + wp.pi / 9.0 * wp.randf(rng)  # ±10°
+        joint_q[tid, 1] = -wp.pi / 9.0 + 2.0 * wp.pi / 9.0 * wp.randf(rng)  # ±20°
         joint_qd[tid, 0] = 0.0
         joint_qd[tid, 1] = 0.0
     else:
@@ -235,7 +243,7 @@ class CartPoleNewtonVecEnv:
         self.obs_dim = 4
         self.act_dim = 1
 
-        self.max_steps = 250  # 5 seconds at dt=0.02 (matches IsaacLab)
+        self.max_steps = 500  # 10 seconds at dt=0.02
 
         # Allocate GPU arrays for all per-step computation
         self._alloc_buffers()
@@ -446,7 +454,7 @@ class CartPoleNewtonVecEnv:
 
         # --- GPU: compute rewards, increment steps, check done ---
         wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
-                  inputs=[self.obs_wp, self.steps_wp, self.x_limit, self.max_steps,
+                  inputs=[self.obs_wp, actions_wp, self.steps_wp, self.x_limit, self.max_steps,
                           self.rewards_wp, self.dones_wp])
 
         self._step_count += 1
