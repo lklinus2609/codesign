@@ -15,7 +15,7 @@ Usage:
 
 import os
 import numpy as np
-from scipy.linalg import solve_continuous_are
+from scipy.linalg import solve_continuous_are, solve as scipy_solve
 import matplotlib.pyplot as plt
 
 
@@ -78,7 +78,7 @@ def nonlinear_dynamics(state, F, L):
         m * g * l * sin_th - b_theta * theta_dot,
     ])
 
-    acc = np.linalg.solve(A_mat, rhs)
+    acc = scipy_solve(A_mat, rhs)
     x_dd, theta_dd = acc
 
     return np.array([x_dot, theta_dot, x_dd, theta_dd])
@@ -143,7 +143,7 @@ def solve_lqr(L, Q, R):
     A, B = linearize(L)
     try:
         P = solve_continuous_are(A, B, Q, R)
-        K = np.linalg.solve(R, B.T @ P)
+        K = scipy_solve(R, B.T @ P)
         return K
     except Exception:
         return None
