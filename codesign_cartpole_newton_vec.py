@@ -91,7 +91,7 @@ from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 # Create environment (single world for video)
 parametric = ParametricCartPoleNewton(L_init=config["L_value"])
-env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=100.0, x_limit=3.0, start_near_upright=True)
+env = CartPoleNewtonVecEnv(parametric_model=parametric, num_worlds=1, force_max=30.0, x_limit=3.0, start_near_upright=True)
 wp.synchronize()
 
 # Create viewer
@@ -131,18 +131,7 @@ for step in range(config["max_steps"]):
 
     obs_all, rewards, dones, _ = env.step(np.array([force]))
     obs = obs_all[0]
-    terminated = dones[0]
     sim_time += env.dt
-
-    if terminated or env.steps[0] >= config["max_steps"]:
-        for _ in range(10):
-            viewer.begin_frame(sim_time)
-            viewer.log_state(env.state_0)
-            viewer.end_frame()
-            frame_wp = viewer.get_frame()
-            if frame_wp is not None:
-                frames.append(frame_wp.numpy())
-        break
 
 wp.synchronize()
 viewer.close()
@@ -513,7 +502,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
             num_worlds=1,
-            force_max=100.0,
+            force_max=30.0,
             x_limit=3.0,
             start_near_upright=True,
         )
@@ -666,7 +655,7 @@ def pghc_codesign_vec(
     env = CartPoleNewtonVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
-        force_max=100.0,
+        force_max=30.0,
         x_limit=3.0,  # IsaacLab uses (-3, 3)
         start_near_upright=True,  # Balance task first (like IsaacLab)
     )
@@ -838,7 +827,7 @@ def pghc_codesign_vec(
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
-            force_max=100.0,
+            force_max=30.0,
             x_limit=3.0,
             start_near_upright=True,
         )
