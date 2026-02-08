@@ -545,74 +545,43 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
 class StabilityGate:
     """Stability gating for PGHC inner loop convergence detection.
 
-    Tracks consecutive inner iterations where reward is stable (below threshold).
-    Converges when stable for `stable_iters_required` consecutive inner iterations.
+    Converges when reward std < std_threshold for `stable_iters_required`
+    consecutive iterations, after at least `min_inner_iters` total iterations.
     """
 
-    def __init__(self, threshold=0.01, min_inner_iters=1000, stable_iters_required=50):
-        self.threshold = threshold
+    def __init__(self, std_threshold=5.0, min_inner_iters=500, stable_iters_required=50):
+        self.std_threshold = std_threshold
         self.min_inner_iters = min_inner_iters
         self.stable_iters_required = stable_iters_required
-        self.reward_history = deque(maxlen=5)  # small window for relative change
-        self.total_inner_iters = 0
-        self.stable_count = 0  # consecutive inner iters while stable
-
-    def reset(self):
-        self.reward_history.clear()
         self.total_inner_iters = 0
         self.stable_count = 0
+        self.last_std = float('inf')
 
-    def update(self, mean_reward):
-        """Called on eval iterations with new mean_reward."""
-        self.reward_history.append(mean_reward)
+    def reset(self):
+        self.total_inner_iters = 0
+        self.stable_count = 0
+        self.last_std = float('inf')
+
+    def update(self, reward_std):
+        """Called periodically with the current reward std."""
+        self.last_std = reward_std
 
     def tick(self, n_iters=1):
         """Called every inner iteration to count total and stable iters."""
         self.total_inner_iters += n_iters
-        if self._is_stable():
+        if self.last_std < self.std_threshold:
             self.stable_count += n_iters
         else:
             self.stable_count = 0
 
-    def _is_stable(self):
-        if len(self.reward_history) < 2:
-            return False
-        rewards_arr = np.array(self.reward_history)
-        mean_val = np.mean(rewards_arr)
-        if abs(mean_val) < 1e-6:
-            return True
-        relative_change = (np.max(rewards_arr) - np.min(rewards_arr)) / abs(mean_val)
-        return relative_change < self.threshold
-
     def is_converged(self):
-        # Must train at least min_inner_iters first
         if self.total_inner_iters < self.min_inner_iters:
             return False
-        # Then need 50 consecutive stable iters AFTER the minimum
-        if self.stable_count >= self.stable_iters_required:
-            return True
-        return False
-
-    def get_stats(self):
-        if len(self.reward_history) < 2:
-            return {"mean": 0, "std": 0, "relative_change": 1.0, "stable_count": 0}
-
-        rewards_arr = np.array(self.reward_history)
-        mean_val = np.mean(rewards_arr)
-        std_val = np.std(rewards_arr)
-        relative_change = (np.max(rewards_arr) - np.min(rewards_arr)) / max(abs(mean_val), 1e-6)
-
-        return {
-            "mean": mean_val,
-            "std": std_val,
-            "relative_change": relative_change,
-            "stable_count": self.stable_count,
-        }
+        return self.stable_count >= self.stable_iters_required
 
 
 def pghc_codesign_vec(
     n_outer_iterations=15,
-    stability_threshold=0.01,
     design_lr=0.02,
     max_step=0.01,
     initial_L=1.0,
@@ -636,7 +605,7 @@ def pghc_codesign_vec(
                 "level": "1.5-vec",
                 "num_worlds": num_worlds,
                 "n_outer_iterations": n_outer_iterations,
-                "stability_threshold": stability_threshold,
+                "stability_std_threshold": 5.0,
                 "design_lr": design_lr,
                 "initial_L": initial_L,
                 "force_max": 20.0,
@@ -667,8 +636,8 @@ def pghc_codesign_vec(
     )
 
     stability_gate = StabilityGate(
-        threshold=stability_threshold,
-        min_inner_iters=1000,
+        std_threshold=5.0,
+        min_inner_iters=500,
         stable_iters_required=50,
     )
 
@@ -687,7 +656,7 @@ def pghc_codesign_vec(
     print(f"  Force max: {env.force_max} N")
     print(f"  Cart bounds: (-{env.x_limit}, {env.x_limit})")
     print(f"  Start near upright: {env.start_near_upright}")
-    print(f"  Stability threshold: {stability_threshold:.1%}")
+    print(f"  Convergence: std < 5.0 for 50 iters (after 500 min)")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
@@ -756,7 +725,7 @@ def pghc_codesign_vec(
 
             # Update stability gate every log_every iters
             if (inner_iter + 1) % log_every == 0 and len(reward_buffer) > 0:
-                stability_gate.update(mean_rew)
+                stability_gate.update(std_rew)
 
             if use_wandb:
                 log_dict = {
@@ -898,7 +867,6 @@ if __name__ == "__main__":
 
     history, policy, model = pghc_codesign_vec(
         n_outer_iterations=args.outer_iters,
-        stability_threshold=0.01,
         design_lr=args.design_lr,
         initial_L=args.initial_L,
         num_worlds=args.num_worlds,
