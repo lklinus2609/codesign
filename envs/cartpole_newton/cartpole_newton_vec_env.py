@@ -19,6 +19,7 @@ try:
     import newton
     from newton.selection import ArticulationView
     NEWTON_AVAILABLE = True
+    wp.init()  # Call once at module load
 except ImportError:
     NEWTON_AVAILABLE = False
     print("Warning: Newton/Warp not available.")
@@ -320,9 +321,19 @@ class CartPoleNewtonVecEnv:
 
         return builder
 
+    def cleanup(self):
+        """Free GPU resources before rebuilding."""
+        for attr in ('state_0', 'state_1', 'control', 'solver', 'cartpoles',
+                     'model', 'obs_wp', 'rewards_wp', 'dones_wp',
+                     'steps_wp', 'prev_actions_wp'):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        import gc
+        gc.collect()
+        wp.synchronize()
+
     def _build_model(self):
         """Build Newton model with replicated cart-poles."""
-        wp.init()
 
         # Build single cart-pole template
         single_cartpole = self._build_single_cartpole()

@@ -520,7 +520,9 @@ def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_r
                 if dones[0]:
                     break
             rollout_rewards.append(total_reward)
-        return np.mean(rollout_rewards)
+        result = np.mean(rollout_rewards)
+        env.cleanup()
+        return result
 
     L_current = parametric_model.L
     wp.synchronize()
@@ -808,7 +810,7 @@ def pghc_codesign_vec(
         parametric_model.set_L(old_L + step)
 
         # Rebuild vectorized environment with new L
-        wp.synchronize()
+        env.cleanup()
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
