@@ -31,6 +31,37 @@ import newton
 from envs.cartpole_newton import CartPoleNewtonVecEnv, ParametricCartPoleNewton
 
 
+class RunningMeanStd:
+    """Tracks running mean/variance of observations using Welford's algorithm.
+
+    Used to normalize observations to ~N(0,1) before feeding to policy/value networks.
+    This is critical for PPO stability with unbounded observation spaces.
+    """
+
+    def __init__(self, shape, clip=5.0):
+        self.mean = np.zeros(shape, dtype=np.float64)
+        self.var = np.ones(shape, dtype=np.float64)
+        self.count = 1e-4
+        self.clip = clip
+
+    def update(self, batch):
+        batch = np.asarray(batch, dtype=np.float64)
+        batch_mean = batch.mean(axis=0)
+        batch_var = batch.var(axis=0)
+        batch_count = batch.shape[0]
+        delta = batch_mean - self.mean
+        total_count = self.count + batch_count
+        self.mean = self.mean + delta * batch_count / total_count
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        self.var = (m_a + m_b + delta**2 * self.count * batch_count / total_count) / total_count
+        self.count = total_count
+
+    def normalize(self, obs):
+        obs_norm = (obs - self.mean.astype(np.float32)) / np.sqrt(self.var.astype(np.float32) + 1e-8)
+        return np.clip(obs_norm, -self.clip, self.clip).astype(np.float32)
+
+
 def _record_video_subprocess(L_value, policy_state_dict, max_steps, width, height):
     """
     Record video in a subprocess to get a fresh OpenGL context.
@@ -272,11 +303,12 @@ class CartPoleValue(nn.Module):
         return self.net(x).squeeze(-1)
 
 
-def collect_rollout_vec(env, policy, value_net, horizon=32):
+def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=32):
     """Collect rollout from vectorized environment (no reset between rollouts).
 
     Tracks per-world episode accumulators so completed episode stats
     are returned alongside rollout data (RSL-RL style, no separate eval).
+    Observations are normalized via obs_rms before feeding to networks.
     """
     wp.synchronize()  # Ensure clean state before rollout
 
@@ -301,7 +333,11 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
     completed_lengths = []
 
     for _ in range(horizon):
-        obs_t = torch.FloatTensor(obs)
+        # Update running stats with raw obs, then normalize
+        obs_rms.update(obs)
+        obs_norm = obs_rms.normalize(obs)
+
+        obs_t = torch.FloatTensor(obs_norm)
         actions, log_probs = policy.get_action_and_log_prob_batch(obs_t)
         with torch.no_grad():
             values = value_net(obs_t)
@@ -309,7 +345,7 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
         actions_np = actions.detach().numpy()
         next_obs, rewards, dones, _ = env.step(actions_np)
 
-        all_obs.append(obs)
+        all_obs.append(obs_norm)  # Store normalized obs for PPO update
         all_actions.append(actions.detach())
         all_rewards.append(rewards)
         all_log_probs.append(log_probs.detach())
@@ -330,14 +366,15 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
 
         obs = next_obs
 
-    # Store last obs for next rollout (no unnecessary resets)
+    # Store raw obs for next rollout (will be normalized at top of next rollout)
     env.last_obs = obs
 
     wp.synchronize()  # Ensure all GPU operations complete
 
-    # Bootstrap value at last observation (critical for short rollouts)
+    # Bootstrap value at last observation (normalized)
+    obs_norm = obs_rms.normalize(obs)
     with torch.no_grad():
-        last_value = value_net(torch.FloatTensor(obs))
+        last_value = value_net(torch.FloatTensor(obs_norm))
 
     # Stack into tensors: (horizon, num_worlds, ...)
     return {
@@ -354,8 +391,8 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
 
 
 def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
-                   gamma=0.99, gae_lambda=0.95, value_coeff=1.0, entropy_coeff=0.005,
-                   num_mini_batches=16, desired_kl=0.003):
+                   gamma=0.98, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.005,
+                   num_mini_batches=8, desired_kl=0.005):
     """PPO update with GAE, mini-batches, and adaptive LR (RSL-RL style).
 
     Returns mean KL divergence for logging and LR adaptation.
@@ -455,7 +492,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
     elif mean_kl < desired_kl / 2.0:
-        new_lr = min(current_lr * 1.5, 2e-4)
+        new_lr = min(current_lr * 1.5, 3e-4)
     else:
         new_lr = current_lr
     for pg in optimizer.param_groups:
@@ -464,7 +501,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     return mean_kl
 
 
-def evaluate_policy_vec(env, policy):
+def evaluate_policy_vec(env, policy, obs_rms=None):
     """Evaluate policy across all worlds for a full episode (no early break)."""
     obs = env.reset()
     episode_rewards = np.zeros(env.num_worlds)
@@ -472,7 +509,8 @@ def evaluate_policy_vec(env, policy):
     completed = np.zeros(env.num_worlds, dtype=bool)
 
     for step in range(env.max_steps):
-        actions = policy.get_actions_batch(obs, deterministic=True)
+        obs_input = obs_rms.normalize(obs) if obs_rms is not None else obs
+        actions = policy.get_actions_batch(obs_input, deterministic=True)
         obs, rewards, dones, _ = env.step(actions)
 
         # Accumulate rewards only for still-running episodes
@@ -492,7 +530,7 @@ def evaluate_policy_vec(env, policy):
     return mean_reward, std_reward, mean_length
 
 
-def compute_design_gradient(parametric_model, policy, eps=0.02,
+def compute_design_gradient(parametric_model, policy, obs_rms=None, eps=0.02,
                             num_eval_worlds=512, force_max=30.0,
                             x_limit=3.0):
     """Compute dReward/dL using finite differences with vectorized evaluation.
@@ -513,7 +551,7 @@ def compute_design_gradient(parametric_model, policy, eps=0.02,
             start_near_upright=True,
         )
         wp.synchronize()
-        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy)
+        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy, obs_rms=obs_rms)
         env.cleanup()
         wp.synchronize()
         return mean_reward, std_reward
@@ -633,8 +671,11 @@ def pghc_codesign_vec(
     policy = CartPolePolicy()
     value_net = CartPoleValue()
     optimizer = optim.Adam(
-        list(policy.parameters()) + list(value_net.parameters()), lr=2e-4
+        list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
     )
+
+    # Running observation normalization (critical for stability with unbounded velocities)
+    obs_rms = RunningMeanStd(shape=(4,))
 
     stability_gate = StabilityGate(
         rel_threshold=0.02,
@@ -705,7 +746,7 @@ def pghc_codesign_vec(
         while True:
             # Collect rollout from all worlds
             try:
-                rollout = collect_rollout_vec(env, policy, value_net, horizon=32)
+                rollout = collect_rollout_vec(env, policy, value_net, obs_rms, horizon=32)
             except Exception as e:
                 print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting env...")
                 wp.synchronize()
@@ -794,7 +835,7 @@ def pghc_codesign_vec(
         print(f"\n  [Outer Loop] Computing dReward/dL (frozen policy, {num_eval_worlds} eval worlds)...")
 
         _, gradient, r_plus, r_minus, std_plus, std_minus = compute_design_gradient(
-            parametric_model, policy,
+            parametric_model, policy, obs_rms=obs_rms,
             eps=0.02, num_eval_worlds=num_eval_worlds,
             force_max=30.0, x_limit=3.0,
         )
@@ -898,7 +939,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=50, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.005, help="Adam learning rate for design params")
-    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length (m)")
+    parser.add_argument("--initial-L", type=float, default=0.8, help="Initial pole length (m)")
     parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel training worlds")
     parser.add_argument("--num-eval-worlds", type=int, default=512, help="Number of parallel eval worlds for FD gradient")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
