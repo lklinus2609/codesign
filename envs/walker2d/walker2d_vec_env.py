@@ -116,7 +116,7 @@ def step_rewards_done_kernel(
         healthy = 0.0
 
     # Control cost
-    ctrl_cost = 0.0
+    ctrl_cost = float(0.0)
     for i in range(num_act_dofs):
         ctrl_cost = ctrl_cost + actions[tid, i] * actions[tid, i]
     ctrl_cost = ctrl_weight * ctrl_cost
