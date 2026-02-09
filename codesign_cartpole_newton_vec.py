@@ -355,7 +355,7 @@ def collect_rollout_vec(env, policy, value_net, horizon=32):
 
 def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
                    gamma=0.99, gae_lambda=0.95, value_coeff=1.0, entropy_coeff=0.005,
-                   num_mini_batches=8, desired_kl=0.005):
+                   num_mini_batches=16, desired_kl=0.003):
     """PPO update with GAE, mini-batches, and adaptive LR (RSL-RL style).
 
     Returns mean KL divergence for logging and LR adaptation.
