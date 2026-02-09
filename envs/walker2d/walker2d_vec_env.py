@@ -80,7 +80,6 @@ def extract_obs_kernel(
 @wp.kernel
 def step_rewards_done_kernel(
     joint_q: wp.array2d(dtype=float),
-    body_q: wp.array2d(dtype=float),
     prev_rootx: wp.array(dtype=float),
     actions: wp.array2d(dtype=float),
     steps: wp.array(dtype=int),
@@ -88,6 +87,7 @@ def step_rewards_done_kernel(
     forward_weight: float,
     ctrl_weight: float,
     healthy_bonus: float,
+    init_z: float,
     z_min: float,
     z_max: float,
     angle_max: float,
@@ -105,8 +105,8 @@ def step_rewards_done_kernel(
     forward_reward = forward_weight * (rootx - prev_rootx[tid]) / dt
     prev_rootx[tid] = rootx
 
-    # Healthy: absolute z from body_q, angle from joint_q
-    torso_z = body_q[tid, 2]  # body_q[torso, z] (body 0, offset 2)
+    # Healthy: absolute z from init_z + rootz displacement, angle from joint_q
+    torso_z = init_z + joint_q[tid, 1]  # rootz is slide joint at index 1
     rooty = joint_q[tid, 2]
 
     healthy = 1.0
@@ -347,15 +347,10 @@ class Walker2DVecEnv:
                 id(s1): self.artic_view.get_attribute("joint_qd", s1),
             }
             self._joint_f = self.artic_view.get_attribute("joint_f", self.control)
-            self._body_q = {
-                id(s0): self.artic_view.get_attribute("body_q", s0),
-                id(s1): self.artic_view.get_attribute("body_q", s1),
-            }
         else:
             self._joint_q = None
             self._joint_qd = None
             self._joint_f = None
-            self._body_q = None
 
         self._gc_counter = 0
 
@@ -375,13 +370,12 @@ class Walker2DVecEnv:
         return self.control.joint_f.reshape((self.num_worlds, self.num_joint_qd_per_world))
 
     def _get_body_q(self, state):
-        if self._body_q is not None:
-            return self._body_q[id(state)]
+        """Get body_q as 2D float array. Only works with requires_grad=True."""
         return state.body_q.reshape((self.num_worlds, self.num_bodies_per_world * 7))
 
     def cleanup(self):
         """Free GPU resources."""
-        for attr in ('_joint_q', '_joint_qd', '_joint_f', '_body_q',
+        for attr in ('_joint_q', '_joint_qd', '_joint_f',
                      'state_0', 'state_1', 'control', 'solver', 'artic_view',
                      'model', 'contacts', 'obs_wp', 'rewards_wp', 'dones_wp',
                      'steps_wp', 'prev_rootx_wp',
@@ -457,12 +451,12 @@ class Walker2DVecEnv:
 
         # Rewards and dones
         joint_q = self._get_joint_q(self.state_0)
-        body_q = self._get_body_q(self.state_0)
         wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
-                  inputs=[joint_q, body_q, self.prev_rootx_wp, self._actions_gpu,
+                  inputs=[joint_q, self.prev_rootx_wp, self._actions_gpu,
                           self.steps_wp, self.dt,
                           self.forward_reward_weight, self.ctrl_cost_weight,
                           self.healthy_reward,
+                          self.parametric_model.init_z,
                           self.healthy_z_range[0], self.healthy_z_range[1],
                           self.healthy_angle_range,
                           self.max_steps, self.act_dim,
