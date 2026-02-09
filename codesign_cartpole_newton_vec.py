@@ -492,56 +492,40 @@ def evaluate_policy_vec(env, policy):
     return mean_reward, std_reward, mean_length
 
 
-def compute_design_gradient(parametric_model, policy, eps=0.02, horizon=200, n_rollouts=3):
-    """Compute dReward/dL using finite differences with vec env (num_worlds=1)."""
+def compute_design_gradient(parametric_model, policy, eps=0.02,
+                            num_eval_worlds=512, force_max=30.0,
+                            x_limit=3.0):
+    """Compute dReward/dL using finite differences with vectorized evaluation.
+
+    Uses num_eval_worlds parallel episodes per perturbation for low-variance
+    gradient estimates. Returns raw R+/R- values and stds for diagnostics.
+    """
+    L_current = parametric_model.L
 
     def eval_at_L(L_val):
-        """Evaluate mean reward at a specific L value."""
+        """Evaluate mean reward at a specific L value using vectorized env."""
         parametric_model.set_L(L_val)
-        # Create vec env with single world for gradient evaluation
         env = CartPoleNewtonVecEnv(
             parametric_model=parametric_model,
-            num_worlds=1,
-            force_max=30.0,
-            x_limit=3.0,
+            num_worlds=num_eval_worlds,
+            force_max=force_max,
+            x_limit=x_limit,
             start_near_upright=True,
         )
-
-        rollout_rewards = []
-        for _ in range(n_rollouts):
-            obs = env.reset()[0]  # Get single world obs
-            total_reward = 0
-            for _ in range(horizon):
-                action = policy.get_action(obs, deterministic=True)
-                force = float(action[0]) * env.force_max
-                obs_all, rewards, dones, _ = env.step(np.array([force]))
-                obs = obs_all[0]
-                total_reward += rewards[0]
-                if dones[0]:
-                    break
-            rollout_rewards.append(total_reward)
-        result = np.mean(rollout_rewards)
+        wp.synchronize()
+        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy)
         env.cleanup()
-        return result
+        wp.synchronize()
+        return mean_reward, std_reward
 
-    L_current = parametric_model.L
-    wp.synchronize()
-
-    # Evaluate at L - eps
-    reward_minus = eval_at_L(L_current - eps)
-    wp.synchronize()
-
-    # Evaluate at L + eps
-    reward_plus = eval_at_L(L_current + eps)
-    wp.synchronize()
-
-    # Restore L
-    parametric_model.set_L(L_current)
+    reward_minus, std_minus = eval_at_L(L_current - eps)
+    reward_plus, std_plus = eval_at_L(L_current + eps)
+    parametric_model.set_L(L_current)  # Restore
 
     gradient = (reward_plus - reward_minus) / (2 * eps)
-    mean_reward = (reward_plus + reward_minus) / 2
+    mean_reward = (reward_plus + reward_minus) / 2.0
 
-    return mean_reward, gradient
+    return mean_reward, gradient, reward_plus, reward_minus, std_plus, std_minus
 
 
 class StabilityGate:
@@ -595,10 +579,10 @@ class StabilityGate:
 
 def pghc_codesign_vec(
     n_outer_iterations=50,
-    design_lr=0.02,
-    max_step=0.01,
+    design_lr=0.005,
     initial_L=0.6,
-    num_worlds=1024,
+    num_worlds=2048,
+    num_eval_worlds=512,
     use_wandb=False,
     video_every_n_iters=100,
 ):
@@ -617,11 +601,13 @@ def pghc_codesign_vec(
             config={
                 "level": "1.5-vec",
                 "num_worlds": num_worlds,
+                "num_eval_worlds": num_eval_worlds,
                 "n_outer_iterations": n_outer_iterations,
                 "convergence": "reward plateau (1% rel change, window=5)",
                 "min_inner_iters": 500,
                 "stable_iters_required": 50,
                 "design_lr": design_lr,
+                "design_optimizer": "Adam",
                 "initial_L": initial_L,
                 "force_max": 30.0,
                 "x_limit": 3.0,
@@ -656,6 +642,13 @@ def pghc_codesign_vec(
         stable_iters_required=50,
     )
 
+    # Adam optimizer for design parameters (gradient ASCENT via negated grad)
+    design_params = torch.tensor([initial_L], dtype=torch.float32, requires_grad=False)
+    design_optimizer = torch.optim.Adam([design_params], lr=design_lr)
+
+    # Outer loop convergence: track L stability
+    L_history = deque(maxlen=5)
+
     history = {
         "L": [parametric_model.L],
         "rewards": [],
@@ -667,11 +660,14 @@ def pghc_codesign_vec(
 
     print(f"\nConfiguration:")
     print(f"  Num parallel worlds: {num_worlds}")
+    print(f"  Num eval worlds (FD): {num_eval_worlds}")
     print(f"  Initial L: {parametric_model.L:.3f} m")
+    print(f"  Design optimizer: Adam (lr={design_lr})")
     print(f"  Force max: {env.force_max} N")
     print(f"  Cart bounds: (-{env.x_limit}, {env.x_limit})")
     print(f"  Start near upright: {env.start_near_upright}")
-    print(f"  Convergence: reward plateau (<1% change, window=5, 50 stable iters after 500 min)")
+    print(f"  Inner convergence: reward plateau (<2% change, window=5, 50 stable iters)")
+    print(f"  Outer convergence: L range < 3mm over 5 iterations")
 
     # Record initial video (untrained policy)
     if use_wandb and video_every_n_iters > 0:
@@ -738,9 +734,10 @@ def pghc_codesign_vec(
                 std_rew = np.std(reward_buffer)
                 mean_len = np.mean(length_buffer)
 
-            # Update stability gate every log_every iters
+            # Update stability gate every log_every iters (tick + update aligned)
             if (inner_iter + 1) % log_every == 0 and len(reward_buffer) > 0:
                 stability_gate.update(mean_rew)
+                stability_gate.tick(log_every)
 
             if use_wandb:
                 log_dict = {
@@ -777,7 +774,6 @@ def pghc_codesign_vec(
                 except Exception as e:
                     print(f"    [wandb] Video recording failed: {type(e).__name__}. Skipping.")
 
-            stability_gate.tick()
             inner_iter += 1
 
             if stability_gate.is_converged():
@@ -791,26 +787,43 @@ def pghc_codesign_vec(
         # =============================================
         # OUTER LOOP: Compute design gradient
         # =============================================
-        print(f"\n  [Outer Loop] Computing dReward/dL (frozen policy)...")
+        # Free training env BEFORE FD eval to avoid GPU OOM
+        env.cleanup()
         wp.synchronize()
 
-        _, gradient = compute_design_gradient(
+        print(f"\n  [Outer Loop] Computing dReward/dL (frozen policy, {num_eval_worlds} eval worlds)...")
+
+        _, gradient, r_plus, r_minus, std_plus, std_minus = compute_design_gradient(
             parametric_model, policy,
-            eps=0.02, horizon=200, n_rollouts=3
+            eps=0.02, num_eval_worlds=num_eval_worlds,
+            force_max=30.0, x_limit=3.0,
         )
         history["gradients"].append(gradient)
 
-        print(f"  dReward/dL = {gradient:.4f}")
+        print(f"  R(L+e) = {r_plus:.2f} +/-{std_plus:.2f}")
+        print(f"  R(L-e) = {r_minus:.2f} +/-{std_minus:.2f}")
+        print(f"  dR/dL  = {gradient:.4f}")
 
         # =============================================
-        # Update L (gradient ascent)
+        # Update L (Adam gradient ascent)
         # =============================================
-        step = np.clip(design_lr * gradient, -max_step, max_step)
         old_L = parametric_model.L
-        parametric_model.set_L(old_L + step)
+        design_optimizer.zero_grad()
+        design_params.grad = torch.tensor([-gradient])  # Negative for gradient ASCENT
+        design_optimizer.step()
 
-        # Rebuild vectorized environment with new L
-        env.cleanup()
+        # Clamp to physical bounds
+        with torch.no_grad():
+            design_params.clamp_(parametric_model.L_min, parametric_model.L_max)
+
+        new_L = design_params.item()
+        parametric_model.set_L(new_L)
+
+        adam_step = new_L - old_L
+        print(f"  Adam step: {old_L:.4f} -> {new_L:.4f} (delta={adam_step:+.5f})")
+        history["L"].append(parametric_model.L)
+
+        # Rebuild training env with new L
         env = CartPoleNewtonVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
@@ -821,17 +834,27 @@ def pghc_codesign_vec(
         env.last_obs = None  # Force fresh reset on next rollout
         wp.synchronize()
 
-        print(f"\n  L update: {old_L:.3f} -> {parametric_model.L:.3f} m (step = {step:+.4f})")
-        history["L"].append(parametric_model.L)
-
         if use_wandb:
             wandb.log({
                 "outer/reward_at_convergence": mean_rew,
                 "outer/gradient": gradient,
-                "outer/L_step": step,
+                "outer/r_plus": r_plus,
+                "outer/r_minus": r_minus,
+                "outer/std_plus": std_plus,
+                "outer/std_minus": std_minus,
+                "outer/adam_step": adam_step,
                 "outer/L_new": parametric_model.L,
                 "outer/inner_iterations_used": stability_gate.total_inner_iters,
             }, step=global_step)
+
+        # Check outer loop convergence (L stability)
+        L_history.append(parametric_model.L)
+        if len(L_history) >= 5:
+            L_range = max(L_history) - min(L_history)
+            if L_range < 0.003:
+                print(f"\n  OUTER CONVERGED: L stable at {parametric_model.L:.4f} m "
+                      f"(range {L_range:.4f} < 0.003 over last 5 iters)")
+                break
 
     # =============================================
     # Final Results
@@ -845,9 +868,9 @@ def pghc_codesign_vec(
     print(f"  Final:   {history['L'][-1]:.3f} m")
     print(f"  Change:  {history['L'][-1] - history['L'][0]:+.3f} m")
 
-    total_samples = sum(history["inner_iterations"]) * num_worlds * 16
+    total_samples = sum(history["inner_iterations"]) * num_worlds * 32
     print(f"\nTotal training samples: {total_samples:,}")
-    print(f"  ({num_worlds} worlds x 16 steps x {sum(history['inner_iterations'])} iters)")
+    print(f"  ({num_worlds} worlds x 32 steps x {sum(history['inner_iterations'])} iters)")
 
     if use_wandb:
         # Record final video
@@ -874,9 +897,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="PGHC Co-Design (Vectorized)")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=50, help="Number of outer iterations")
-    parser.add_argument("--design-lr", type=float, default=0.02, help="Design learning rate")
-    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length")
-    parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel worlds")
+    parser.add_argument("--design-lr", type=float, default=0.005, help="Adam learning rate for design params")
+    parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length (m)")
+    parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel training worlds")
+    parser.add_argument("--num-eval-worlds", type=int, default=512, help="Number of parallel eval worlds for FD gradient")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
 
@@ -885,6 +909,7 @@ if __name__ == "__main__":
         design_lr=args.design_lr,
         initial_L=args.initial_L,
         num_worlds=args.num_worlds,
+        num_eval_worlds=args.num_eval_worlds,
         use_wandb=args.wandb,
         video_every_n_iters=args.video_every,
     )
