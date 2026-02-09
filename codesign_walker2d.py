@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Level 2: PGHC Co-Design for Ant Locomotion (Vectorized)
+Level 2.1: PGHC Co-Design for Walker2D Locomotion (Vectorized)
 
-Optimizes Ant morphology (leg_length, foot_length, torso_radius) for forward
-locomotion using PGHC with vectorized Newton physics environments.
+Optimizes Walker2D morphology (thigh_length, leg_length, foot_length) for
+forward locomotion using PGHC with vectorized Newton physics environments.
 
-Uses the same architecture as Level 1.5 (cart-pole vectorized):
-- Separate actor/critic networks with obs normalization
-- PPO with adaptive LR and mini-batches
-- Vectorized FD gradient with 512 eval worlds per perturbation
-- Adam optimizer for design parameters
-- StabilityGate for inner loop convergence
+Walker2D is a 2D biped: simpler dynamics than Ant, more relevant to humanoid.
+- 17D observations, 6D actions
+- 3 design parameters (symmetric for both legs)
 
 Run with wandb logging:
-    python codesign_ant.py --wandb --num-worlds 1024
+    python codesign_walker2d.py --wandb --num-worlds 1024
 """
 
-# CRITICAL: Must set BEFORE importing pyglet/newton for headless video recording
 import os
 os.environ["PYGLET_HEADLESS"] = "1"
 
@@ -36,8 +32,8 @@ except ImportError:
 import warp as wp
 import newton
 
-from envs.ant import ParametricAnt
-from envs.ant.ant_vec_env import AntVecEnv
+from envs.walker2d.walker2d_env import ParametricWalker2D
+from envs.walker2d.walker2d_vec_env import Walker2DVecEnv
 
 
 # ---------------------------------------------------------------------------
@@ -45,7 +41,7 @@ from envs.ant.ant_vec_env import AntVecEnv
 # ---------------------------------------------------------------------------
 
 class RunningMeanStd:
-    """Tracks running mean/variance of observations using Welford's algorithm."""
+    """Tracks running mean/variance using Welford's algorithm."""
 
     def __init__(self, shape, clip=5.0):
         self.mean = np.zeros(shape, dtype=np.float64)
@@ -75,10 +71,10 @@ class RunningMeanStd:
 # Networks
 # ---------------------------------------------------------------------------
 
-class AntPolicy(nn.Module):
-    """Policy network for Ant (separate from value network)."""
+class Walker2DPolicy(nn.Module):
+    """Policy network for Walker2D."""
 
-    def __init__(self, obs_dim=27, act_dim=8, hidden_dim=128):
+    def __init__(self, obs_dim=17, act_dim=6, hidden_dim=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -87,9 +83,7 @@ class AntPolicy(nn.Module):
             nn.ELU(),
             nn.Linear(hidden_dim, act_dim),
         )
-        # Higher init noise for 8D action space exploration
         self.log_std = nn.Parameter(torch.ones(act_dim) * -0.5)
-
         nn.init.uniform_(self.net[-1].weight, -0.1, 0.1)
         nn.init.zeros_(self.net[-1].bias)
 
@@ -105,8 +99,7 @@ class AntPolicy(nn.Module):
                 return mean.numpy()
             std = torch.exp(self.log_std)
             action = mean + std * torch.randn_like(mean)
-            action = torch.clamp(action, -1.0, 1.0)
-            return action.numpy()
+            return torch.clamp(action, -1.0, 1.0).numpy()
 
     def get_actions_batch(self, obs_batch, deterministic=False):
         if isinstance(obs_batch, np.ndarray):
@@ -117,8 +110,7 @@ class AntPolicy(nn.Module):
                 return mean.numpy()
             std = torch.exp(self.log_std)
             actions = mean + std * torch.randn_like(mean)
-            actions = torch.clamp(actions, -1.0, 1.0)
-            return actions.numpy()
+            return torch.clamp(actions, -1.0, 1.0).numpy()
 
     def get_action_and_log_prob_batch(self, obs_batch):
         mean = self.forward(obs_batch)
@@ -130,10 +122,10 @@ class AntPolicy(nn.Module):
         return actions, log_probs
 
 
-class AntValue(nn.Module):
-    """Value network for Ant."""
+class Walker2DValue(nn.Module):
+    """Value network for Walker2D."""
 
-    def __init__(self, obs_dim=27, hidden_dim=128):
+    def __init__(self, obs_dim=17, hidden_dim=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden_dim),
@@ -152,11 +144,7 @@ class AntValue(nn.Module):
 # ---------------------------------------------------------------------------
 
 def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
-    """Collect rollout from vectorized environment (no reset between rollouts).
-
-    Tracks per-world episode accumulators so completed episode stats
-    are returned alongside rollout data (RSL-RL style).
-    """
+    """Collect rollout from vectorized environment (RSL-RL style)."""
     wp.synchronize()
 
     num_worlds = env.num_worlds
@@ -166,15 +154,9 @@ def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
         env.ep_reward_accum = np.zeros(num_worlds)
         env.ep_length_accum = np.zeros(num_worlds)
 
-    all_obs = []
-    all_actions = []
-    all_rewards = []
-    all_log_probs = []
-    all_dones = []
-    all_values = []
-
-    completed_rewards = []
-    completed_lengths = []
+    all_obs, all_actions, all_rewards = [], [], []
+    all_log_probs, all_dones, all_values = [], [], []
+    completed_rewards, completed_lengths = [], []
 
     for _ in range(horizon):
         obs_rms.update(obs)
@@ -198,8 +180,7 @@ def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
         env.ep_reward_accum += rewards
         env.ep_length_accum += 1
 
-        done_indices = np.where(dones)[0]
-        for idx in done_indices:
+        for idx in np.where(dones)[0]:
             completed_rewards.append(env.ep_reward_accum[idx])
             completed_lengths.append(env.ep_length_accum[idx])
             env.ep_reward_accum[idx] = 0.0
@@ -208,7 +189,6 @@ def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
         obs = next_obs
 
     env.last_obs = obs
-
     wp.synchronize()
 
     obs_norm = obs_rms.normalize(obs)
@@ -233,7 +213,6 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
                    num_mini_batches=8, desired_kl=0.008):
     """PPO update with GAE, mini-batches, and adaptive LR."""
     H, N = rollout["rewards"].shape
-
     rewards = rollout["rewards"]
     dones = rollout["dones"]
     values = rollout["values"]
@@ -242,17 +221,11 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     with torch.no_grad():
         advantages = torch.zeros(H, N)
         last_gae = torch.zeros(N)
-
         for t in reversed(range(H)):
-            if t == H - 1:
-                next_value = last_value
-            else:
-                next_value = values[t + 1]
-
+            next_value = last_value if t == H - 1 else values[t + 1]
             delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
             last_gae = delta + gamma * gae_lambda * (1 - dones[t]) * last_gae
             advantages[t] = last_gae
-
         returns = advantages + values
 
     total_samples = H * N
@@ -261,7 +234,6 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     old_log_probs_flat = rollout["log_probs"].reshape(total_samples)
     advantages_flat = advantages.reshape(total_samples)
     returns_flat = returns.reshape(total_samples)
-
     advantages_flat = (advantages_flat - advantages_flat.mean()) / (advantages_flat.std() + 1e-8)
 
     all_params = list(policy.parameters()) + list(value_net.parameters())
@@ -270,30 +242,20 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
 
     for epoch in range(n_epochs):
         perm = torch.randperm(total_samples)
-
         for mb in range(num_mini_batches):
             idx = perm[mb * mini_batch_size : (mb + 1) * mini_batch_size]
 
-            obs_mb = obs_flat[idx]
-            acts_mb = acts_flat[idx]
-            old_lp_mb = old_log_probs_flat[idx]
-            adv_mb = advantages_flat[idx]
-            ret_mb = returns_flat[idx]
-
-            mean = policy(obs_mb)
+            mean = policy(obs_flat[idx])
             std = torch.exp(policy.log_std)
             dist = torch.distributions.Normal(mean, std)
-            log_probs = dist.log_prob(acts_mb).sum(-1)
+            log_probs = dist.log_prob(acts_flat[idx]).sum(-1)
             entropy = dist.entropy().sum(-1).mean()
+            values_pred = value_net(obs_flat[idx])
 
-            values_pred = value_net(obs_mb)
-
-            ratio = torch.exp(log_probs - old_lp_mb)
+            ratio = torch.exp(log_probs - old_log_probs_flat[idx])
             clipped_ratio = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
-            policy_loss = -torch.min(ratio * adv_mb, clipped_ratio * adv_mb).mean()
-
-            value_loss = nn.functional.mse_loss(values_pred, ret_mb)
-
+            policy_loss = -torch.min(ratio * advantages_flat[idx], clipped_ratio * advantages_flat[idx]).mean()
+            value_loss = nn.functional.mse_loss(values_pred, returns_flat[idx])
             loss = policy_loss + value_coeff * value_loss - entropy_coeff * entropy
 
             optimizer.zero_grad()
@@ -307,11 +269,9 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
             dist_all = torch.distributions.Normal(mean_all, std_all)
             new_lp = dist_all.log_prob(acts_flat).sum(-1)
             mean_kl = (old_log_probs_flat - new_lp).mean().item()
-
         if mean_kl > 2.0 * desired_kl:
             break
 
-    # Adaptive LR
     current_lr = optimizer.param_groups[0]['lr']
     if mean_kl > 2.0 * desired_kl:
         new_lr = max(current_lr / 1.5, 1e-5)
@@ -339,15 +299,10 @@ def evaluate_policy_vec(env, policy, obs_rms=None):
 
         episode_rewards += rewards * (~completed)
         episode_lengths += (~completed).astype(float)
-
         completed = completed | dones
 
     env.last_obs = None
-
-    mean_reward = np.mean(episode_rewards)
-    std_reward = np.std(episode_rewards)
-    mean_length = np.mean(episode_lengths)
-    return mean_reward, std_reward, mean_length
+    return np.mean(episode_rewards), np.std(episode_rewards), np.mean(episode_lengths)
 
 
 # ---------------------------------------------------------------------------
@@ -356,34 +311,26 @@ def evaluate_policy_vec(env, policy, obs_rms=None):
 
 def compute_design_gradient(parametric_model, policy, obs_rms=None, eps=0.02,
                             num_eval_worlds=512):
-    """Compute dReward/d(param) for all 3 design params using finite differences.
-
-    Uses num_eval_worlds parallel episodes per perturbation for low-variance
-    gradient estimates. Returns per-param gradients and diagnostics.
-    """
-    param_names = ["leg_length", "foot_length", "torso_radius"]
+    """Compute dReward/d(param) for all 3 design params via finite differences."""
+    param_names = ["thigh_length", "leg_length", "foot_length"]
     current_vals = {name: getattr(parametric_model, name) for name in param_names}
 
     def eval_at_params(**overrides):
-        """Evaluate mean reward with specific param overrides."""
-        # Set params
         for name, val in overrides.items():
             setattr(parametric_model, name, val)
-        # Clamp to bounds
         parametric_model.set_params(
+            thigh_length=parametric_model.thigh_length,
             leg_length=parametric_model.leg_length,
             foot_length=parametric_model.foot_length,
-            torso_radius=parametric_model.torso_radius,
         )
-        env = AntVecEnv(
+        env = Walker2DVecEnv(
             parametric_model=parametric_model,
             num_worlds=num_eval_worlds,
         )
         wp.synchronize()
-        mean_reward, std_reward, mean_length = evaluate_policy_vec(env, policy, obs_rms=obs_rms)
+        mean_reward, std_reward, _ = evaluate_policy_vec(env, policy, obs_rms=obs_rms)
         env.cleanup()
         wp.synchronize()
-        # Restore original params
         for name, val in current_vals.items():
             setattr(parametric_model, name, val)
         return mean_reward, std_reward
@@ -393,7 +340,6 @@ def compute_design_gradient(parametric_model, policy, obs_rms=None, eps=0.02,
 
     for name in param_names:
         val = current_vals[name]
-
         r_plus, std_plus = eval_at_params(**{name: val + eps})
         r_minus, std_minus = eval_at_params(**{name: val - eps})
 
@@ -420,7 +366,8 @@ def compute_design_gradient(parametric_model, policy, obs_rms=None, eps=0.02,
 class StabilityGate:
     """Inner loop convergence detection via reward plateau."""
 
-    def __init__(self, rel_threshold=0.02, min_inner_iters=500, stable_iters_required=50, window=5):
+    def __init__(self, rel_threshold=0.02, min_inner_iters=500,
+                 stable_iters_required=50, window=5):
         self.rel_threshold = rel_threshold
         self.min_inner_iters = min_inner_iters
         self.stable_iters_required = stable_iters_required
@@ -450,8 +397,7 @@ class StabilityGate:
         mean_val = np.mean(rewards)
         if abs(mean_val) < 1e-6:
             return True
-        relative_change = (np.max(rewards) - np.min(rewards)) / abs(mean_val)
-        return relative_change < self.rel_threshold
+        return (np.max(rewards) - np.min(rewards)) / abs(mean_val) < self.rel_threshold
 
     def is_converged(self):
         if self.total_inner_iters < self.min_inner_iters:
@@ -463,96 +409,88 @@ class StabilityGate:
 # Main PGHC loop
 # ---------------------------------------------------------------------------
 
-def pghc_codesign_ant(
+def pghc_codesign_walker2d(
     n_outer_iterations=50,
     design_lr=0.005,
-    initial_leg_length=0.28,
-    initial_foot_length=0.57,
-    initial_torso_radius=0.25,
+    initial_thigh_length=0.45,
+    initial_leg_length=0.50,
+    initial_foot_length=0.20,
     num_worlds=1024,
     num_eval_worlds=512,
     use_wandb=False,
     horizon=64,
 ):
-    """PGHC Co-Design for Ant using vectorized environments."""
+    """PGHC Co-Design for Walker2D using vectorized environments."""
     print("=" * 60)
-    print("PGHC Co-Design for Ant (Vectorized Newton Physics)")
+    print("PGHC Co-Design for Walker2D (Vectorized Newton Physics)")
     print("=" * 60)
 
     if use_wandb and WANDB_AVAILABLE:
         wandb.init(
             project="pghc-codesign",
-            name=f"ant-vec-{num_worlds}w",
+            name=f"walker2d-vec-{num_worlds}w",
             config={
-                "level": "2-ant-vec",
+                "level": "2.1-walker2d-vec",
                 "num_worlds": num_worlds,
                 "num_eval_worlds": num_eval_worlds,
                 "n_outer_iterations": n_outer_iterations,
                 "design_lr": design_lr,
-                "design_optimizer": "Adam",
+                "initial_thigh_length": initial_thigh_length,
                 "initial_leg_length": initial_leg_length,
                 "initial_foot_length": initial_foot_length,
-                "initial_torso_radius": initial_torso_radius,
                 "horizon": horizon,
                 "gamma": 0.99,
                 "entropy_coeff": 0.01,
                 "desired_kl": 0.008,
                 "hidden_dim": 128,
+                "gear_ratio": 100,
+                "ctrl_cost_weight": 1e-3,
             },
         )
         print(f"  [wandb] Logging enabled")
-    elif use_wandb and not WANDB_AVAILABLE:
+    elif use_wandb:
         print("  [wandb] Not available")
         use_wandb = False
 
-    # Initialize parametric model
-    parametric_model = ParametricAnt(
+    parametric_model = ParametricWalker2D(
+        thigh_length=initial_thigh_length,
         leg_length=initial_leg_length,
         foot_length=initial_foot_length,
-        torso_radius=initial_torso_radius,
     )
 
-    # Create vectorized environment
-    env = AntVecEnv(
+    env = Walker2DVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
     )
 
-    policy = AntPolicy()
-    value_net = AntValue()
+    policy = Walker2DPolicy()
+    value_net = Walker2DValue()
     optimizer = optim.Adam(
         list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
     )
 
-    obs_rms = RunningMeanStd(shape=(27,))
+    obs_rms = RunningMeanStd(shape=(17,))
+    stability_gate = StabilityGate(rel_threshold=0.02, min_inner_iters=0, stable_iters_required=50)
 
-    stability_gate = StabilityGate(
-        rel_threshold=0.02,
-        min_inner_iters=0,
-        stable_iters_required=50,
-    )
-
-    # Adam optimizer for 3 design parameters (gradient ASCENT via negated grad)
+    param_names = ["thigh_length", "leg_length", "foot_length"]
     design_params = torch.tensor(
-        [initial_leg_length, initial_foot_length, initial_torso_radius],
+        [initial_thigh_length, initial_leg_length, initial_foot_length],
         dtype=torch.float32, requires_grad=False
     )
     design_optimizer = torch.optim.Adam([design_params], lr=design_lr)
 
-    param_names = ["leg_length", "foot_length", "torso_radius"]
     param_bounds = {
+        "thigh_length": (parametric_model.thigh_length_min, parametric_model.thigh_length_max),
         "leg_length": (parametric_model.leg_length_min, parametric_model.leg_length_max),
         "foot_length": (parametric_model.foot_length_min, parametric_model.foot_length_max),
-        "torso_radius": (parametric_model.torso_radius_min, parametric_model.torso_radius_max),
     }
 
-    # Outer loop convergence: track param stability
     param_history = {name: deque(maxlen=5) for name in param_names}
 
     history = {
+        "thigh_length": [parametric_model.thigh_length],
         "leg_length": [parametric_model.leg_length],
         "foot_length": [parametric_model.foot_length],
-        "torso_radius": [parametric_model.torso_radius],
         "rewards": [],
         "gradients": [],
         "inner_iterations": [],
@@ -566,28 +504,26 @@ def pghc_codesign_ant(
     print(f"  Horizon: {horizon}")
     print(f"  Design optimizer: Adam (lr={design_lr})")
     print(f"  Initial morphology:")
-    print(f"    leg_length = {parametric_model.leg_length:.3f} m")
-    print(f"    foot_length = {parametric_model.foot_length:.3f} m")
-    print(f"    torso_radius = {parametric_model.torso_radius:.3f} m")
+    for name in param_names:
+        print(f"    {name} = {getattr(parametric_model, name):.3f} m")
+    print(f"  Init z: {parametric_model.init_z:.3f} m")
 
     for outer_iter in range(n_outer_iterations):
         print(f"\n{'='*60}")
         print(f"Outer Iteration {outer_iter + 1}/{n_outer_iterations}")
         print(f"{'='*60}")
-        print(f"  leg={parametric_model.leg_length:.3f}, "
-              f"foot={parametric_model.foot_length:.3f}, "
-              f"torso_r={parametric_model.torso_radius:.3f}")
+        print(f"  thigh={parametric_model.thigh_length:.3f}, "
+              f"leg={parametric_model.leg_length:.3f}, "
+              f"foot={parametric_model.foot_length:.3f}")
 
         if use_wandb:
             wandb.log({
                 "outer/iteration": outer_iter + 1,
-                "outer/leg_length": parametric_model.leg_length,
-                "outer/foot_length": parametric_model.foot_length,
-                "outer/torso_radius": parametric_model.torso_radius,
+                **{f"outer/{n}": getattr(parametric_model, n) for n in param_names},
             }, step=global_step)
 
         # =============================================
-        # INNER LOOP: Train until convergence
+        # INNER LOOP
         # =============================================
         print(f"\n  [Inner Loop] Training PPO ({num_worlds} parallel envs)...")
         stability_gate.reset()
@@ -595,7 +531,6 @@ def pghc_codesign_ant(
         log_every = 10
         inner_iter = 0
         mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
-
         reward_buffer = deque(maxlen=200)
         length_buffer = deque(maxlen=200)
 
@@ -603,7 +538,7 @@ def pghc_codesign_ant(
             try:
                 rollout = collect_rollout_vec(env, policy, value_net, obs_rms, horizon=horizon)
             except Exception as e:
-                print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting env...")
+                print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting...")
                 wp.synchronize()
                 env.last_obs = None
                 if hasattr(env, 'ep_reward_accum'):
@@ -640,9 +575,7 @@ def pghc_codesign_ant(
                     "inner/mean_reward": mean_rew,
                     "inner/reward_std": std_rew,
                     "inner/episode_length": mean_len,
-                    "design/leg_length": parametric_model.leg_length,
-                    "design/foot_length": parametric_model.foot_length,
-                    "design/torso_radius": parametric_model.torso_radius,
+                    **{f"design/{n}": getattr(parametric_model, n) for n in param_names},
                 }, step=global_step)
 
             if (inner_iter + 1) % log_every == 0:
@@ -654,17 +587,18 @@ def pghc_codesign_ant(
             inner_iter += 1
 
             if stability_gate.is_converged():
-                print(f"    CONVERGED at iter {inner_iter} (stable for {stability_gate.stable_count} iters)")
+                print(f"    CONVERGED at iter {inner_iter} "
+                      f"(stable for {stability_gate.stable_count} iters)")
                 break
 
         history["rewards"].append(mean_rew)
         history["inner_iterations"].append(stability_gate.total_inner_iters)
-        print(f"  Policy converged. Reward = {mean_rew:.1f} +/- {std_rew:.1f}, Length = {mean_len:.0f}")
+        print(f"  Policy converged. Reward = {mean_rew:.1f} +/- {std_rew:.1f}, "
+              f"Length = {mean_len:.0f}")
 
         # =============================================
-        # OUTER LOOP: Compute design gradients
+        # OUTER LOOP
         # =============================================
-        # Free training env BEFORE FD eval to avoid GPU OOM
         env.cleanup()
         wp.synchronize()
 
@@ -683,39 +617,37 @@ def pghc_codesign_ant(
                   f"grad={d['gradient']:.4f}")
 
         # =============================================
-        # Update design parameters (Adam gradient ascent)
+        # Update design parameters
         # =============================================
         old_params = {name: getattr(parametric_model, name) for name in param_names}
 
         design_optimizer.zero_grad()
         grad_tensor = torch.tensor(
-            [-gradients[name] for name in param_names],  # Negative for ascent
+            [-gradients[name] for name in param_names],
             dtype=torch.float32
         )
         design_params.grad = grad_tensor
         design_optimizer.step()
 
-        # Clamp to physical bounds
         with torch.no_grad():
             for i, name in enumerate(param_names):
                 lo, hi = param_bounds[name]
                 design_params[i].clamp_(lo, hi)
 
-        # Apply new params
         for i, name in enumerate(param_names):
             setattr(parametric_model, name, design_params[i].item())
 
         print(f"\n  Design update:")
-        for i, name in enumerate(param_names):
+        for name in param_names:
             delta = getattr(parametric_model, name) - old_params[name]
-            print(f"    {name}: {old_params[name]:.4f} -> {getattr(parametric_model, name):.4f} "
-                  f"(delta={delta:+.5f})")
+            print(f"    {name}: {old_params[name]:.4f} -> "
+                  f"{getattr(parametric_model, name):.4f} (delta={delta:+.5f})")
 
         for name in param_names:
             history[name].append(getattr(parametric_model, name))
 
-        # Rebuild training env with new morphology
-        env = AntVecEnv(
+        # Rebuild env
+        env = Walker2DVecEnv(
             num_worlds=num_worlds,
             parametric_model=parametric_model,
         )
@@ -736,7 +668,7 @@ def pghc_codesign_ant(
                 log_dict[f"outer/{name}_new"] = getattr(parametric_model, name)
             wandb.log(log_dict, step=global_step)
 
-        # Check outer loop convergence (all params stable)
+        # Check outer convergence
         for name in param_names:
             param_history[name].append(getattr(parametric_model, name))
 
@@ -744,8 +676,7 @@ def pghc_codesign_ant(
             all_stable = True
             for name in param_names:
                 vals = list(param_history[name])
-                param_range = max(vals) - min(vals)
-                if param_range >= 0.005:  # 5mm threshold for ant params
+                if max(vals) - min(vals) >= 0.005:
                     all_stable = False
                     break
             if all_stable:
@@ -766,13 +697,12 @@ def pghc_codesign_ant(
 
     total_samples = sum(history["inner_iterations"]) * num_worlds * horizon
     print(f"\nTotal training samples: {total_samples:,}")
-    print(f"  ({num_worlds} worlds x {horizon} steps x {sum(history['inner_iterations'])} iters)")
 
     if use_wandb:
         wandb.log({
             "summary/total_samples": total_samples,
-            **{f"summary/{name}_initial": history[name][0] for name in param_names},
-            **{f"summary/{name}_final": history[name][-1] for name in param_names},
+            **{f"summary/{n}_initial": history[n][0] for n in param_names},
+            **{f"summary/{n}_final": history[n][-1] for n in param_names},
         })
         wandb.finish()
 
@@ -780,24 +710,24 @@ def pghc_codesign_ant(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="PGHC Co-Design for Ant (Vectorized)")
+    parser = argparse.ArgumentParser(description="PGHC Co-Design for Walker2D (Vectorized)")
     parser.add_argument("--wandb", action="store_true", help="Enable wandb logging")
-    parser.add_argument("--outer-iters", type=int, default=50, help="Number of outer iterations")
-    parser.add_argument("--design-lr", type=float, default=0.005, help="Adam learning rate for design params")
-    parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel training worlds")
-    parser.add_argument("--num-eval-worlds", type=int, default=512, help="Number of parallel eval worlds for FD")
-    parser.add_argument("--horizon", type=int, default=64, help="Rollout horizon")
-    parser.add_argument("--initial-leg", type=float, default=0.28, help="Initial leg length")
-    parser.add_argument("--initial-foot", type=float, default=0.57, help="Initial foot length")
-    parser.add_argument("--initial-torso-r", type=float, default=0.25, help="Initial torso radius")
+    parser.add_argument("--outer-iters", type=int, default=50)
+    parser.add_argument("--design-lr", type=float, default=0.005)
+    parser.add_argument("--num-worlds", type=int, default=1024)
+    parser.add_argument("--num-eval-worlds", type=int, default=512)
+    parser.add_argument("--horizon", type=int, default=64)
+    parser.add_argument("--initial-thigh", type=float, default=0.45)
+    parser.add_argument("--initial-leg", type=float, default=0.50)
+    parser.add_argument("--initial-foot", type=float, default=0.20)
     args = parser.parse_args()
 
-    history, policy, model = pghc_codesign_ant(
+    history, policy, model = pghc_codesign_walker2d(
         n_outer_iterations=args.outer_iters,
         design_lr=args.design_lr,
+        initial_thigh_length=args.initial_thigh,
         initial_leg_length=args.initial_leg,
         initial_foot_length=args.initial_foot,
-        initial_torso_radius=args.initial_torso_r,
         num_worlds=args.num_worlds,
         num_eval_worlds=args.num_eval_worlds,
         use_wandb=args.wandb,
