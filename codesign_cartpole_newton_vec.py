@@ -809,7 +809,7 @@ def pghc_codesign_vec(
         # =============================================
         old_L = parametric_model.L
         design_optimizer.zero_grad()
-        design_params.grad = torch.tensor([-gradient])  # Negative for gradient ASCENT
+        design_params.grad = torch.tensor([-gradient], dtype=torch.float32)  # Negative for gradient ASCENT
         design_optimizer.step()
 
         # Clamp to physical bounds

@@ -135,7 +135,9 @@ r = 1.0*(alive) - 2.0*(terminated) - theta^2 - 0.1*x^2
 
 ### Convergence Criteria
 
-**Inner loop**: Reward plateau (<1% relative change over window of 5 evaluations, sustained for 50 consecutive iterations, after 500 minimum iterations).
+**Inner loop**: Reward plateau (<2% relative change over window of 5 evaluations, sustained for 50 consecutive iterations).
+
+**Outer loop**: L range < 3mm over last 5 outer iterations (design parameter stabilized).
 
 ### Success Criteria
 
@@ -228,6 +230,10 @@ Full system validation on the target robot.
 - [x] Conservative PPO (max LR 3e-4, desired_kl 0.005, 8 mini-batches)
 - [x] Run PGHC with finite-difference gradients
 - [x] Video recording with subprocess (OpenGL workaround)
+- [x] Adam optimizer for design params (replaces clipped SGD)
+- [x] Vectorized FD eval (512 worlds per perturbation, replaces 1-world 3-rollout)
+- [x] GPU memory fix (free training env before FD eval, rebuild after)
+- [x] Outer loop convergence detection (L stability < 3mm over 5 iters)
 - Code: `envs/cartpole_newton/`, `codesign_cartpole_newton_vec.py`
 
 ### Level 2: Ant (Newton/Warp) --- CREATED, NOT VALIDATED
@@ -279,9 +285,11 @@ Full system validation on the target robot.
 ### Outer Loop (Morphology)
 | Parameter | Current | Tune At Level |
 |-----------|---------|---------------|
-| `design_lr` | 0.02 | Level 2 |
-| `max_step` | 0.01 | Level 2 |
-| `convergence` | Reward plateau (1%) | Level 1.5 |
+| `design_lr` | 0.005 (Adam) | Level 2 |
+| `num_eval_worlds` | 512 | Level 2 |
+| `design_optimizer` | Adam | Level 1.5 |
+| Inner convergence | Reward plateau (2%) | Level 1.5 |
+| Outer convergence | L range < 3mm / 5 iters | Level 1.5 |
 | `diff_horizon` | 3 | Level 3 |
 
 ---
@@ -295,7 +303,7 @@ Level 1: Cart-Pole (PyTorch) ---------- DONE
     |   Envelope theorem validated, PGHC converges
     |
 Level 1.5: Cart-Pole (Newton/Warp) ---- DONE
-    |   Vectorized envs, finite-diff gradients, RSL-RL tracking
+    |   Vectorized envs, Adam optimizer, 512-world FD eval, RSL-RL tracking
     |
 Level 2: Ant (Newton/Warp) ------------ YOU ARE HERE
     |   Created but not validated on GPU
@@ -310,5 +318,5 @@ Level 3: G1 Humanoid ------------------ BLOCKED
 
 ---
 
-*Document Version: 3.0*
-*Last Updated: 2026-02-08*
+*Document Version: 4.0*
+*Last Updated: 2026-02-09*

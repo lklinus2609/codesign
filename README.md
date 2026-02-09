@@ -127,7 +127,7 @@ codesign/
 ### PGHC Algorithm
 
 ```
-Initialize: morphology theta, policy pi
+Initialize: morphology theta, policy pi, Adam optimizer for theta
 
 for outer_iteration in range(N):
     # INNER LOOP: Optimize policy at current morphology
@@ -136,24 +136,27 @@ for outer_iteration in range(N):
         Update pi using PPO
 
     # OUTER LOOP: Optimize morphology
-    Compute gradient: g = dReturn/d_theta (with pi FROZEN)
-    theta = theta + clip(lr * g, -max_step, max_step)
+    Compute gradient: g = dReturn/d_theta (with pi FROZEN, vectorized FD eval)
+    Adam step on theta using -g (gradient ascent via negated gradient)
+    Clamp theta to physical bounds
 ```
 
 ### Level 1.5 Hyperparameters (Current)
 
 | Parameter | Value | Description |
 |-----------|-------|-------------|
-| `num_worlds` | 2048 | Parallel environments |
+| `num_worlds` | 2048 | Parallel training environments |
+| `num_eval_worlds` | 512 | Parallel eval environments for FD gradient |
 | `horizon` | 32 | Rollout steps per update |
 | `force_max` | 30 N | Cart force limit |
 | `max_steps` | 500 | Episode length (10s at 50Hz) |
 | `initial_L` | 0.6 m | Initial pole length |
-| `max_step` | 0.01 m | Max design parameter step per outer iter |
+| `design_lr` | 0.005 | Adam learning rate for design params |
 | `desired_kl` | 0.005 | KL target for adaptive LR |
 | `max_lr` | 3e-4 | Learning rate ceiling |
 | `mini_batches` | 8 | Mini-batches per PPO epoch |
-| `convergence` | Reward plateau (<1% change, window=5) | Inner loop stopping criterion |
+| Inner convergence | Reward plateau (<2% change, window=5) | Inner loop stopping criterion |
+| Outer convergence | L range < 3mm over 5 iters | Outer loop stopping criterion |
 
 ### Reward Function (Level 1.5)
 
@@ -188,10 +191,11 @@ r = 1.0*(alive) - 2.0*(terminated) - theta^2 - 0.1*x^2 - 0.01*action^2
 When computing `dReturn/d_theta`, the policy pi must be FROZEN at its optimized state. The gradient flows through the physics dynamics, not the policy.
 
 ### Finite Difference Gradients
-For Newton-based environments, morphology changes require model rebuilding. We use finite difference:
+For Newton-based environments, morphology changes require model rebuilding. We use vectorized finite difference evaluation (512 parallel worlds per perturbation):
 ```
 dReturn/d_theta = (Return(theta+eps) - Return(theta-eps)) / (2*eps)
 ```
+Gradients are fed to an Adam optimizer (not clipped SGD), which normalizes magnitude automatically and uses momentum to smooth noisy estimates.
 
 ### RSL-RL Style Episode Tracking
 Episode stats are tracked from training rollouts using per-world accumulators. No separate evaluation environment is needed.
@@ -207,7 +211,7 @@ python codesign_cartpole_newton_vec.py --wandb --num-worlds 2048
 ## Known Limitations
 
 1. **Newton contact instability**: Differentiable simulation has contact issues. Workaround: short horizon before ground contact.
-2. **Model rebuild cost**: Changing morphology in Newton requires full model rebuild (expensive for gradient computation).
+2. **Model rebuild cost**: Changing morphology in Newton requires full model rebuild. Training env is freed before FD eval and rebuilt after to avoid GPU OOM.
 3. **G1 gradient chain broken**: numpy in parametric_g1.py breaks warp's autograd. Needs Warp kernels for quaternion math.
 4. **Local optima**: PGHC finds local optima. Results depend on initialization.
 

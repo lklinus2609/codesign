@@ -606,6 +606,16 @@ Record significant technical decisions here with date and rationale.
 
 ---
 
+### 2026-02-09: Adam Optimizer for Design Parameters
+
+**Decision**: Replace clipped gradient ascent (`clip(lr * grad, ±max_step)`) with Adam optimizer for outer loop design parameters. Use vectorized FD evaluation (512 worlds per perturbation) instead of 1-world 3-rollout evaluation.
+
+**Rationale**: The old approach produced noise-dominated gradients (~400K magnitude) that were always clipped to ±0.01, making the outer loop a sign-based random walk. Adam normalizes gradient magnitude automatically, uses momentum to smooth noisy estimates, and produces variable step sizes. Vectorized eval reduces standard error ~13x. Training env is freed before FD eval and rebuilt after to prevent GPU OOM.
+
+**Code**: `codesign_cartpole_newton_vec.py: pghc_codesign_vec()`, `compute_design_gradient()`
+
+---
+
 ### Template for New Decisions
 
 ```markdown
@@ -648,8 +658,8 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 | Parameter | Current | Tune At |
 |-----------|---------|---------|
-| `design_lr` | 0.02 | Level 2 (Ant) |
-| `max_step` | 0.01 | Level 2 (Ant) |
+| `design_lr` | 0.005 (Adam) | Level 2 (Ant) |
+| `num_eval_worlds` | 512 | Level 2 (Ant) |
 | `desired_kl` | 0.005 | Level 1.5 (Newton) |
 | `diff_horizon` | 3 | Level 3 (G1 Humanoid) |
 
@@ -664,5 +674,5 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ---
 
-*Document Version: 3.0*
-*Last Updated: 2026-02-08*
+*Document Version: 4.0*
+*Last Updated: 2026-02-09*
