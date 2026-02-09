@@ -802,7 +802,7 @@ def pghc_codesign_vec(
             # Record video every N inner iterations
             if use_wandb and video_every_n_iters > 0 and (inner_iter + 1) % video_every_n_iters == 0:
                 try:
-                    print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.2f}m)...")
+                    print(f"    [wandb] Recording video (iter {inner_iter + 1}, L={parametric_model.L:.4f}m)...")
                     video = record_episode_video(parametric_model.L, policy, max_steps=500)
                     if video is not None:
                         wandb.log({
