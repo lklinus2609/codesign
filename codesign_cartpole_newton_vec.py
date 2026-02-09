@@ -899,7 +899,7 @@ if __name__ == "__main__":
     parser.add_argument("--outer-iters", type=int, default=50, help="Number of outer iterations")
     parser.add_argument("--design-lr", type=float, default=0.005, help="Adam learning rate for design params")
     parser.add_argument("--initial-L", type=float, default=0.6, help="Initial pole length (m)")
-    parser.add_argument("--num-worlds", type=int, default=2048, help="Number of parallel training worlds")
+    parser.add_argument("--num-worlds", type=int, default=1024, help="Number of parallel training worlds")
     parser.add_argument("--num-eval-worlds", type=int, default=512, help="Number of parallel eval worlds for FD gradient")
     parser.add_argument("--video-every", type=int, default=100, help="Record video every N inner iterations (0 to disable)")
     args = parser.parse_args()
