@@ -223,6 +223,7 @@ class Walker2DVecEnv:
         healthy_angle_range: float = 1.0,
         gear_ratio: float = 100.0,
         device: str = "cuda:0",
+        requires_grad: bool = False,
     ):
         if not NEWTON_AVAILABLE:
             raise ImportError("Newton/Warp required.")
@@ -238,6 +239,7 @@ class Walker2DVecEnv:
         self.healthy_z_range = healthy_z_range
         self.healthy_angle_range = healthy_angle_range
         self.gear_ratio = gear_ratio
+        self.requires_grad = requires_grad
 
         if parametric_model is None:
             self.parametric_model = ParametricWalker2D()
@@ -288,7 +290,7 @@ class Walker2DVecEnv:
             builder = newton.ModelBuilder()
             builder.replicate(single_builder, self.num_worlds, spacing=(5.0, 5.0, 0.0))
 
-            self.model = builder.finalize(requires_grad=True)
+            self.model = builder.finalize(requires_grad=self.requires_grad)
 
             # DOF counts per world
             total_joint_q = self.model.joint_q.numpy().shape[0]

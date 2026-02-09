@@ -949,6 +949,8 @@ def pghc_codesign_walker2d_diff(
 
         log_every = 10
         inner_iter = 0
+        crash_count = 0
+        max_crashes = 5
         mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
         reward_buffer = deque(maxlen=200)
         length_buffer = deque(maxlen=200)
@@ -956,8 +958,19 @@ def pghc_codesign_walker2d_diff(
         while True:
             try:
                 rollout = collect_rollout_vec(env, policy, value_net, obs_rms, horizon=horizon)
+                crash_count = 0  # reset on success
             except Exception as e:
-                print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}. Resetting...")
+                crash_count += 1
+                print(f"    [WARN] Physics crash at iter {inner_iter+1}: {type(e).__name__}: {e}")
+                if crash_count >= max_crashes:
+                    print(f"    [ERROR] {max_crashes} consecutive crashes. Rebuilding env...")
+                    env.cleanup()
+                    wp.synchronize()
+                    env = Walker2DVecEnv(
+                        num_worlds=num_worlds,
+                        parametric_model=parametric_model,
+                    )
+                    crash_count = 0
                 wp.synchronize()
                 env.last_obs = None
                 if hasattr(env, 'ep_reward_accum'):
