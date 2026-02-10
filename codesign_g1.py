@@ -25,7 +25,9 @@ os.environ["PYGLET_HEADLESS"] = "1"
 
 import argparse
 import gc
+import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -196,22 +198,57 @@ def compute_forward_loss_kernel(
 # ---------------------------------------------------------------------------
 
 class MimicKitInnerLoop:
-    """Runs MimicKit AMP training as a subprocess."""
+    """Runs MimicKit AMP training as a subprocess with convergence detection."""
 
-    def __init__(self, mimickit_dir, num_envs=4096):
+    # Regex to parse "| Test_Return  |     123.456 |" from MimicKit log tables
+    _RETURN_RE = re.compile(r"\|\s*Test_Return\s*\|\s*([0-9eE.+-]+)\s*\|")
+
+    def __init__(self, mimickit_dir, num_envs=4096,
+                 plateau_threshold=0.02, plateau_window=5, min_outputs=10):
+        """
+        Args:
+            mimickit_dir: path to MimicKit root
+            plateau_threshold: relative change threshold for convergence (0.02 = 2%)
+            plateau_window: number of consecutive log outputs to check for plateau
+            min_outputs: minimum log outputs before allowing early stop
+        """
         self.mimickit_dir = Path(mimickit_dir)
         self.mimickit_src = self.mimickit_dir / "mimickit"
+        self.plateau_threshold = plateau_threshold
+        self.plateau_window = plateau_window
+        self.min_outputs = min_outputs
+
+    def _check_plateau(self, returns):
+        """Check if recent returns have plateaued.
+
+        Returns True if the max relative change over the last plateau_window
+        outputs is below plateau_threshold.
+        """
+        if len(returns) < max(self.plateau_window, self.min_outputs):
+            return False
+
+        recent = returns[-self.plateau_window:]
+        mean_val = np.mean(recent)
+        if abs(mean_val) < 1e-8:
+            return False
+
+        spread = max(recent) - min(recent)
+        rel_change = spread / abs(mean_val)
+        return rel_change < self.plateau_threshold
 
     def run(self, mjcf_modifier, theta_np, out_dir, num_envs=4096,
             max_samples=5_000_000, resume_from=None, logger_type="wandb"):
         """Run MimicKit AMP training with modified G1 morphology.
+
+        Streams subprocess stdout, parses Test_Return, and terminates early
+        when the reward plateaus (relative change < threshold over window).
 
         Args:
             mjcf_modifier: G1MJCFModifier instance
             theta_np: design parameters (6,)
             out_dir: output directory for this outer iteration
             num_envs: number of parallel training environments
-            max_samples: convergence proxy
+            max_samples: max samples safety cap
             resume_from: checkpoint to resume from (speeds up convergence)
             logger_type: "wandb" or "tb"
 
@@ -260,18 +297,73 @@ class MimicKitInnerLoop:
 
         print(f"    [MimicKit] Running: {' '.join(cmd[-8:])}")
 
-        # 4. Run subprocess (cwd = MimicKit root so relative paths in configs
-        #    like motion_file: data/motions/... resolve correctly)
+        # 4. Run subprocess with stdout streaming for convergence detection
+        #    cwd = MimicKit root so relative paths in configs resolve correctly
         env = os.environ.copy()
         env["PYGLET_HEADLESS"] = "1"
-        result = subprocess.run(
+
+        test_returns = []
+        converged = False
+
+        proc = subprocess.Popen(
             cmd,
             cwd=str(self.mimickit_dir),
             env=env,
-            capture_output=False,  # let it print to stdout
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
         )
-        if result.returncode != 0:
-            print(f"    [MimicKit] WARNING: Training subprocess exited with code {result.returncode}")
+
+        try:
+            for line in proc.stdout:
+                # Pass through to our stdout
+                sys.stdout.write(line)
+                sys.stdout.flush()
+
+                # Parse Test_Return from MimicKit log tables
+                m = self._RETURN_RE.search(line)
+                if m:
+                    try:
+                        ret = float(m.group(1))
+                        test_returns.append(ret)
+
+                        if self._check_plateau(test_returns):
+                            n = len(test_returns)
+                            recent = test_returns[-self.plateau_window:]
+                            mean_r = np.mean(recent)
+                            spread = max(recent) - min(recent)
+                            print(f"\n    [MimicKit] CONVERGED after {n} log outputs "
+                                  f"(mean_return={mean_r:.2f}, spread={spread:.3f}, "
+                                  f"rel_change={spread/abs(mean_r):.4f} < {self.plateau_threshold})")
+                            converged = True
+                            proc.terminate()
+                            proc.wait(timeout=30)
+                            break
+                    except ValueError:
+                        pass
+
+        except Exception as e:
+            print(f"    [MimicKit] Stream error: {e}")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+        rc = proc.returncode
+        # -15 = SIGTERM (our termination), 0 = normal exit
+        if rc not in (0, -15, -signal.SIGTERM, None) and not converged:
+            print(f"    [MimicKit] WARNING: Training subprocess exited with code {rc}")
+
+        if test_returns:
+            print(f"    [MimicKit] Final Test_Return: {test_returns[-1]:.2f} "
+                  f"(tracked {len(test_returns)} outputs)")
+        else:
+            print(f"    [MimicKit] WARNING: No Test_Return values parsed from output")
 
         # 5. Return checkpoint path
         checkpoint = out_dir / "training" / "model.pt"
@@ -436,8 +528,10 @@ class DiffG1Eval:
             # Store joint structure info
             self.joints_per_world = self.model.joint_count // self.num_worlds
             self.bodies_per_world = self.model.body_count // self.num_worlds
-            self.joint_q_size = self.model.joint_q_size // self.num_worlds
-            self.joint_qd_size = self.model.joint_qd_size // self.num_worlds
+            total_joint_q = self.model.joint_q.numpy().shape[0]
+            total_joint_qd = self.model.joint_qd.numpy().shape[0]
+            self.joint_q_size = total_joint_q // self.num_worlds
+            self.joint_qd_size = total_joint_qd // self.num_worlds
 
             print(f"    [DiffG1Eval] Model built: {self.joints_per_world} joints/world, "
                   f"{self.bodies_per_world} bodies/world, "
@@ -616,8 +710,8 @@ class DiffG1Eval:
         # Prepare: Initialize state and load actions
         # ---------------------------------------------------------------
         state_0 = self.states[0]
-        total_q = self.model.joint_q_size
-        total_qd = self.model.joint_qd_size
+        total_q = self.model.joint_q.numpy().shape[0]
+        total_qd = self.model.joint_qd.numpy().shape[0]
 
         # Initialize joint_q from pre-computed init, zero joint_qd
         launch_dim = max(total_q, total_qd)
@@ -820,6 +914,9 @@ def pghc_codesign_g1(
     out_dir="output_g1_codesign",
     inner_logger="tb",
     resume_checkpoint=None,
+    plateau_threshold=0.02,
+    plateau_window=5,
+    min_plateau_outputs=10,
 ):
     """PGHC Co-Design for G1 Humanoid with backprop design gradients."""
     print("=" * 70)
@@ -847,6 +944,9 @@ def pghc_codesign_g1(
                 "gradient_method": "backprop",
                 "eval_solver": "SolverSemiImplicit",
                 "train_solver": "SolverMuJoCo (via MimicKit)",
+                "plateau_threshold": plateau_threshold,
+                "plateau_window": plateau_window,
+                "min_plateau_outputs": min_plateau_outputs,
             },
         )
         print(f"  [wandb] Logging enabled")
@@ -859,7 +959,12 @@ def pghc_codesign_g1(
     theta_bounds = (-0.5236, 0.5236)  # ±30 degrees
 
     mjcf_modifier = G1MJCFModifier(str(BASE_MJCF_PATH))
-    inner_loop = MimicKitInnerLoop(str(MIMICKIT_DIR))
+    inner_loop = MimicKitInnerLoop(
+        str(MIMICKIT_DIR),
+        plateau_threshold=plateau_threshold,
+        plateau_window=plateau_window,
+        min_outputs=min_plateau_outputs,
+    )
     design_optimizer = AdamOptimizer(NUM_DESIGN_PARAMS, lr=design_lr)
 
     param_names = [f"theta_{i}_{SYMMETRIC_PAIRS[i][0].replace('_link','')}"
@@ -883,6 +988,8 @@ def pghc_codesign_g1(
     print(f"  Design optimizer:             Adam (lr={design_lr})")
     print(f"  Design params:                {NUM_DESIGN_PARAMS} (symmetric lower-body pairs)")
     print(f"  Theta bounds:                 ±30° (±0.5236 rad)")
+    print(f"  Inner convergence:            plateau <{plateau_threshold*100:.0f}% over {plateau_window} outputs "
+          f"(min {min_plateau_outputs} outputs)")
     print(f"  Initial theta:                all zeros")
     if compare_fd:
         print(f"  FD comparison:                ENABLED")
@@ -1076,7 +1183,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-train-envs", type=int, default=4096)
     parser.add_argument("--num-eval-worlds", type=int, default=8)
     parser.add_argument("--eval-horizon", type=int, default=100)
-    parser.add_argument("--max-inner-samples", type=int, default=5_000_000)
+    parser.add_argument("--max-inner-samples", type=int, default=200_000_000_000)
     parser.add_argument("--out-dir", type=str, default="output_g1_codesign")
     parser.add_argument("--inner-logger", type=str, default="tb",
                         choices=["tb", "wandb"])
@@ -1084,6 +1191,12 @@ if __name__ == "__main__":
                         help="MimicKit checkpoint to resume from")
     parser.add_argument("--compare-fd", action="store_true",
                         help="Also compute FD gradient for comparison (very slow)")
+    parser.add_argument("--plateau-threshold", type=float, default=0.02,
+                        help="Inner convergence: relative change threshold (default: 0.02 = 2%%)")
+    parser.add_argument("--plateau-window", type=int, default=5,
+                        help="Inner convergence: number of log outputs to check (default: 5)")
+    parser.add_argument("--min-plateau-outputs", type=int, default=10,
+                        help="Inner convergence: min log outputs before early stop (default: 10)")
     args = parser.parse_args()
 
     history = pghc_codesign_g1(
@@ -1098,4 +1211,7 @@ if __name__ == "__main__":
         out_dir=args.out_dir,
         inner_logger=args.inner_logger,
         resume_checkpoint=args.resume_checkpoint,
+        plateau_threshold=args.plateau_threshold,
+        plateau_window=args.plateau_window,
+        min_plateau_outputs=args.min_plateau_outputs,
     )
