@@ -123,14 +123,26 @@ class G1MJCFModifier:
     def generate_env_config(self, mjcf_path, base_env_config_path, output_path):
         """Copy env config YAML, replacing char_file with the modified MJCF path.
 
+        All file paths in the config are resolved to absolute so the config
+        works regardless of the consumer's cwd (subprocess or in-process import).
+
         Args:
-            mjcf_path: path to the modified MJCF
+            mjcf_path: path to the modified MJCF (should be absolute)
             base_env_config_path: path to the base amp_g1_env.yaml
             output_path: where to write the modified config
         """
         with open(base_env_config_path, "r") as f:
             config = yaml.safe_load(f)
 
-        config["char_file"] = mjcf_path
+        # Resolve file paths relative to MimicKit root (grandparent of env config dir)
+        base_dir = os.path.dirname(os.path.abspath(base_env_config_path))
+        mimickit_root = os.path.abspath(os.path.join(base_dir, "..", ".."))
+
+        config["char_file"] = os.path.abspath(mjcf_path)
+
+        # Resolve motion_file if present and relative
+        if "motion_file" in config and not os.path.isabs(config["motion_file"]):
+            config["motion_file"] = os.path.join(mimickit_root, config["motion_file"])
+
         with open(output_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)

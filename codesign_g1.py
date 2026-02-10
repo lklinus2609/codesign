@@ -256,16 +256,17 @@ class MimicKitInnerLoop:
         ]
 
         if resume_from is not None and Path(resume_from).exists():
-            cmd.extend(["--model_file", str(resume_from)])
+            cmd.extend(["--model_file", str(Path(resume_from).resolve())])
 
         print(f"    [MimicKit] Running: {' '.join(cmd[-8:])}")
 
-        # 4. Run subprocess
+        # 4. Run subprocess (cwd = MimicKit root so relative paths in configs
+        #    like motion_file: data/motions/... resolve correctly)
         env = os.environ.copy()
         env["PYGLET_HEADLESS"] = "1"
         result = subprocess.run(
             cmd,
-            cwd=str(self.mimickit_src),
+            cwd=str(self.mimickit_dir),
             env=env,
             capture_output=False,  # let it print to stdout
         )
@@ -825,7 +826,7 @@ def pghc_codesign_g1(
     print("PGHC Co-Design for G1 Humanoid (Level 3 — BPTT Gradients)")
     print("=" * 70)
 
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir).resolve()  # Must be absolute — MimicKit subprocess has different cwd
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if use_wandb and WANDB_AVAILABLE:
