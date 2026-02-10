@@ -43,19 +43,21 @@ from envs.walker2d.walker2d_vec_env import Walker2DVecEnv
 # Observation normalization (same as Level 2.1)
 # ---------------------------------------------------------------------------
 
-class RunningMeanStd:
-    """Tracks running mean/variance using Welford's algorithm."""
+class RunningMeanStdCUDA:
+    """Tracks running mean/variance using Welford's algorithm on CUDA tensors."""
 
-    def __init__(self, shape, clip=5.0):
-        self.mean = np.zeros(shape, dtype=np.float64)
-        self.var = np.ones(shape, dtype=np.float64)
+    def __init__(self, shape, clip=5.0, device="cuda:0"):
+        self.mean = torch.zeros(shape, dtype=torch.float64, device=device)
+        self.var = torch.ones(shape, dtype=torch.float64, device=device)
         self.count = 1e-4
         self.clip = clip
+        self.device = device
 
     def update(self, batch):
-        batch = np.asarray(batch, dtype=np.float64)
-        batch_mean = batch.mean(axis=0)
-        batch_var = batch.var(axis=0)
+        """batch: (N, D) CUDA float32 tensor."""
+        batch = batch.double()
+        batch_mean = batch.mean(dim=0)
+        batch_var = batch.var(dim=0)
         batch_count = batch.shape[0]
         delta = batch_mean - self.mean
         total_count = self.count + batch_count
@@ -66,7 +68,12 @@ class RunningMeanStd:
         self.count = total_count
 
     def normalize(self, obs):
-        obs_norm = (obs - self.mean.astype(np.float32)) / np.sqrt(self.var.astype(np.float32) + 1e-8)
+        """obs: (N, D) CUDA float32 tensor. Returns (N, D) CUDA float32 tensor."""
+        return ((obs - self.mean.float()) / torch.sqrt(self.var.float() + 1e-8)).clamp(-self.clip, self.clip)
+
+    def normalize_np(self, obs_np):
+        """Normalize numpy array (for DiffWalker2DEval action pre-collection)."""
+        obs_norm = (obs_np - self.mean.cpu().numpy().astype(np.float32)) / np.sqrt(self.var.cpu().numpy().astype(np.float32) + 1e-8)
         return np.clip(obs_norm, -self.clip, self.clip).astype(np.float32)
 
 
@@ -92,26 +99,28 @@ class Walker2DPolicy(nn.Module):
         return torch.tanh(self.net(x))
 
     def get_action(self, obs, deterministic=False):
+        """obs: CUDA tensor or numpy. Returns CUDA tensor."""
         if isinstance(obs, np.ndarray):
-            obs = torch.FloatTensor(obs)
+            obs = torch.FloatTensor(obs).to(next(self.parameters()).device)
         with torch.no_grad():
             mean = self.forward(obs)
             if deterministic:
-                return mean.numpy()
+                return mean
             std = torch.exp(self.log_std)
             action = mean + std * torch.randn_like(mean)
-            return torch.clamp(action, -1.0, 1.0).numpy()
+            return torch.clamp(action, -1.0, 1.0)
 
     def get_actions_batch(self, obs_batch, deterministic=False):
+        """obs_batch: CUDA tensor or numpy. Returns CUDA tensor."""
         if isinstance(obs_batch, np.ndarray):
-            obs_batch = torch.FloatTensor(obs_batch)
+            obs_batch = torch.FloatTensor(obs_batch).to(next(self.parameters()).device)
         with torch.no_grad():
             mean = self.forward(obs_batch)
             if deterministic:
-                return mean.numpy()
+                return mean
             std = torch.exp(self.log_std)
             actions = mean + std * torch.randn_like(mean)
-            return torch.clamp(actions, -1.0, 1.0).numpy()
+            return torch.clamp(actions, -1.0, 1.0)
 
     def get_action_and_log_prob_batch(self, obs_batch):
         mean = self.forward(obs_batch)
@@ -142,65 +151,67 @@ class Walker2DValue(nn.Module):
 # PPO Training (same as Level 2.1)
 # ---------------------------------------------------------------------------
 
-def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
-    """Collect rollout from vectorized environment."""
-    wp.synchronize()
-
+def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64, device="cuda:0"):
+    """Collect rollout from vectorized environment. All GPU-resident."""
     num_worlds = env.num_worlds
     obs = env.last_obs if hasattr(env, 'last_obs') and env.last_obs is not None else env.reset()
 
     if not hasattr(env, 'ep_reward_accum') or env.ep_reward_accum is None:
-        env.ep_reward_accum = np.zeros(num_worlds)
-        env.ep_length_accum = np.zeros(num_worlds)
+        env.ep_reward_accum = torch.zeros(num_worlds, device=device)
+        env.ep_length_accum = torch.zeros(num_worlds, device=device, dtype=torch.int32)
 
-    all_obs, all_actions, all_rewards = [], [], []
-    all_log_probs, all_dones, all_values = [], [], []
+    # Pre-allocate rollout storage on GPU
+    all_obs = torch.zeros(horizon, num_worlds, env.obs_dim, device=device)
+    all_actions = torch.zeros(horizon, num_worlds, env.act_dim, device=device)
+    all_rewards = torch.zeros(horizon, num_worlds, device=device)
+    all_log_probs = torch.zeros(horizon, num_worlds, device=device)
+    all_dones = torch.zeros(horizon, num_worlds, device=device)
+    all_values = torch.zeros(horizon, num_worlds, device=device)
+
     completed_rewards, completed_lengths = [], []
 
-    for _ in range(horizon):
+    for t in range(horizon):
         obs_rms.update(obs)
         obs_norm = obs_rms.normalize(obs)
 
-        obs_t = torch.FloatTensor(obs_norm)
-        actions, log_probs = policy.get_action_and_log_prob_batch(obs_t)
+        actions, log_probs = policy.get_action_and_log_prob_batch(obs_norm)
         with torch.no_grad():
-            values = value_net(obs_t)
+            values = value_net(obs_norm)
 
-        actions_np = actions.detach().numpy()
-        next_obs, rewards, dones, _ = env.step(actions_np)
+        next_obs, rewards, dones, _ = env.step(actions.detach())
 
-        all_obs.append(obs_norm)
-        all_actions.append(actions.detach())
-        all_rewards.append(rewards)
-        all_log_probs.append(log_probs.detach())
-        all_dones.append(dones)
-        all_values.append(values)
+        all_obs[t] = obs_norm
+        all_actions[t] = actions.detach()
+        all_rewards[t] = rewards
+        all_log_probs[t] = log_probs.detach()
+        all_dones[t] = dones.float()
+        all_values[t] = values
 
+        # Episode tracking on GPU
         env.ep_reward_accum += rewards
         env.ep_length_accum += 1
-
-        for idx in np.where(dones)[0]:
-            completed_rewards.append(env.ep_reward_accum[idx])
-            completed_lengths.append(env.ep_length_accum[idx])
-            env.ep_reward_accum[idx] = 0.0
-            env.ep_length_accum[idx] = 0.0
+        done_mask = dones.bool() if dones.dtype != torch.bool else dones
+        if done_mask.any():
+            completed_rewards.extend(env.ep_reward_accum[done_mask].cpu().tolist())
+            completed_lengths.extend(env.ep_length_accum[done_mask].cpu().float().tolist())
+            env.ep_reward_accum[done_mask] = 0.0
+            env.ep_length_accum[done_mask] = 0
 
         obs = next_obs
 
     env.last_obs = obs
-    wp.synchronize()
 
     obs_norm = obs_rms.normalize(obs)
     with torch.no_grad():
-        last_value = value_net(torch.FloatTensor(obs_norm))
+        last_value = value_net(obs_norm)
 
     return {
-        "observations": torch.FloatTensor(np.array(all_obs)),
-        "actions": torch.stack(all_actions),
-        "rewards": torch.FloatTensor(np.array(all_rewards)),
-        "log_probs": torch.stack(all_log_probs),
-        "dones": torch.FloatTensor(np.array(all_dones)),
-        "values": torch.stack(all_values),
+        "observations": all_obs,
+        "actions": all_actions,
+        "rewards": all_rewards,
+        "log_probs": all_log_probs,
+        "dones": all_dones,
+        "values": all_values,
         "last_value": last_value,
         "completed_rewards": completed_rewards,
         "completed_lengths": completed_lengths,
@@ -210,7 +221,8 @@ def collect_rollout_vec(env, policy, value_net, obs_rms, horizon=64):
 def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
                    gamma=0.99, gae_lambda=0.95, value_coeff=0.5, entropy_coeff=0.01,
                    num_mini_batches=8, desired_kl=0.008):
-    """PPO update with GAE, mini-batches, and adaptive LR."""
+    """PPO update with GAE, mini-batches, and adaptive LR. All tensors on CUDA."""
+    device = rollout["rewards"].device
     H, N = rollout["rewards"].shape
     rewards = rollout["rewards"]
     dones = rollout["dones"]
@@ -218,8 +230,8 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     last_value = rollout["last_value"]
 
     with torch.no_grad():
-        advantages = torch.zeros(H, N)
-        last_gae = torch.zeros(N)
+        advantages = torch.zeros(H, N, device=device)
+        last_gae = torch.zeros(N, device=device)
         for t in reversed(range(H)):
             next_value = last_value if t == H - 1 else values[t + 1]
             delta = rewards[t] + gamma * next_value * (1 - dones[t]) - values[t]
@@ -240,7 +252,7 @@ def ppo_update_vec(policy, value_net, optimizer, rollout, n_epochs=5, clip_ratio
     mean_kl = 0.0
 
     for epoch in range(n_epochs):
-        perm = torch.randperm(total_samples)
+        perm = torch.randperm(total_samples, device=device)
         for mb in range(num_mini_batches):
             idx = perm[mb * mini_batch_size : (mb + 1) * mini_batch_size]
 
@@ -572,11 +584,14 @@ class DiffWalker2DEval:
             wp.synchronize()
 
             obs_np = self.obs_wp.numpy()
-            obs_norm = obs_rms.normalize(obs_np)
-            actions_np = policy.get_actions_batch(obs_norm, deterministic=True)
+            obs_norm = obs_rms.normalize_np(obs_np)
+            # Policy is on CUDA — send obs there, get actions back
+            obs_t = torch.FloatTensor(obs_norm).to(next(policy.parameters()).device)
+            actions_t = policy.get_actions_batch(obs_t, deterministic=True)
+            actions_np = actions_t.cpu().numpy().astype(np.float64)
 
             # Store actions
-            self._actions_cpu.numpy()[:] = actions_np.astype(np.float64)
+            self._actions_cpu.numpy()[:] = actions_np
             wp.copy(self.pre_actions[step], self._actions_cpu)
 
             # Step forward (non-tape, using SemiImplicit solver for consistency)
@@ -730,6 +745,7 @@ class DiffWalker2DEval:
 
 def compute_fd_gradient(parametric_model, policy, obs_rms, eps=0.02, num_eval_worlds=64):
     """Finite-difference gradient for 2 design params (for validation only)."""
+    device = next(policy.parameters()).device
     param_names = ["thigh_length", "leg_length"]
     current_vals = {name: getattr(parametric_model, name) for name in param_names}
 
@@ -745,20 +761,21 @@ def compute_fd_gradient(parametric_model, policy, obs_rms, eps=0.02, num_eval_wo
             num_worlds=num_eval_worlds,
         )
         wp.synchronize()
-        obs = env.reset()
-        episode_rewards = np.zeros(num_eval_worlds)
-        completed = np.zeros(num_eval_worlds, dtype=bool)
+        obs = env.reset()  # CUDA tensor
+        episode_rewards = torch.zeros(num_eval_worlds, device=device)
+        completed = torch.zeros(num_eval_worlds, dtype=torch.bool, device=device)
         for step in range(env.max_steps):
             obs_input = obs_rms.normalize(obs) if obs_rms is not None else obs
             actions = policy.get_actions_batch(obs_input, deterministic=True)
             obs, rewards, dones, _ = env.step(actions)
-            episode_rewards += rewards * (~completed)
-            completed = completed | dones
+            done_mask = dones.bool() if dones.dtype != torch.bool else dones
+            episode_rewards += rewards * (~completed).float()
+            completed = completed | done_mask
         env.cleanup()
         wp.synchronize()
         for name, val in current_vals.items():
             setattr(parametric_model, name, val)
-        return np.mean(episode_rewards)
+        return episode_rewards.mean().item()
 
     gradients = {}
     for name in param_names:
@@ -875,18 +892,20 @@ def pghc_codesign_walker2d_diff(
         foot_length=fixed_foot_length,
     )
 
+    device = torch.device("cuda:0")
+
     env = Walker2DVecEnv(
         num_worlds=num_worlds,
         parametric_model=parametric_model,
     )
 
-    policy = Walker2DPolicy()
-    value_net = Walker2DValue()
+    policy = Walker2DPolicy().to(device)
+    value_net = Walker2DValue().to(device)
     optimizer = optim.Adam(
         list(policy.parameters()) + list(value_net.parameters()), lr=3e-4
     )
 
-    obs_rms = RunningMeanStd(shape=(17,))
+    obs_rms = RunningMeanStdCUDA(shape=(17,), device=device)
     stability_gate = StabilityGate(rel_threshold=0.02, min_inner_iters=0, stable_iters_required=50)
 
     param_names = ["thigh_length", "leg_length"]
@@ -957,7 +976,7 @@ def pghc_codesign_walker2d_diff(
 
         while True:
             try:
-                rollout = collect_rollout_vec(env, policy, value_net, obs_rms, horizon=horizon)
+                rollout = collect_rollout_vec(env, policy, value_net, obs_rms, horizon=horizon, device=device)
                 crash_count = 0  # reset on success
             except Exception as e:
                 crash_count += 1

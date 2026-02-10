@@ -20,6 +20,7 @@ Usage:
 """
 
 import numpy as np
+import torch
 import tempfile
 import os
 
@@ -332,7 +333,6 @@ class Walker2DVecEnv:
         self.steps_wp = wp.zeros(self.num_worlds, dtype=int, device=self.device)
         self.prev_rootx_wp = wp.zeros(self.num_worlds, dtype=float, device=self.device)
 
-        self._actions_cpu = wp.zeros((self.num_worlds, self.act_dim), dtype=float, device="cpu")
         self._actions_gpu = wp.zeros((self.num_worlds, self.act_dim), dtype=float, device=self.device)
 
         # Cache ArticulationView attributes
@@ -379,7 +379,7 @@ class Walker2DVecEnv:
                      'state_0', 'state_1', 'control', 'solver', 'artic_view',
                      'model', 'contacts', 'obs_wp', 'rewards_wp', 'dones_wp',
                      'steps_wp', 'prev_rootx_wp',
-                     '_actions_cpu', '_actions_gpu'):
+                     '_actions_gpu'):
             if hasattr(self, attr):
                 delattr(self, attr)
         import gc
@@ -392,11 +392,13 @@ class Walker2DVecEnv:
         wp.launch(extract_obs_kernel, dim=self.num_worlds,
                   inputs=[joint_q, joint_qd, self.obs_wp])
 
-    def _get_obs(self) -> np.ndarray:
+    def _get_obs_torch(self) -> torch.Tensor:
+        """Extract obs to GPU warp buffer, return as CUDA float32 tensor."""
         self._extract_obs_to_gpu()
-        return self.obs_wp.numpy()
+        wp.synchronize()
+        return wp.to_torch(self.obs_wp).float()
 
-    def reset(self) -> np.ndarray:
+    def reset(self) -> torch.Tensor:
         wp.synchronize()
 
         self.steps_wp.zero_()
@@ -416,9 +418,8 @@ class Walker2DVecEnv:
         wp.copy(joint_qd_1, joint_qd)
 
         self._propagate_state()
-        wp.synchronize()
 
-        return self._get_obs()
+        return self._get_obs_torch()
 
     def _propagate_state(self):
         wp.synchronize()
@@ -430,11 +431,21 @@ class Walker2DVecEnv:
         self.state_0, self.state_1 = self.state_1, self.state_0
         wp.synchronize()
 
-    def step(self, actions: np.ndarray):
-        """Step all environments in parallel."""
-        actions = np.asarray(actions, dtype=np.float64).reshape(self.num_worlds, self.act_dim)
-        self._actions_cpu.numpy()[:] = actions
-        wp.copy(self._actions_gpu, self._actions_cpu)
+    def step(self, actions: torch.Tensor):
+        """Step all environments in parallel.
+
+        Args:
+            actions: (num_worlds, 6) CUDA float32 tensor with values in [-1, 1]
+
+        Returns:
+            obs: (num_worlds, 17) CUDA float32 tensor
+            rewards: (num_worlds,) CUDA float32 tensor
+            dones: (num_worlds,) CUDA int32 tensor (0 or 1)
+            infos: dict (requires sync for CPU-side stats)
+        """
+        # Convert torch CUDA → warp GPU (zero-copy for same device)
+        actions_wp = wp.from_torch(actions.double())
+        wp.copy(self._actions_gpu, actions_wp)
 
         # Set torques
         joint_f = self._get_joint_f()
@@ -442,10 +453,10 @@ class Walker2DVecEnv:
                   inputs=[self._actions_gpu, self.gear_ratio, joint_f,
                           self.act_dim, 3])  # 3 root DOFs
 
-        # Physics substeps
+        # Physics substeps — collide once per macro step (not per substep)
+        self.contacts = self.model.collide(self.state_0)
         for _ in range(self.num_substeps):
             self.state_0.clear_forces()
-            self.contacts = self.model.collide(self.state_0)
             self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sub_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
@@ -473,29 +484,22 @@ class Walker2DVecEnv:
         wp.copy(self._get_joint_q(self.state_1), joint_q)
         wp.copy(self._get_joint_qd(self.state_1), joint_qd)
 
-        # Extract obs
+        # Extract obs and return as CUDA tensors (zero-copy via wp.to_torch)
         self._extract_obs_to_gpu()
-
-        # Transfer to CPU
         wp.synchronize()
-        obs_np = self.obs_wp.numpy()
-        rewards_np = self.rewards_wp.numpy()
-        dones_np = self.dones_wp.numpy().astype(bool)
 
-        infos = {
-            "mean_reward": float(np.mean(rewards_np)),
-            "num_dones": int(np.sum(dones_np)),
-            "thigh_length": self.parametric_model.thigh_length,
-            "leg_length": self.parametric_model.leg_length,
-            "foot_length": self.parametric_model.foot_length,
-        }
+        obs_torch = wp.to_torch(self.obs_wp).float()        # (N, 17) CUDA float32
+        rew_torch = wp.to_torch(self.rewards_wp).float()     # (N,) CUDA float32
+        done_torch = wp.to_torch(self.dones_wp)              # (N,) CUDA int32
+
+        infos = {}
 
         self._gc_counter += 1
-        if self._gc_counter % 100 == 0:
+        if self._gc_counter % 50 == 0:
             import gc
             gc.collect()
 
-        return obs_np, rewards_np, dones_np, infos
+        return obs_torch, rew_torch, done_torch, infos
 
 
 def test_vec_env():
@@ -504,6 +508,7 @@ def test_vec_env():
     print("=" * 50)
 
     num_worlds = 64
+    device = torch.device("cuda:0")
     env = Walker2DVecEnv(num_worlds=num_worlds)
 
     print(f"Num worlds: {num_worlds}")
@@ -513,29 +518,29 @@ def test_vec_env():
     print(f"Bodies per world: {env.num_bodies_per_world}")
 
     obs = env.reset()
-    print(f"\nInitial obs shape: {obs.shape}")
-    print(f"Initial obs mean: {obs.mean(axis=0)[:5]}...")
+    print(f"\nInitial obs shape: {obs.shape}, device: {obs.device}")
 
-    total_rewards = np.zeros(num_worlds)
+    total_rewards = torch.zeros(num_worlds, device=device)
     n_steps = 200
 
     import time
     start = time.time()
 
     for step in range(n_steps):
-        actions = np.random.uniform(-1, 1, size=(num_worlds, 6))
+        actions = torch.rand(num_worlds, 6, device=device) * 2 - 1
         obs, rewards, dones, infos = env.step(actions)
         total_rewards += rewards
 
         if step % 50 == 0:
-            print(f"Step {step}: mean_reward={infos['mean_reward']:.3f}, dones={infos['num_dones']}")
+            print(f"Step {step}: mean_reward={rewards.mean().item():.3f}, "
+                  f"dones={dones.sum().item()}")
 
     elapsed = time.time() - start
     fps = (n_steps * num_worlds) / elapsed
 
     print(f"\nTotal time: {elapsed:.2f}s")
     print(f"Throughput: {fps:.0f} steps/sec ({num_worlds} worlds x {n_steps} steps)")
-    print(f"Mean total reward: {total_rewards.mean():.1f}")
+    print(f"Mean total reward: {total_rewards.mean().item():.1f}")
     print("\nVectorized Walker2D environment test complete!")
 
     env.cleanup()
