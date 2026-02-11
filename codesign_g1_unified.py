@@ -184,12 +184,14 @@ class InnerLoopController:
     """Drives MimicKit agent._train_iter() with convergence detection."""
 
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
-                 min_plateau_outputs=10, max_samples=200_000_000):
+                 min_plateau_outputs=10, max_samples=200_000_000,
+                 use_wandb=False):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
         self.min_plateau_outputs = min_plateau_outputs
         self.max_samples = max_samples
+        self.use_wandb = use_wandb
 
     def _check_plateau(self, returns):
         n_required = max(self.plateau_window, self.min_plateau_outputs)
@@ -238,6 +240,18 @@ class InnerLoopController:
             agent._log_train_info(train_info, test_info, env_diag_info,
                                   start_time)
             agent._logger.print_log()
+
+            # wandb: forward all inner loop metrics
+            if self.use_wandb:
+                wlog = {}
+                for k, entry in agent._logger.log_current_row.items():
+                    v = entry.val
+                    try:
+                        wlog[f"inner/{k}"] = float(v)
+                    except (TypeError, ValueError):
+                        pass
+                if wlog:
+                    wandb.log(wlog)
 
             if output_iter:
                 agent._logger.write_log()
@@ -397,6 +411,7 @@ def pghc_codesign_g1_unified(args):
         plateau_window=args.plateau_window,
         min_plateau_outputs=args.min_plateau_outputs,
         max_samples=args.max_inner_samples,
+        use_wandb=use_wandb,
     )
 
     history = {
