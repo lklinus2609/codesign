@@ -503,6 +503,7 @@ def pghc_codesign_g1_unified(args):
     history = {
         "theta": [theta.copy()],
         "forward_dist": [],
+        "cot": [],
         "gradients": [],
         "inner_times": [],
     }
@@ -566,14 +567,16 @@ def pghc_codesign_g1_unified(args):
         diff_eval.theta_np = theta.copy()
         diff_eval.theta_wp.assign(theta.astype(np.float64))
 
-        grad_theta, fwd_dist = diff_eval.compute_gradient(actions_list)
+        grad_theta, fwd_dist, cot = diff_eval.compute_gradient(actions_list)
 
         print(f"    BPTT gradients:")
         for i, name in enumerate(param_names):
             print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
         print(f"    Forward distance = {fwd_dist:.3f} m")
+        print(f"    Cost of Transport = {cot:.4f}")
 
         history["forward_dist"].append(fwd_dist)
+        history["cot"].append(cot)
         history["gradients"].append(grad_theta.copy())
 
         # ----- Design Update -----
@@ -605,6 +608,7 @@ def pghc_codesign_g1_unified(args):
             log_dict = {
                 "outer/iteration": outer_iter + 1,
                 "outer/eval_forward_distance": fwd_dist,
+                "outer/cot": cot,
                 "outer/inner_time_min": inner_time / 60.0,
                 "outer/grad_norm": np.linalg.norm(grad_theta),
             }
@@ -644,6 +648,9 @@ def pghc_codesign_g1_unified(args):
     if history["forward_dist"]:
         print(f"\nForward distance: {history['forward_dist'][0]:.3f} -> "
               f"{history['forward_dist'][-1]:.3f} m")
+    if history["cot"]:
+        print(f"Cost of Transport: {history['cot'][0]:.4f} -> "
+              f"{history['cot'][-1]:.4f}")
 
     total_time = sum(history["inner_times"])
     print(f"Total inner loop time: {total_time / 3600:.1f} hours")

@@ -172,6 +172,63 @@ def compute_forward_loss_kernel(
         loss[0] = -total / float(num_worlds)
 
 
+@wp.kernel
+def accumulate_qd_energy_kernel(
+    joint_qd: wp.array(dtype=float),
+    energy_buf: wp.array(dtype=float),
+    qd_dof_start: int,
+    num_act_dofs: int,
+    total_qd_per_world: int,
+    num_worlds: int,
+    sub_dt: float,
+):
+    """Accumulate ||qd_actuated||^2 * sub_dt / num_worlds into energy_buf[0].
+
+    Called once per substep (inside tape). Single-threaded — 32 worlds x ~30 DOFs
+    is trivial.
+    """
+    tid = wp.tid()
+    if tid == 0:
+        total = float(0.0)
+        for w in range(num_worlds):
+            base = w * total_qd_per_world + qd_dof_start
+            for d in range(num_act_dofs):
+                qd_val = joint_qd[base + d]
+                total = total + qd_val * qd_val
+        energy_buf[0] = energy_buf[0] + total * sub_dt / float(num_worlds)
+
+
+@wp.kernel
+def compute_cot_loss_kernel(
+    body_q_final: wp.array(dtype=float),
+    body_q_initial: wp.array(dtype=float),
+    num_bodies_per_world: int,
+    energy_buf: wp.array(dtype=float),
+    total_mass: float,
+    loss: wp.array(dtype=float),
+    fwd_dist_buf: wp.array(dtype=float),
+    num_worlds: int,
+):
+    """loss = CoT = energy / (m * g * d).
+
+    Also writes mean forward distance to fwd_dist_buf for logging.
+    """
+    tid = wp.tid()
+    if tid == 0:
+        total_dist = float(0.0)
+        for w in range(num_worlds):
+            stride = w * num_bodies_per_world * 7
+            x_final = body_q_final[stride]
+            x_initial = body_q_initial[stride]
+            total_dist = total_dist + (x_final - x_initial)
+        mean_dist = total_dist / float(num_worlds)
+        fwd_dist_buf[0] = mean_dist
+
+        # Clamp distance to avoid div-by-zero
+        safe_dist = wp.max(mean_dist, 0.1)
+        loss[0] = energy_buf[0] / (total_mass * 9.81 * safe_dist)
+
+
 # ---------------------------------------------------------------------------
 # Action collection via MimicKit (programmatic import)
 # ---------------------------------------------------------------------------
@@ -445,6 +502,17 @@ class DiffG1Eval:
         # Loss buffer
         self.loss_buf = wp.zeros(1, dtype=float, requires_grad=True, device=self.device)
 
+        # Energy accumulation buffer (CoT numerator)
+        self.energy_buf = wp.zeros(1, dtype=float, requires_grad=True, device=self.device)
+
+        # Forward distance buffer (for logging, not differentiated)
+        self.fwd_dist_buf = wp.zeros(1, dtype=float, device=self.device)
+
+        # Total mass of one robot (for CoT denominator)
+        body_mass_np = self.model.body_mass.numpy()
+        self.total_mass = float(body_mass_np[:self.bodies_per_world].sum())
+        print(f"    [DiffG1Eval] Total robot mass = {self.total_mass:.2f} kg")
+
         # Initial body_q snapshot (flat, matching model.body_q layout)
         body_q_size = self.model.body_count * 7
         self.body_q_initial = wp.zeros(
@@ -474,16 +542,19 @@ class DiffG1Eval:
         del init_state
 
     def compute_gradient(self, actions_list):
-        """Compute ∂reward/∂theta via BPTT.
+        """Compute ∂CoT/∂theta via BPTT and return negative gradient for ascent.
+
+        CoT = Energy / (m * g * d), where Energy = mean(Σ ||qd_actuated||² * dt).
 
         Args:
             actions_list: list of (num_worlds, act_dim) numpy arrays, one per timestep.
                           act_dim should match self.num_act_dofs.
 
         Returns:
-            (grad_theta_np, mean_forward_dist)
-            grad_theta_np: (6,) numpy array of reward gradients w.r.t. theta
+            (grad_theta_np, mean_forward_dist, cot_value)
+            grad_theta_np: (6,) numpy array of -∂CoT/∂theta (for gradient ascent)
             mean_forward_dist: scalar, mean forward distance achieved
+            cot_value: scalar, Cost of Transport
         """
         wp.synchronize()
 
@@ -528,6 +599,7 @@ class DiffG1Eval:
         # Phase 2: Replay on tape for gradients
         # ---------------------------------------------------------------
         self.loss_buf.zero_()
+        self.energy_buf.zero_()
 
         tape = wp.Tape()
         with tape:
@@ -578,33 +650,55 @@ class DiffG1Eval:
                     contacts = self.model.collide(src)
                     self.solver.step(src, dst, self.control, contacts, self.sub_dt)
 
+                    # Accumulate joint velocity energy on tape
+                    wp.launch(
+                        accumulate_qd_energy_kernel,
+                        dim=1,
+                        inputs=[
+                            dst.joint_qd,
+                            self.energy_buf,
+                            self.qd_dof_start,
+                            self.num_act_dofs,
+                            self.total_qd_per_world,
+                            self.num_worlds,
+                            self.sub_dt,
+                        ],
+                    )
+
                     physics_step += 1
 
-            # Compute loss: -mean(forward distance)
+            # Compute loss: CoT = energy / (m * g * d)
             final_state = self.states[physics_step]
             wp.launch(
-                compute_forward_loss_kernel,
+                compute_cot_loss_kernel,
                 dim=1,
                 inputs=[
                     final_state.body_q,
                     self.body_q_initial,
                     self.bodies_per_world,
+                    self.energy_buf,
+                    self.total_mass,
                     self.loss_buf,
+                    self.fwd_dist_buf,
                     self.num_worlds,
                 ],
             )
 
-        # Get loss value
+        # Get loss value (CoT) and forward distance
         wp.synchronize()
-        loss_val = self.loss_buf.numpy()[0]
-        mean_forward_dist = -loss_val  # loss = -mean(fwd_dist)
+        cot_val = self.loss_buf.numpy()[0]
+        mean_forward_dist = float(self.fwd_dist_buf.numpy()[0])
+        energy_val = float(self.energy_buf.numpy()[0])
 
-        if np.isnan(loss_val) or np.isinf(loss_val):
-            print("    [WARN] Loss is NaN/Inf, skipping backward")
+        print(f"    [DiffG1Eval] energy={energy_val:.4f}, "
+              f"fwd_dist={mean_forward_dist:.4f}, CoT={cot_val:.4f}")
+
+        if np.isnan(cot_val) or np.isinf(cot_val):
+            print("    [WARN] CoT is NaN/Inf, skipping backward")
             tape.zero()
-            return np.zeros(NUM_DESIGN_PARAMS), 0.0
+            return np.zeros(NUM_DESIGN_PARAMS), 0.0, float('inf')
 
-        # Backward
+        # Backward: minimize CoT
         tape.backward(self.loss_buf)
         wp.synchronize()
 
@@ -615,12 +709,12 @@ class DiffG1Eval:
         if theta_grad is None:
             print("    [WARN] No theta gradient available")
             tape.zero()
-            return np.zeros(NUM_DESIGN_PARAMS), mean_forward_dist
+            return np.zeros(NUM_DESIGN_PARAMS), mean_forward_dist, float(cot_val)
 
         grad_np = theta_grad.numpy().copy()
 
-        # loss = -mean(fwd_dist), reward = -loss
-        # ∂reward/∂theta = -∂loss/∂theta = -grad_np
+        # loss = CoT → minimize CoT
+        # reward_grad = -∂loss/∂theta (gradient ascent on -CoT = descent on CoT)
         reward_grad = -grad_np
 
         # Clip gradients
@@ -629,14 +723,15 @@ class DiffG1Eval:
 
         tape.zero()
 
-        return reward_grad.astype(np.float64), float(mean_forward_dist)
+        return reward_grad.astype(np.float64), float(mean_forward_dist), float(cot_val)
 
     def cleanup(self):
         """Free GPU resources."""
         for attr in ('states', 'model', 'solver', 'control',
-                     'pre_actions', 'loss_buf', 'body_q_initial',
-                     'theta_wp', 'base_quats_wp', 'joint_local_indices_wp',
-                     'param_for_joint_wp', 'init_qpos_wp'):
+                     'pre_actions', 'loss_buf', 'energy_buf', 'fwd_dist_buf',
+                     'body_q_initial', 'theta_wp', 'base_quats_wp',
+                     'joint_local_indices_wp', 'param_for_joint_wp',
+                     'init_qpos_wp'):
             if hasattr(self, attr):
                 try:
                     delattr(self, attr)
@@ -704,16 +799,18 @@ def main():
         num_substeps=8,
     )
 
-    grad_theta, fwd_dist = diff_eval.compute_gradient(actions_list)
+    grad_theta, fwd_dist, cot_val = diff_eval.compute_gradient(actions_list)
 
     print(f"    BPTT gradient: {grad_theta}")
     print(f"    Forward distance: {fwd_dist:.4f} m")
+    print(f"    Cost of Transport: {cot_val:.4f}")
 
     # ----- Save results -----
     np.savez(
         args.output_file,
         grad_theta=grad_theta,
         fwd_dist=np.array(fwd_dist),
+        cot=np.array(cot_val),
     )
     print(f"  [EvalWorker] Results saved to {args.output_file}")
 
