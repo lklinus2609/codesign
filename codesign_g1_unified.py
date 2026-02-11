@@ -208,6 +208,7 @@ class InnerLoopController:
         Returns (converged: bool, test_returns: list[float]).
         """
         agent = self.agent
+        env = agent._env
         out_dir = Path(out_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         checkpoint_path = str(out_dir / "model.pt")
@@ -218,16 +219,28 @@ class InnerLoopController:
 
         test_returns = []
         converged = False
+        start_time = time.time()
+        test_info = None
 
         while agent._sample_count < self.max_samples:
-            agent._train_iter()
+            train_info = agent._train_iter()
             agent._sample_count = agent._update_sample_count()
 
-            if agent._iter % agent._iters_per_output == 0:
+            output_iter = (agent._iter % agent._iters_per_output == 0)
+
+            if output_iter:
                 test_info = agent.test_model(agent._test_episodes)
                 mean_ret = test_info["mean_return"]
                 test_returns.append(mean_ret)
 
+            # MimicKit native logging: populate logger + print every iter
+            env_diag_info = env.get_diagnostics()
+            agent._log_train_info(train_info, test_info, env_diag_info,
+                                  start_time)
+            agent._logger.print_log()
+
+            if output_iter:
+                agent._logger.write_log()
                 agent.save(checkpoint_path)
 
                 if self._check_plateau(test_returns):
@@ -241,9 +254,6 @@ class InnerLoopController:
                 # Reset after test (matches MimicKit train_model behavior)
                 agent._train_return_tracker.reset()
                 agent._curr_obs, agent._curr_info = agent._reset_envs()
-
-            # Print MimicKit's native formatted log every iteration
-            agent._logger.write_log()
 
             agent._iter += 1
 
