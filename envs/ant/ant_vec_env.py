@@ -57,50 +57,44 @@ def set_joint_torques_kernel(
 
 @wp.kernel
 def extract_obs_kernel(
-    body_q: wp.array2d(dtype=float),
-    body_qd: wp.array2d(dtype=float),
     joint_q: wp.array2d(dtype=float),
     joint_qd: wp.array2d(dtype=float),
     obs: wp.array2d(dtype=float),
-    num_bodies: int,
 ):
     """Extract 27D observation per world.
 
-    Obs layout:
-      [0]     torso z position (1)
-      [1:5]   torso orientation quaternion (4) -- from body_q[torso, 3:7]
-      [5:13]  joint angles (8) -- from joint_q[7:]
-      [13:19] torso linear + angular velocity (6) -- from body_qd[torso, :]
-      [19:27] joint velocities (8) -- from joint_qd[6:]
+    Uses joint_q/joint_qd (always flat float) instead of body_q/body_qd.
+    For a free-base robot, joint_q[0:7] = [x,y,z,qw,qx,qy,qz] matches
+    body_q[torso], and joint_qd[0:6] matches body_qd[torso].
 
-    body_q layout per body: [x, y, z, qw, qx, qy, qz] = 7 floats
-    body_qd layout per body: [wx, wy, wz, vx, vy, vz] = 6 floats
+    Obs layout:
+      [0]     torso z position (1)        -- joint_q[2]
+      [1:5]   torso orientation quat (4)   -- joint_q[3:7]
+      [5:13]  joint angles (8)             -- joint_q[7:15]
+      [13:19] torso velocity (6)           -- joint_qd[0:6]
+      [19:27] joint velocities (8)         -- joint_qd[6:14]
+
     joint_q: 7 free-root + 8 hinge = 15 per world
     joint_qd: 6 free-root + 8 hinge = 14 per world
     """
     tid = wp.tid()
 
-    # Torso is body index 0 for this world
-    # body_q is (num_worlds * num_bodies, 7) flattened or (num_worlds, num_bodies * 7)
-    # With ArticulationView, body_q is (num_worlds, num_bodies * 7)
-    torso_offset = 0  # First body
+    # Torso z position (joint_q[2] = z)
+    obs[tid, 0] = joint_q[tid, 2]
 
-    # Torso z position
-    obs[tid, 0] = body_q[tid, torso_offset * 7 + 2]
-
-    # Torso orientation quaternion (w, x, y, z)
-    obs[tid, 1] = body_q[tid, torso_offset * 7 + 3]
-    obs[tid, 2] = body_q[tid, torso_offset * 7 + 4]
-    obs[tid, 3] = body_q[tid, torso_offset * 7 + 5]
-    obs[tid, 4] = body_q[tid, torso_offset * 7 + 6]
+    # Torso orientation quaternion (joint_q[3:7] = qw, qx, qy, qz)
+    obs[tid, 1] = joint_q[tid, 3]
+    obs[tid, 2] = joint_q[tid, 4]
+    obs[tid, 3] = joint_q[tid, 5]
+    obs[tid, 4] = joint_q[tid, 6]
 
     # Joint angles (8 actuated joints, skip 7 free-root q-coords)
     for i in range(8):
         obs[tid, 5 + i] = joint_q[tid, 7 + i]
 
-    # Torso velocity (6D: angular wx,wy,wz then linear vx,vy,vz from body_qd)
+    # Torso velocity (6D: angular+linear from joint_qd[0:6])
     for i in range(6):
-        obs[tid, 13 + i] = body_qd[tid, torso_offset * 6 + i]
+        obs[tid, 13 + i] = joint_qd[tid, i]
 
     # Joint velocities (8 actuated, skip 6 free-root qd-coords)
     for i in range(8):
@@ -109,7 +103,7 @@ def extract_obs_kernel(
 
 @wp.kernel
 def step_rewards_done_kernel(
-    body_q: wp.array2d(dtype=float),
+    joint_q: wp.array2d(dtype=float),
     prev_x: wp.array(dtype=float),
     actions: wp.array2d(dtype=float),
     steps: wp.array(dtype=int),
@@ -129,9 +123,9 @@ def step_rewards_done_kernel(
 
     steps[tid] = steps[tid] + 1
 
-    # Torso x and z (body_q: [x, y, z, qw, qx, qy, qz] per body)
-    torso_x = body_q[tid, 0]
-    torso_z = body_q[tid, 2]
+    # Torso x and z (joint_q: [x, y, z, qw, qx, qy, qz, ...] per world)
+    torso_x = joint_q[tid, 0]
+    torso_z = joint_q[tid, 2]
 
     # Forward velocity reward
     x_before = prev_x[tid]
@@ -420,14 +414,6 @@ class AntVecEnv:
                 id(s1): self.artic_view.get_attribute("joint_qd", s1),
             }
             self._joint_f = self.artic_view.get_attribute("joint_f", self.control)
-            self._body_q = {
-                id(s0): self.artic_view.get_attribute("body_q", s0),
-                id(s1): self.artic_view.get_attribute("body_q", s1),
-            }
-            self._body_qd = {
-                id(s0): self.artic_view.get_attribute("body_qd", s0),
-                id(s1): self.artic_view.get_attribute("body_qd", s1),
-            }
         else:
             # Fallback: reshape raw model arrays manually
             self._cache_raw_views()
@@ -440,8 +426,6 @@ class AntVecEnv:
         self._joint_q = None
         self._joint_qd = None
         self._joint_f = None
-        self._body_q = None
-        self._body_qd = None
 
     def _get_joint_q(self, state):
         """Get (num_worlds, num_joint_q_per_world) view of joint_q."""
@@ -462,21 +446,9 @@ class AntVecEnv:
             return self._joint_f
         return self.control.joint_f.reshape((self.num_worlds, self.num_joint_qd_per_world))
 
-    def _get_body_q(self, state):
-        """Get (num_worlds, num_bodies * 7) view of body_q."""
-        if self._body_q is not None:
-            return self._body_q[id(state)]
-        return state.body_q.reshape((self.num_worlds, self.num_bodies_per_world * 7))
-
-    def _get_body_qd(self, state):
-        """Get (num_worlds, num_bodies * 6) view of body_qd."""
-        if self._body_qd is not None:
-            return self._body_qd[id(state)]
-        return state.body_qd.reshape((self.num_worlds, self.num_bodies_per_world * 6))
-
     def cleanup(self):
         """Free GPU resources before rebuilding."""
-        for attr in ('_joint_q', '_joint_qd', '_joint_f', '_body_q', '_body_qd',
+        for attr in ('_joint_q', '_joint_qd', '_joint_f',
                      'state_0', 'state_1', 'control', 'solver', 'artic_view',
                      'model', 'contacts', 'obs_wp', 'rewards_wp', 'dones_wp',
                      'steps_wp', 'prev_x_wp',
@@ -489,14 +461,11 @@ class AntVecEnv:
 
     def _extract_obs_to_gpu(self):
         """Extract observations into self.obs_wp on GPU (no CPU transfer)."""
-        body_q = self._get_body_q(self.state_0)
-        body_qd = self._get_body_qd(self.state_0)
         joint_q = self._get_joint_q(self.state_0)
         joint_qd = self._get_joint_qd(self.state_0)
 
         wp.launch(extract_obs_kernel, dim=self.num_worlds,
-                  inputs=[body_q, body_qd, joint_q, joint_qd, self.obs_wp,
-                          self.num_bodies_per_world])
+                  inputs=[joint_q, joint_qd, self.obs_wp])
 
     def _get_obs(self) -> np.ndarray:
         """Get observations as numpy."""
@@ -579,9 +548,9 @@ class AntVecEnv:
             self.state_0, self.state_1 = self.state_1, self.state_0
 
         # --- GPU: compute rewards, increment steps, check done ---
-        body_q = self._get_body_q(self.state_0)
+        joint_q = self._get_joint_q(self.state_0)
         wp.launch(step_rewards_done_kernel, dim=self.num_worlds,
-                  inputs=[body_q, self.prev_x_wp, self._actions_gpu,
+                  inputs=[joint_q, self.prev_x_wp, self._actions_gpu,
                           self.steps_wp, self.dt,
                           self.forward_reward_weight, self.ctrl_cost_weight,
                           self.healthy_reward,

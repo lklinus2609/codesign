@@ -150,24 +150,24 @@ def diff_init_worlds_kernel(
 
 @wp.kernel
 def compute_forward_loss_kernel(
-    body_q_final: wp.array(dtype=float),
-    body_q_initial: wp.array(dtype=float),
-    num_bodies_per_world: int,
+    joint_q_final: wp.array(dtype=float),
+    joint_q_initial: wp.array(dtype=float),
+    joint_q_size: int,
     loss: wp.array(dtype=float),
     num_worlds: int,
 ):
     """loss = -mean(x_final - x_initial) over all worlds.
 
-    body_q is flat: (num_worlds * num_bodies_per_world * 7,).
-    Root body x position is at body_q[w * num_bodies * 7 + 0].
+    Uses joint_q (always flat float) instead of body_q.
+    Root x position is at joint_q[w * joint_q_size + 0].
     """
     tid = wp.tid()
     if tid == 0:
         total = float(0.0)
         for w in range(num_worlds):
-            stride = w * num_bodies_per_world * 7
-            x_final = body_q_final[stride]
-            x_initial = body_q_initial[stride]
+            idx = w * joint_q_size
+            x_final = joint_q_final[idx]
+            x_initial = joint_q_initial[idx]
             total = total + (x_final - x_initial)
         loss[0] = -total / float(num_worlds)
 
@@ -200,9 +200,9 @@ def accumulate_qd_energy_kernel(
 
 @wp.kernel
 def compute_cot_loss_kernel(
-    body_q_final: wp.array(dtype=float),
-    body_q_initial: wp.array(dtype=float),
-    num_bodies_per_world: int,
+    joint_q_final: wp.array(dtype=float),
+    joint_q_initial: wp.array(dtype=float),
+    joint_q_size: int,
     energy_buf: wp.array(dtype=float),
     total_mass: float,
     loss: wp.array(dtype=float),
@@ -211,15 +211,17 @@ def compute_cot_loss_kernel(
 ):
     """loss = CoT = energy / (m * g * d).
 
+    Uses joint_q (always flat float) instead of body_q.
+    Root x position is at joint_q[w * joint_q_size + 0].
     Also writes mean forward distance to fwd_dist_buf for logging.
     """
     tid = wp.tid()
     if tid == 0:
         total_dist = float(0.0)
         for w in range(num_worlds):
-            stride = w * num_bodies_per_world * 7
-            x_final = body_q_final[stride]
-            x_initial = body_q_initial[stride]
+            idx = w * joint_q_size
+            x_final = joint_q_final[idx]
+            x_initial = joint_q_initial[idx]
             total_dist = total_dist + (x_final - x_initial)
         mean_dist = total_dist / float(num_worlds)
         fwd_dist_buf[0] = mean_dist
@@ -513,10 +515,10 @@ class DiffG1Eval:
         self.total_mass = float(body_mass_np[:self.bodies_per_world].sum())
         print(f"    [DiffG1Eval] Total robot mass = {self.total_mass:.2f} kg")
 
-        # Initial body_q snapshot (flat, matching model.body_q layout)
-        body_q_size = self.model.body_count * 7
-        self.body_q_initial = wp.zeros(
-            body_q_size, dtype=float,
+        # Initial joint_q snapshot buffer (for forward distance computation)
+        total_q = self.model.joint_q.numpy().shape[0]
+        self.joint_q_initial = wp.zeros(
+            total_q, dtype=float,
             requires_grad=True, device=self.device,
         )
 
@@ -622,8 +624,8 @@ class DiffG1Eval:
             # FK to populate body_q from joint_q
             newton.eval_fk(self.model, state_0.joint_q, state_0.joint_qd, state_0)
 
-            # Store initial body_q
-            wp.copy(self.body_q_initial, state_0.body_q)
+            # Store initial joint_q (for forward distance computation)
+            wp.copy(self.joint_q_initial, state_0.joint_q)
 
             # Physics loop
             physics_step = 0
@@ -673,9 +675,9 @@ class DiffG1Eval:
                 compute_cot_loss_kernel,
                 dim=1,
                 inputs=[
-                    final_state.body_q,
-                    self.body_q_initial,
-                    self.bodies_per_world,
+                    final_state.joint_q,
+                    self.joint_q_initial,
+                    self.joint_q_size,
                     self.energy_buf,
                     self.total_mass,
                     self.loss_buf,
@@ -729,7 +731,7 @@ class DiffG1Eval:
         """Free GPU resources."""
         for attr in ('states', 'model', 'solver', 'control',
                      'pre_actions', 'loss_buf', 'energy_buf', 'fwd_dist_buf',
-                     'body_q_initial', 'theta_wp', 'base_quats_wp',
+                     'joint_q_initial', 'theta_wp', 'base_quats_wp',
                      'joint_local_indices_wp', 'param_for_joint_wp',
                      'init_qpos_wp'):
             if hasattr(self, attr):

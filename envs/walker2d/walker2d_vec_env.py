@@ -369,10 +369,6 @@ class Walker2DVecEnv:
             return self._joint_f
         return self.control.joint_f.reshape((self.num_worlds, self.num_joint_qd_per_world))
 
-    def _get_body_q(self, state):
-        """Get body_q as 2D float array. Only works with requires_grad=True."""
-        return state.body_q.reshape((self.num_worlds, self.num_bodies_per_world * 7))
-
     def cleanup(self):
         """Free GPU resources."""
         for attr in ('_joint_q', '_joint_qd', '_joint_f',

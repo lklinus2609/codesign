@@ -14,7 +14,9 @@ This document outlines a systematic verification strategy for the Performance-Ga
 | 1 | Cart-Pole | 2 | Envelope theorem validity | ~10s | DONE |
 | 1.5 | Cart-Pole (Newton) | 2 | Newton/Warp integration, vectorized envs | ~5s | DONE |
 | 2 | Ant | 27 | Multi-body dynamics, parametric morphology | ~30s | CREATED |
-| 3 | G1 Humanoid | 37 | Full system | ~5min | BLOCKED |
+| 2.1 | Walker2D | 9 | Multi-body 2D locomotion, FD gradients | ~30s | CREATED |
+| 2.2 | Walker2D | 9 | BPTT gradients via wp.Tape() | ~30s | CREATED |
+| 3u | G1 Humanoid | 37 | Full system (unified single-process) | ~5min | GPU VALIDATION |
 
 **Key Insight**: If Level N fails, do not proceed to Level N+1. Each level is designed so that failure indicates a specific bug class.
 
@@ -183,10 +185,15 @@ Test PGHC on a multi-body 3D locomotion task with parametric morphology using Ne
 
 ---
 
-## Level 3: G1 Humanoid (Target)
+## Level 3u: G1 Humanoid (Unified Single-Process)
 
 ### Purpose
-Full system validation on the target robot.
+Full system validation on the target robot using single-process unified architecture.
+
+### Status (2026-02-11)
+- Inner loop (MimicKit AMP) runs successfully on GPU
+- BPTT phase reached but crashed on `body_q` dtype mismatch — **FIXED** (migrated to `joint_q`)
+- Awaiting re-run to validate full outer loop
 
 ### Only Proceed Here If
 
@@ -203,7 +210,7 @@ Full system validation on the target robot.
 | Frequent falls | Increase stability_threshold, more warmup iterations |
 | High-dimensional morphology | Start with hip angles only (current setup) |
 | Mode collapse | Multiple random seeds, curriculum learning |
-| Gradient chain broken by numpy | Implement quaternion math as Warp kernels (see G1_DIFFERENTIABILITY.md) |
+| GPU OOM | Build DiffG1Eval lazily, free after BPTT (Issue #16) |
 
 ---
 
@@ -244,13 +251,27 @@ Full system validation on the target robot.
 - [ ] Run and validate PGHC on Ant (requires Newton GPU machine)
 - Code: `envs/ant/`, `codesign_ant.py`, `test_level2_ant.py`
 
-### Level 3: G1 Humanoid --- BLOCKED
-- [x] Implement `ParametricG1Model` with joint angle parameterization
-- [x] Implement `HybridAMPAgent` with outer loop
-- [x] Implement differentiable rollout infrastructure
-- [ ] Fix gradient chain (numpy breaks backprop --- see G1_DIFFERENTIABILITY.md)
-- [ ] Run and validate PGHC on G1
-- Code: `parametric_g1.py`, `hybrid_agent.py`, `train_hybrid.py`
+### Level 2.1: Walker2D (Newton/Warp, FD) --- CREATED, NOT VALIDATED
+- [x] Implement `Walker2DVecEnv` with Newton physics
+- [x] Implement finite-difference gradient computation
+- [x] Write co-design script (`codesign_walker2d.py`)
+- [ ] Run and validate on GPU
+- Code: `envs/walker2d/`, `codesign_walker2d.py`
+
+### Level 2.2: Walker2D (Newton/Warp, BPTT) --- CREATED, NOT VALIDATED
+- [x] Implement `DiffWalker2DEval` with SolverSemiImplicit
+- [x] Implement BPTT gradient via wp.Tape()
+- [x] GPU-resident refactor (zero CPU-GPU transfers)
+- [ ] Run and validate on GPU
+- Code: `envs/walker2d/`, `codesign_walker2d_diff.py`
+
+### Level 3u: G1 Humanoid (Unified Single-Process) --- GPU VALIDATION
+- [x] Implement unified single-process co-design script
+- [x] Implement BPTT via wp.Tape() with Warp quaternion kernels
+- [x] Fix gradient chain (all-Warp, no numpy in backprop path)
+- [x] Fix body_q dtype crash (use joint_q instead)
+- [ ] Complete GPU validation (inner loop succeeds, BPTT body_q crash fixed)
+- Code: `codesign_g1_unified.py`, `g1_eval_worker.py`, `g1_mjcf_modifier.py`
 
 ---
 
@@ -305,18 +326,21 @@ Level 1: Cart-Pole (PyTorch) ---------- DONE
 Level 1.5: Cart-Pole (Newton/Warp) ---- DONE
     |   Vectorized envs, Adam optimizer, 512-world FD eval, RSL-RL tracking
     |
-Level 2: Ant (Newton/Warp) ------------ YOU ARE HERE
-    |   Created but not validated on GPU
-    |   Need: Run codesign_ant.py on Newton machine
+Level 2: Ant (Newton/Warp) ------------ CREATED (needs GPU validation)
     |
-Level 3: G1 Humanoid ------------------ BLOCKED
-    |   Gradient chain broken by numpy conversions
-    |   Need: Implement Warp kernels for quaternion math
+Level 2.1: Walker2D (FD) -------------- CREATED (needs GPU validation)
+    |
+Level 2.2: Walker2D (BPTT) ------------ CREATED (needs GPU validation)
+    |
+Level 3u: G1 Humanoid (Unified) ------- YOU ARE HERE
+    |   Inner loop runs successfully on GPU
+    |   BPTT body_q dtype crash fixed (2026-02-11)
+    |   Need: Re-run to validate full outer loop
     |
     └── Ready for thesis experiments
 ```
 
 ---
 
-*Document Version: 4.0*
-*Last Updated: 2026-02-09*
+*Document Version: 5.0*
+*Last Updated: 2026-02-11*

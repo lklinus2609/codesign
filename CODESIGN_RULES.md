@@ -66,6 +66,11 @@ codesign/                          # Repository root
 │   ├── codesign_cartpole.py             # Level 1: PGHC with trust region
 │   ├── codesign_cartpole_newton_vec.py  # Level 1.5: Vectorized Newton PGHC
 │   ├── codesign_ant.py                  # Level 2: PGHC for Ant morphology
+│   ├── codesign_walker2d.py             # Level 2.1: Walker2D with FD gradients
+│   ├── codesign_walker2d_diff.py        # Level 2.2: Walker2D with BPTT gradients
+│   ├── codesign_g1_unified.py           # Level 3u: G1 unified single-process
+│   ├── g1_eval_worker.py               # Level 3u: DiffG1Eval BPTT worker
+│   ├── g1_mjcf_modifier.py             # Level 3u: MJCF body-quat modifier
 │   │
 │   ├── # === TESTING ===
 │   ├── run_all_tests.py           # Test runner
@@ -87,9 +92,14 @@ codesign/                          # Repository root
 │   │   ├── cartpole_newton/       # Level 1.5: Cart-pole with Newton/Warp
 │   │   │   ├── __init__.py
 │   │   │   └── cartpole_newton_vec_env.py  # Vectorized GPU cart-pole
-│   │   └── ant/                   # Level 2: Ant with Newton/Warp
+│   │   ├── ant/                   # Level 2: Ant with Newton/Warp
+│   │   │   ├── __init__.py
+│   │   │   ├── ant_env.py         # Single-world Ant env
+│   │   │   └── ant_vec_env.py     # Vectorized GPU Ant env
+│   │   └── walker2d/              # Level 2.1-2.2: Walker2D
 │   │       ├── __init__.py
-│   │       └── ant_env.py         # Parametric Ant with MJCF generation
+│   │       ├── walker2d_env.py    # Single-world Walker2D env
+│   │       └── walker2d_vec_env.py # Vectorized GPU Walker2D env
 │   │
 │   ├── # === DOCUMENTATION ===
 │   ├── README.md                  # Quick start guide
@@ -387,10 +397,21 @@ Level 2: Ant (Newton/Warp)                           [CREATED]
     └── Multi-body MJCF generation
     Code: envs/ant/, codesign_ant.py
 
-Level 3: G1 Humanoid (target)                        [BLOCKED]
-    ├── Full system validation
-    └── BLOCKED: gradient chain broken by numpy conversions
-    Code: parametric_g1.py, hybrid_agent.py
+Level 2.1: Walker2D (Newton/Warp, FD)                [CREATED]
+    ├── Parametric morphology (thigh, leg, foot length)
+    └── Finite-difference gradients
+    Code: envs/walker2d/, codesign_walker2d.py
+
+Level 2.2: Walker2D (Newton/Warp, BPTT)              [CREATED]
+    ├── BPTT gradients via wp.Tape()
+    └── GPU-resident (zero CPU-GPU transfers)
+    Code: envs/walker2d/, codesign_walker2d_diff.py
+
+Level 3u: G1 Humanoid (unified single-process)       [GPU VALIDATION]
+    ├── Full system with BPTT outer loop
+    ├── MimicKit AMP inner loop (library import)
+    └── body_q→joint_q migration for dtype safety
+    Code: codesign_g1_unified.py, g1_eval_worker.py
 ```
 
 ### Gate Criteria
@@ -616,6 +637,16 @@ Record significant technical decisions here with date and rationale.
 
 ---
 
+### 2026-02-11: Never Use body_q/body_qd in Warp Kernels
+
+**Decision**: Replace all `body_q`/`body_qd` usage in Warp kernels with `joint_q`/`joint_qd`. Added as Project Rule #4.
+
+**Rationale**: `state.body_q` dtype varies across Newton/Warp versions — may be `wp.transformf` or flat `float` depending on `requires_grad` setting AND the specific Newton version installed. This caused a crash in the G1 BPTT phase on GPU. `joint_q`/`joint_qd` are ALWAYS `wp.array(dtype=float)` regardless of settings. For free-base robots, `joint_q[0:7] = [x,y,z,qw,qx,qy,qz]` is identical to the root body transform.
+
+**Code**: Fixed in `g1_eval_worker.py`, `codesign_walker2d_diff.py`, `envs/ant/ant_vec_env.py`, `envs/walker2d/walker2d_vec_env.py`.
+
+---
+
 ### Template for New Decisions
 
 ```markdown
@@ -674,5 +705,5 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 
 ---
 
-*Document Version: 4.0*
-*Last Updated: 2026-02-09*
+*Document Version: 5.0*
+*Last Updated: 2026-02-11*

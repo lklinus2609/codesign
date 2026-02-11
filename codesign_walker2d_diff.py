@@ -349,24 +349,23 @@ def diff_init_worlds_kernel(
 
 @wp.kernel
 def compute_forward_loss_kernel(
-    body_q_final: wp.array2d(dtype=float),
-    body_q_initial: wp.array2d(dtype=float),
-    num_bodies_per_world: int,
+    joint_q_final: wp.array2d(dtype=float),
+    joint_q_initial: wp.array2d(dtype=float),
     loss: wp.array(dtype=float),
     num_worlds: int,
 ):
     """loss = -mean(x_final - x_initial) over all worlds.
 
-    body_q is (num_worlds, num_bodies_per_world * 7).
-    Root body x = body_q[w, 0].
+    Uses joint_q (always flat float) instead of body_q.
+    Root x position is at joint_q[w, 0].
     Negative because we want gradient ASCENT on forward distance.
     """
     tid = wp.tid()
     if tid == 0:
         total = float(0.0)
         for w in range(num_worlds):
-            x_final = body_q_final[w, 0]
-            x_initial = body_q_initial[w, 0]
+            x_final = joint_q_final[w, 0]
+            x_initial = joint_q_initial[w, 0]
             total = total + (x_final - x_initial)
         loss[0] = -total / float(num_worlds)
 
@@ -483,9 +482,9 @@ class DiffWalker2DEval:
         # Loss buffer
         self.loss_buf = wp.zeros(1, dtype=float, requires_grad=True, device=self.device)
 
-        # Store initial body_q for loss computation
-        self.body_q_initial = wp.zeros(
-            (self.num_worlds, self.num_bodies_per_world * 7),
+        # Store initial joint_q for loss computation
+        self.joint_q_initial = wp.zeros(
+            (self.num_worlds, self.num_joints_per_world),
             dtype=float, requires_grad=True, device=self.device,
         )
 
@@ -503,7 +502,6 @@ class DiffWalker2DEval:
         # Cache articulation views for all states
         self._joint_q_cache = {}
         self._joint_qd_cache = {}
-        self._body_q_cache = {}
         self._joint_f = None
 
         if self.artic_view is not None:
@@ -511,7 +509,6 @@ class DiffWalker2DEval:
                 sid = id(s)
                 self._joint_q_cache[sid] = self.artic_view.get_attribute("joint_q", s)
                 self._joint_qd_cache[sid] = self.artic_view.get_attribute("joint_qd", s)
-                self._body_q_cache[sid] = self.artic_view.get_attribute("body_q", s)
             self._joint_f = self.artic_view.get_attribute("joint_f", self.control)
 
     def _get_joint_q(self, state):
@@ -525,12 +522,6 @@ class DiffWalker2DEval:
         if sid in self._joint_qd_cache:
             return self._joint_qd_cache[sid]
         return state.joint_qd.reshape((self.num_worlds, self.num_joints_per_world))
-
-    def _get_body_q(self, state):
-        sid = id(state)
-        if sid in self._body_q_cache:
-            return self._body_q_cache[sid]
-        return state.body_q.reshape((self.num_worlds, self.num_bodies_per_world * 7))
 
     def _get_joint_f(self):
         if self._joint_f is not None:
@@ -607,9 +598,9 @@ class DiffWalker2DEval:
                 tmp_state_a, tmp_state_b = tmp_state_b, tmp_state_a
 
         # Compute mean reward (forward distance) from phase 1 for diagnostics
-        body_q_final_np = self._get_body_q(tmp_state_a).numpy()
+        joint_q_final_np = self._get_joint_q(tmp_state_a).numpy()
         # Initial x is 0 (we reset to zero)
-        mean_forward_dist = np.mean(body_q_final_np[:, 0])
+        mean_forward_dist = np.mean(joint_q_final_np[:, 0])
 
         # Clean up tmp states
         del tmp_state_a, tmp_state_b
@@ -627,9 +618,9 @@ class DiffWalker2DEval:
             # FK on tape
             newton.eval_fk(self.model, state_0.joint_q, state_0.joint_qd, state_0)
 
-            # Store initial body_q for loss
-            body_q_0 = self._get_body_q(state_0)
-            wp.copy(self.body_q_initial, body_q_0)
+            # Store initial joint_q for loss
+            joint_q_0 = self._get_joint_q(state_0)
+            wp.copy(self.joint_q_initial, joint_q_0)
 
             # Physics loop
             physics_step = 0
@@ -655,12 +646,11 @@ class DiffWalker2DEval:
 
             # Compute loss: -mean(forward distance)
             final_state = self.states[physics_step]
-            body_q_final = self._get_body_q(final_state)
+            joint_q_final = self._get_joint_q(final_state)
 
             wp.launch(compute_forward_loss_kernel, dim=1,
-                      inputs=[body_q_final, self.body_q_initial,
-                              self.num_bodies_per_world, self.loss_buf,
-                              self.num_worlds])
+                      inputs=[joint_q_final, self.joint_q_initial,
+                              self.loss_buf, self.num_worlds])
 
         # Get loss value
         wp.synchronize()
@@ -730,8 +720,8 @@ class DiffWalker2DEval:
         """Free GPU resources."""
         for attr in ('states', 'artic_view', 'model', 'solver', 'control',
                      'obs_wp', 'pre_actions', '_actions_cpu', 'loss_buf',
-                     'body_q_initial', '_joint_q_cache', '_joint_qd_cache',
-                     '_body_q_cache', '_joint_f'):
+                     'joint_q_initial', '_joint_q_cache', '_joint_qd_cache',
+                     '_joint_f'):
             if hasattr(self, attr):
                 delattr(self, attr)
         import gc
