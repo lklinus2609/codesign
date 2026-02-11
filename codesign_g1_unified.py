@@ -228,10 +228,6 @@ class InnerLoopController:
                 mean_ret = test_info["mean_return"]
                 test_returns.append(mean_ret)
 
-                print(f"    [Inner] iter={agent._iter:4d}  "
-                      f"samples={agent._sample_count:>10,}  "
-                      f"test_return={mean_ret:.2f}")
-
                 agent.save(checkpoint_path)
 
                 if self._check_plateau(test_returns):
@@ -245,6 +241,9 @@ class InnerLoopController:
                 # Reset after test (matches MimicKit train_model behavior)
                 agent._train_return_tracker.reset()
                 agent._curr_obs, agent._curr_info = agent._reset_envs()
+
+            # Print MimicKit's native formatted log every iteration
+            agent._logger.write_log()
 
             agent._iter += 1
 
