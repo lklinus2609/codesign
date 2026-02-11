@@ -663,7 +663,7 @@ def main():
                         help="Path to MimicKit agent config YAML")
     parser.add_argument("--output-file", type=str, required=True,
                         help="Path to write eval_result.npz")
-    parser.add_argument("--num-eval-worlds", type=int, default=8)
+    parser.add_argument("--num-eval-worlds", type=int, default=32)
     parser.add_argument("--eval-horizon", type=int, default=100)
     args = parser.parse_args()
 
