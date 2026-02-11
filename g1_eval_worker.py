@@ -54,7 +54,7 @@ def update_joint_X_p_from_theta_kernel(
     base_quats: wp.array2d(dtype=float),
     joint_local_indices: wp.array(dtype=int),
     param_for_joint: wp.array(dtype=int),
-    joint_X_p: wp.array2d(dtype=float),
+    joint_X_p: wp.array(dtype=wp.transformf),
     joints_per_world: int,
     num_worlds: int,
     num_param_joints: int,
@@ -63,6 +63,9 @@ def update_joint_X_p_from_theta_kernel(
 
     Launched with dim = num_param_joints * num_worlds.
     Each thread handles one (parameterized joint, world) pair.
+    joint_X_p has dtype=transformf (pos: vec3f, rot: quatf).
+    base_quats stores the 4 quaternion components extracted from
+    joint_X_p.numpy()[:, 3:7] in the same memory layout order.
     """
     tid = wp.tid()
     j = tid // num_worlds   # parameterized joint index (0..11)
@@ -73,12 +76,12 @@ def update_joint_X_p_from_theta_kernel(
     p_idx = param_for_joint[j]
     angle = theta[p_idx]
 
-    # Delta quat from X-rotation: (cos(a/2), sin(a/2), 0, 0)
+    # Delta quat from X-rotation
     half = angle * 0.5
     dw = wp.cos(half)
     dx = wp.sin(half)
 
-    # Base quat (w, x, y, z)
+    # Base quat components (same order as joint_X_p numpy layout)
     bw = base_quats[j, 0]
     bx = base_quats[j, 1]
     by = base_quats[j, 2]
@@ -98,12 +101,12 @@ def update_joint_X_p_from_theta_kernel(
     ny = ny * inv_norm
     nz = nz * inv_norm
 
-    # Write to joint_X_p[global_idx, 3:7]
+    # Read current transform (preserves position), write new rotation
     global_idx = w * joints_per_world + joint_local_indices[j]
-    joint_X_p[global_idx, 3] = nw
-    joint_X_p[global_idx, 4] = nx
-    joint_X_p[global_idx, 5] = ny
-    joint_X_p[global_idx, 6] = nz
+    pos = wp.transform_get_translation(joint_X_p[global_idx])
+    # quatf(x, y, z, w) maps to byte positions [3,4,5,6] — same layout as
+    # the old direct writes to joint_X_p[idx, 3..6]
+    joint_X_p[global_idx] = wp.transformf(pos, wp.quatf(nw, nx, ny, nz))
 
 
 @wp.kernel
