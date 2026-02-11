@@ -53,6 +53,7 @@ if str(MIMICKIT_SRC_DIR) not in sys.path:
 
 import warp as wp
 import newton  # noqa: F401
+from newton.viewer import ViewerGL
 import torch
 
 # MimicKit modules (newton_engine.py sets wp.config.enable_backward = False)
@@ -185,13 +186,17 @@ class InnerLoopController:
 
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
                  min_plateau_outputs=10, max_samples=200_000_000,
-                 use_wandb=False):
+                 use_wandb=False, viewer=None, engine=None,
+                 video_interval=100):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
         self.min_plateau_outputs = min_plateau_outputs
         self.max_samples = max_samples
         self.use_wandb = use_wandb
+        self.viewer = viewer
+        self.engine = engine
+        self.video_interval = video_interval
 
     def _check_plateau(self, returns):
         n_required = max(self.plateau_window, self.min_plateau_outputs)
@@ -257,6 +262,18 @@ class InnerLoopController:
                 agent._logger.write_log()
                 agent.save(checkpoint_path)
 
+                # Video capture every video_interval iterations
+                if (self.use_wandb and self.viewer is not None
+                        and agent._iter % self.video_interval == 0):
+                    video = capture_video(
+                        self.viewer, agent, env, self.engine,
+                        num_steps=200,
+                    )
+                    if video is not None:
+                        wandb.log({"inner/video": wandb.Video(
+                            video, fps=30, format="mp4",
+                        )})
+
                 if self._check_plateau(test_returns):
                     recent = test_returns[-self.plateau_window:]
                     spread = max(recent) - min(recent)
@@ -301,6 +318,56 @@ def collect_actions_from_agent(agent, env, num_eval_worlds, horizon):
 
     agent.set_mode(base_agent_mod.AgentMode.TRAIN)
     return actions_list
+
+
+# ---------------------------------------------------------------------------
+# Video capture
+# ---------------------------------------------------------------------------
+
+def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
+    """Capture a short evaluation video for wandb logging.
+
+    Returns (T, C, H, W) uint8 numpy array, or None on failure.
+    """
+    try:
+        agent.eval()
+        agent.set_mode(base_agent_mod.AgentMode.TEST)
+
+        obs, info = env.reset()
+        wp.synchronize()
+
+        frames = []
+        sim_time = 0.0
+        dt = 1.0 / fps
+
+        with torch.no_grad():
+            for step in range(num_steps):
+                action, _ = agent._decide_action(obs, info)
+                obs, reward, done, info = env.step(action)
+                sim_time += dt
+
+                viewer.begin_frame(sim_time)
+                viewer.log_state(engine._sim_state.raw_state)
+                viewer.end_frame()
+
+                frame_wp = viewer.get_frame()
+                if frame_wp is not None:
+                    frames.append(frame_wp.numpy().copy())
+
+        agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+
+        if not frames:
+            return None
+
+        # wandb.Video expects (T, C, H, W)
+        video = np.stack(frames)            # (T, H, W, 3)
+        video = video.transpose(0, 3, 1, 2)  # (T, 3, H, W)
+        return video
+
+    except Exception as e:
+        print(f"    [Video] Capture failed: {e}")
+        agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +448,22 @@ def pghc_codesign_g1_unified(args):
         sim_model, args.num_train_envs
     )
 
+    # Headless viewer for video capture (wandb)
+    viewer = None
+    if use_wandb:
+        try:
+            viewer = ViewerGL(headless=True, width=640, height=480)
+            viewer.set_model(sim_model, max_worlds=1)
+            viewer.set_camera(
+                pos=wp.vec3(3.0, -3.0, 1.5),
+                pitch=-10.0,
+                yaw=90.0,
+            )
+            print("  [Viewer] Headless viewer created for video capture")
+        except Exception as e:
+            print(f"  [Viewer] Failed to create viewer: {e}")
+            viewer = None
+
     print("[3/4] Building differentiable eval model...")
     diff_eval = DiffG1Eval(
         mjcf_modifier=mjcf_modifier,
@@ -412,6 +495,9 @@ def pghc_codesign_g1_unified(args):
         min_plateau_outputs=args.min_plateau_outputs,
         max_samples=args.max_inner_samples,
         use_wandb=use_wandb,
+        viewer=viewer,
+        engine=engine,
+        video_interval=args.video_interval,
     )
 
     history = {
@@ -595,6 +681,8 @@ if __name__ == "__main__":
                         help="Inner convergence: window size")
     parser.add_argument("--min-plateau-outputs", type=int, default=10,
                         help="Inner convergence: min outputs before early stop")
+    parser.add_argument("--video-interval", type=int, default=100,
+                        help="Log video to wandb every N inner iterations")
     args = parser.parse_args()
 
     pghc_codesign_g1_unified(args)
