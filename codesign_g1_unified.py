@@ -678,7 +678,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-train-envs", type=int, default=4096)
     parser.add_argument("--num-eval-worlds", type=int, default=32)
     parser.add_argument("--eval-horizon", type=int, default=100)
-    parser.add_argument("--max-inner-samples", type=int, default=200_000_000)
+    parser.add_argument("--max-inner-samples", type=int, default=2_000_000_000)
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
