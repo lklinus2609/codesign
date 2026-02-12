@@ -8,14 +8,15 @@ all GPU resources persistent across outer iterations.
 Architecture:
     Single process, single CUDA context:
     1. Build MimicKit AMPEnv + AMPAgent ONCE (N training worlds)
-    2. Build DiffG1Eval ONCE (M eval worlds, requires_grad=True)
-    3. OUTER LOOP:
+    2. OUTER LOOP:
         a. Update training model joint_X_p in-place from theta
         b. Inner loop: agent._train_iter() until convergence
         c. Collect actions (frozen policy, slice M worlds from training env)
-        d. BPTT gradient via DiffG1Eval.compute_gradient()
-        e. Adam update theta, clip to +/-30 deg
-        f. Check outer convergence (theta stable over last 5 iters)
+        d. Build DiffG1Eval lazily (M eval worlds, requires_grad=True)
+        e. BPTT gradient via DiffG1Eval.compute_gradient()
+        f. Free DiffG1Eval (reclaim 2-4 GiB VRAM for next inner loop)
+        g. Adam update theta, clip to +/-30 deg
+        h. Check outer convergence (theta stable over last 5 iters)
 
 Run:
     python codesign_g1_unified.py --wandb --num-train-envs 4096 --num-eval-worlds 32
@@ -30,6 +31,8 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
+
+import gc
 
 import numpy as np
 
@@ -62,10 +65,12 @@ import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import learning.base_agent as base_agent_mod
 
-# CRITICAL: Restore backward mode for BPTT kernels.
-# Warp kernel compilation is lazy (happens on first launch, not on
-# @wp.kernel decoration), so all kernels will compile with backward enabled.
-wp.config.enable_backward = True
+# NOTE: MimicKit's newton_engine.py sets wp.config.enable_backward = False.
+# We keep it False during training (matching pure MimicKit behavior) and only
+# set it True right before building DiffG1Eval for BPTT. Warp kernel compilation
+# is lazy (first launch), so training kernels compile WITHOUT adjoint code,
+# and BPTT kernels compile WITH it — each set only compiles once.
+# wp.config.enable_backward = True  # COMMENTED OUT: was causing instability
 
 # Co-design modules
 from g1_mjcf_modifier import (
@@ -464,16 +469,22 @@ def pghc_codesign_g1_unified(args):
             print(f"  [Viewer] Failed to create viewer: {e}")
             viewer = None
 
-    print("[3/4] Building differentiable eval model...")
-    diff_eval = DiffG1Eval(
-        mjcf_modifier=mjcf_modifier,
-        theta_np=theta,
-        num_worlds=args.num_eval_worlds,
-        horizon=args.eval_horizon,
-        dt=1.0 / 30.0,
-        num_substeps=8,
-        device=device,
-    )
+    # DiffG1Eval is built LAZILY in the outer loop (right before BPTT) and
+    # freed immediately after. This prevents 2-4 GiB VRAM from coexisting
+    # with the training model during the inner loop.
+    # --- COMMENTED OUT: was built at startup, wasting VRAM during training ---
+    # print("[3/4] Building differentiable eval model...")
+    # diff_eval = DiffG1Eval(
+    #     mjcf_modifier=mjcf_modifier,
+    #     theta_np=theta,
+    #     num_worlds=args.num_eval_worlds,
+    #     horizon=args.eval_horizon,
+    #     dt=1.0 / 30.0,
+    #     num_substeps=8,
+    #     device=device,
+    # )
+    diff_eval = None  # Built lazily in outer loop
+    print("[3/4] DiffG1Eval will be built lazily before each BPTT phase")
 
     # =========================================================
     # Outer loop setup
@@ -562,12 +573,33 @@ def pghc_codesign_g1_unified(args):
         print(f"    Got {len(actions_list)} steps x {actions_list[0].shape}")
 
         # ----- BPTT Gradient -----
-        print(f"\n  [BPTT] Computing gradient...")
+        print(f"\n  [BPTT] Building DiffG1Eval lazily...")
 
-        diff_eval.theta_np = theta.copy()
-        diff_eval.theta_wp.assign(theta.astype(np.float64))
+        # Enable backward ONLY for BPTT kernel compilation
+        wp.config.enable_backward = True
 
+        diff_eval = DiffG1Eval(
+            mjcf_modifier=mjcf_modifier,
+            theta_np=theta.copy(),
+            num_worlds=args.num_eval_worlds,
+            horizon=args.eval_horizon,
+            dt=1.0 / 30.0,
+            num_substeps=8,
+            device=device,
+        )
+
+        print(f"  [BPTT] Computing gradient...")
         grad_theta, fwd_dist, cot = diff_eval.compute_gradient(actions_list)
+
+        # Free DiffG1Eval immediately (reclaim 2-4 GiB VRAM)
+        diff_eval.cleanup()
+        diff_eval = None
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Restore enable_backward = False for next inner loop
+        wp.config.enable_backward = False
+        print(f"  [BPTT] DiffG1Eval freed, VRAM reclaimed")
 
         print(f"    BPTT gradients:")
         for i, name in enumerate(param_names):
@@ -656,7 +688,8 @@ def pghc_codesign_g1_unified(args):
     print(f"Total inner loop time: {total_time / 3600:.1f} hours")
 
     # Cleanup
-    diff_eval.cleanup()
+    if diff_eval is not None:
+        diff_eval.cleanup()
     if use_wandb:
         wandb.finish()
 
