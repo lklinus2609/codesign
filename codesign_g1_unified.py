@@ -189,25 +189,25 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
 class InnerLoopController:
     """Drives MimicKit agent._train_iter() with convergence detection."""
 
-    def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
-                 min_plateau_outputs=10, max_samples=200_000_000,
+    def __init__(self, agent, plateau_threshold=0.02, plateau_window=50,
+                 min_plateau_iters=200, max_samples=200_000_000,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
-        self.min_plateau_outputs = min_plateau_outputs
+        self.min_plateau_iters = min_plateau_iters
         self.max_samples = max_samples
         self.use_wandb = use_wandb
         self.viewer = viewer
         self.engine = engine
         self.video_interval = video_interval
 
-    def _check_plateau(self, returns):
-        n_required = max(self.plateau_window, self.min_plateau_outputs)
-        if len(returns) < n_required:
+    def _check_plateau(self, values):
+        n_required = max(self.plateau_window, self.min_plateau_iters)
+        if len(values) < n_required:
             return False
-        recent = returns[-self.plateau_window:]
+        recent = values[-self.plateau_window:]
         mean_val = np.mean(recent)
         if abs(mean_val) < 1e-8:
             return False
@@ -217,7 +217,11 @@ class InnerLoopController:
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or sample cap.
 
-        Returns (converged: bool, test_returns: list[float]).
+        Convergence is detected when the training disc_reward_mean plateaus,
+        since AMP's env reward is 0 (discriminator reward is the real signal)
+        and episode length alone can plateau once the robot learns to stand.
+
+        Returns (converged: bool, disc_reward_ema_history: list[float]).
         """
         agent = self.agent
         env = agent._env
@@ -229,7 +233,9 @@ class InnerLoopController:
         agent._curr_obs, agent._curr_info = agent._reset_envs()
         agent._init_train()
 
-        test_returns = []
+        disc_reward_ema = None
+        disc_reward_ema_history = []
+        ema_alpha = 0.05  # smoothing factor — lower = smoother
         converged = False
         start_time = time.time()
         test_info = None
@@ -240,10 +246,19 @@ class InnerLoopController:
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
+            # Track EMA of disc_reward_mean (smooths out sawtooth from env resets)
+            disc_r = train_info.get("disc_reward_mean")
+            if disc_r is not None:
+                if torch.is_tensor(disc_r):
+                    disc_r = disc_r.item()
+                if disc_reward_ema is None:
+                    disc_reward_ema = disc_r
+                else:
+                    disc_reward_ema = ema_alpha * disc_r + (1 - ema_alpha) * disc_reward_ema
+                disc_reward_ema_history.append(disc_reward_ema)
+
             if output_iter:
                 test_info = agent.test_model(agent._test_episodes)
-                mean_ret = test_info["mean_return"]
-                test_returns.append(mean_ret)
 
             # MimicKit native logging: populate logger + print every iter
             env_diag_info = env.get_diagnostics()
@@ -251,21 +266,22 @@ class InnerLoopController:
                                   start_time)
             agent._logger.print_log()
 
-            # wandb: forward all inner loop metrics
-            if self.use_wandb:
-                wlog = {}
-                for k, entry in agent._logger.log_current_row.items():
-                    v = entry.val
-                    try:
-                        wlog[f"inner/{k}"] = float(v)
-                    except (TypeError, ValueError):
-                        pass
-                if wlog:
-                    wandb.log(wlog)
-
             if output_iter:
                 agent._logger.write_log()
                 agent.save(checkpoint_path)
+
+                # wandb: forward inner loop metrics (only on output iters,
+                # matching vanilla MimicKit's tensorboard write frequency)
+                if self.use_wandb:
+                    wlog = {}
+                    for k, entry in agent._logger.log_current_row.items():
+                        v = entry.val
+                        try:
+                            wlog[f"inner/{k}"] = float(v)
+                        except (TypeError, ValueError):
+                            pass
+                    if wlog:
+                        wandb.log(wlog)
 
                 # Video capture every video_interval iterations
                 if (self.use_wandb and self.viewer is not None
@@ -282,11 +298,11 @@ class InnerLoopController:
                     except Exception as e:
                         print(f"  [Inner Loop] Video logging failed: {e}")
 
-                if self._check_plateau(test_returns):
-                    recent = test_returns[-self.plateau_window:]
+                if self._check_plateau(disc_reward_ema_history):
+                    recent = disc_reward_ema_history[-self.plateau_window:]
                     spread = max(recent) - min(recent)
-                    print(f"    [Inner] CONVERGED ({len(test_returns)} outputs, "
-                          f"mean={np.mean(recent):.2f}, spread={spread:.3f})")
+                    print(f"    [Inner] CONVERGED ({len(disc_reward_ema_history)} iters, "
+                          f"disc_reward_ema={np.mean(recent):.4f}, spread={spread:.4f})")
                     converged = True
                     break
 
@@ -300,7 +316,7 @@ class InnerLoopController:
             agent.save(checkpoint_path)
             print(f"    [Inner] Sample cap reached ({agent._sample_count:,})")
 
-        return converged, test_returns
+        return converged, disc_reward_ema_history
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +522,7 @@ def pghc_codesign_g1_unified(args):
         agent,
         plateau_threshold=args.plateau_threshold,
         plateau_window=args.plateau_window,
-        min_plateau_outputs=args.min_plateau_outputs,
+        min_plateau_iters=args.min_plateau_iters,
         max_samples=args.max_inner_samples,
         use_wandb=use_wandb,
         viewer=viewer,
@@ -552,7 +568,7 @@ def pghc_codesign_g1_unified(args):
         t0 = time.time()
 
         try:
-            converged, test_returns = inner_ctrl.train_until_converged(
+            converged, disc_ema_hist = inner_ctrl.train_until_converged(
                 iter_dir
             )
             inner_time = time.time() - t0
@@ -651,8 +667,8 @@ def pghc_codesign_g1_unified(args):
                 log_dict[f"outer/{name}_rad"] = theta[i]
                 log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
                 log_dict[f"outer/grad_{name}"] = grad_theta[i]
-            if test_returns:
-                log_dict["outer/final_test_return"] = test_returns[-1]
+            if disc_ema_hist:
+                log_dict["outer/final_disc_reward_ema"] = disc_ema_hist[-1]
             wandb.log(log_dict)
 
         # Outer convergence check
@@ -720,10 +736,10 @@ if __name__ == "__main__":
                         help="MimicKit checkpoint to resume from")
     parser.add_argument("--plateau-threshold", type=float, default=0.02,
                         help="Inner convergence: relative change threshold")
-    parser.add_argument("--plateau-window", type=int, default=5,
-                        help="Inner convergence: window size")
-    parser.add_argument("--min-plateau-outputs", type=int, default=10,
-                        help="Inner convergence: min outputs before early stop")
+    parser.add_argument("--plateau-window", type=int, default=50,
+                        help="Inner convergence: window size (in training iters)")
+    parser.add_argument("--min-plateau-iters", type=int, default=200,
+                        help="Inner convergence: min iters before early stop")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     args = parser.parse_args()
