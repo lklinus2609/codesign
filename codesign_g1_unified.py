@@ -299,6 +299,9 @@ class InnerLoopController:
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
 
+                if self.is_root:
+                    print(f"    [Iter {agent._iter}] Running test rollout...",
+                          flush=True)
                 test_info = agent.test_model(agent._test_episodes)  # ALL ranks
 
             # MimicKit native logging: populate logger (contains collective ops)
@@ -309,6 +312,15 @@ class InnerLoopController:
             # Only root prints/writes logs
             if self.is_root:
                 agent._logger.print_log()
+                # Explicit progress line every iteration
+                disc_r_str = ""
+                _dr = train_info.get("disc_reward_mean")
+                if _dr is not None:
+                    _dr = _dr.item() if torch.is_tensor(_dr) else _dr
+                    disc_r_str = f" disc_r={_dr:.4f}"
+                print(f"    [Iter {agent._iter}] "
+                      f"samples={agent._sample_count:,}{disc_r_str}",
+                      flush=True)
 
             if output_iter:
                 if self.is_root:
