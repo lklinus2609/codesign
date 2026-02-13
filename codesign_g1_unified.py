@@ -195,6 +195,7 @@ class InnerLoopController:
 
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
                  min_plateau_outputs=10, max_samples=200_000_000,
+                 min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100):
         self.agent = agent
@@ -202,6 +203,7 @@ class InnerLoopController:
         self.plateau_window = plateau_window
         self.min_plateau_outputs = min_plateau_outputs
         self.max_samples = max_samples
+        self.min_inner_iters = min_inner_iters
         self.use_wandb = use_wandb
         self.viewer = viewer
         self.engine = engine
@@ -243,6 +245,7 @@ class InnerLoopController:
         converged = False
         start_time = time.time()
         test_info = None
+        inner_iters = 0
 
         while agent._sample_count < self.max_samples:
             train_info = agent._train_iter()
@@ -299,10 +302,11 @@ class InnerLoopController:
                     except Exception as e:
                         print(f"  [Inner Loop] Video logging failed: {e}")
 
-                if self._check_plateau(disc_rewards):
+                if inner_iters >= self.min_inner_iters and self._check_plateau(disc_rewards):
                     recent = disc_rewards[-self.plateau_window:]
                     spread = max(recent) - min(recent)
                     print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
+                          f"{inner_iters} iters, "
                           f"disc_reward={np.mean(recent):.4f}, spread={spread:.4f})")
                     converged = True
                     break
@@ -312,6 +316,7 @@ class InnerLoopController:
                 agent._curr_obs, agent._curr_info = agent._reset_envs()
 
             agent._iter += 1
+            inner_iters += 1
 
         if not converged:
             agent.save(checkpoint_path)
@@ -525,6 +530,7 @@ def pghc_codesign_g1_unified(args):
         plateau_window=args.plateau_window,
         min_plateau_outputs=args.min_plateau_outputs,
         max_samples=args.max_inner_samples,
+        min_inner_iters=args.kickoff_min_iters,  # first outer iter; reset to 0 after
         use_wandb=use_wandb,
         viewer=viewer,
         engine=engine,
@@ -549,6 +555,8 @@ def pghc_codesign_g1_unified(args):
     print(f"  Design optimizer:  Adam (lr={args.design_lr})")
     print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
     print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
+    if args.kickoff_min_iters > 0:
+        print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
 
     # =========================================================
     # Outer loop
@@ -582,6 +590,12 @@ def pghc_codesign_g1_unified(args):
             continue
 
         history["inner_times"].append(inner_time)
+
+        # After kickoff, allow convergence without minimum iter gate
+        if outer_iter == 0 and inner_ctrl.min_inner_iters > 0:
+            print(f"  [Kickoff] Disabling min_inner_iters "
+                  f"({inner_ctrl.min_inner_iters}) for subsequent iters")
+            inner_ctrl.min_inner_iters = 0
 
         # ----- Collect Actions -----
         print(f"\n  [Actions] Collecting ({args.num_eval_worlds} worlds x "
@@ -676,6 +690,12 @@ def pghc_codesign_g1_unified(args):
                 log_dict["outer/final_disc_reward"] = disc_rewards[-1]
             wandb.log(log_dict)
 
+            # Save artifacts to wandb files
+            wandb.save(str(iter_dir / "model.pt"), base_path=str(out_dir))
+            wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
+            wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
+            wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
+
         # Outer convergence check
         theta_history.append(theta.copy())
         if len(theta_history) >= 5:
@@ -741,10 +761,12 @@ if __name__ == "__main__":
                         help="MimicKit checkpoint to resume from")
     parser.add_argument("--plateau-threshold", type=float, default=0.02,
                         help="Inner convergence: relative change threshold")
-    parser.add_argument("--plateau-window", type=int, default=5,
+    parser.add_argument("--plateau-window", type=int, default=50,
                         help="Inner convergence: window size (in output intervals)")
     parser.add_argument("--min-plateau-outputs", type=int, default=10,
                         help="Inner convergence: min output intervals before early stop")
+    parser.add_argument("--kickoff-min-iters", type=int, default=2000,
+                        help="Min inner iters before convergence on first outer iter (0=disabled)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     args = parser.parse_args()

@@ -584,6 +584,28 @@ class DiffG1Eval:
 
         del init_state
 
+    @staticmethod
+    def _dbg_wp(name, arr, max_print=8):
+        """Debug helper: print stats for a warp array, flag NaN/Inf."""
+        a = arr.numpy()
+        has_nan = np.any(np.isnan(a))
+        has_inf = np.any(np.isinf(a))
+        tag = ""
+        if has_nan:
+            nan_count = int(np.isnan(a).sum())
+            tag += f" *** NaN({nan_count}/{a.size}) ***"
+        if has_inf:
+            inf_count = int(np.isinf(a).sum())
+            tag += f" *** Inf({inf_count}/{a.size}) ***"
+        finite = a[np.isfinite(a)]
+        if finite.size > 0:
+            print(f"      [{name}] shape={a.shape} min={finite.min():.6g} "
+                  f"max={finite.max():.6g} mean={finite.mean():.6g} "
+                  f"absmax={np.abs(finite).max():.6g}{tag}")
+        else:
+            print(f"      [{name}] shape={a.shape} ALL NaN/Inf{tag}")
+        return has_nan or has_inf
+
     def compute_gradient(self, actions_list):
         """Compute ∂CoT/∂theta via BPTT and return negative gradient for ascent.
 
@@ -600,6 +622,7 @@ class DiffG1Eval:
             cot_value: scalar, Cost of Transport
         """
         wp.synchronize()
+        DBG = "    [BPTT-DBG]"
 
         # ---------------------------------------------------------------
         # Prepare: Initialize state and load actions
@@ -608,12 +631,33 @@ class DiffG1Eval:
         total_q = self.model.joint_q.numpy().shape[0]
         total_qd = self.model.joint_qd.numpy().shape[0]
 
+        print(f"{DBG} === PHASE 0: Initialization ===")
+        print(f"{DBG} total_q={total_q}, total_qd={total_qd}, "
+              f"num_worlds={self.num_worlds}, horizon={self.horizon}, "
+              f"num_substeps={self.num_substeps}")
+        print(f"{DBG} joint_q_size/world={self.joint_q_size}, "
+              f"joint_qd_size/world={self.joint_qd_size}")
+        print(f"{DBG} qd_dof_start={self.qd_dof_start}, "
+              f"num_act_dofs={self.num_act_dofs}")
+
+        # Check theta input
+        print(f"{DBG} theta_wp:")
+        self._dbg_wp("theta", self.theta_wp)
+
+        # Check init qpos
+        print(f"{DBG} init_qpos_wp:")
+        self._dbg_wp("init_qpos", self.init_qpos_wp)
+
         # Initialize joint_q from pre-computed init, zero joint_qd
         launch_dim = max(total_q, total_qd)
         wp.launch(diff_init_worlds_kernel, dim=launch_dim,
                   inputs=[state_0.joint_q, state_0.joint_qd,
                           self.init_qpos_wp, total_q, total_qd])
         wp.synchronize()
+
+        print(f"{DBG} After init_worlds:")
+        self._dbg_wp("state_0.joint_q", state_0.joint_q)
+        self._dbg_wp("state_0.joint_qd", state_0.joint_qd)
 
         # Store actions into pre-allocated warp buffers
         for step in range(min(self.horizon, len(actions_list))):
@@ -639,19 +683,32 @@ class DiffG1Eval:
             self.pre_actions[step].assign(actions_np)
 
         # Diagnostic: verify actions are non-zero
-        act0 = self.pre_actions[0].numpy()
-        act_abs_mean = np.abs(act0).mean()
-        act_abs_max = np.abs(act0).max()
-        print(f"    [DiffG1Eval] Actions check: mean|a|={act_abs_mean:.4f}, "
-              f"max|a|={act_abs_max:.4f} (should be >0)")
+        print(f"{DBG} === Actions summary ===")
+        for step_i in [0, self.horizon // 2, self.horizon - 1]:
+            if step_i < len(self.pre_actions):
+                a = self.pre_actions[step_i].numpy()
+                print(f"{DBG}   step {step_i}: mean|a|={np.abs(a).mean():.4f}, "
+                      f"max|a|={np.abs(a).max():.4f}, "
+                      f"nan={np.isnan(a).sum()}, inf={np.isinf(a).sum()}")
+
+        # Check PD gains
+        print(f"{DBG} === PD gains ===")
+        self._dbg_wp("joint_target_ke", self.model.joint_target_ke)
+        self._dbg_wp("joint_target_kd", self.model.joint_target_kd)
+
+        # Check joint_X_p before tape
+        print(f"{DBG} === joint_X_p (before tape) ===")
+        self._dbg_wp("joint_X_p", self.model.joint_X_p)
 
         # ---------------------------------------------------------------
         # Phase 2: Replay on tape for gradients
         # ---------------------------------------------------------------
+        print(f"{DBG} === PHASE 2: Forward pass on tape ===")
         self.loss_buf.zero_()
         self.energy_buf.zero_()
 
         tape = wp.Tape()
+        first_nan_step = None
         with tape:
             # Apply theta → joint_X_p on tape (differentiable)
             wp.launch(
@@ -669,8 +726,22 @@ class DiffG1Eval:
                 ],
             )
 
+            wp.synchronize()
+            print(f"{DBG} After theta→joint_X_p kernel:")
+            self._dbg_wp("joint_X_p", self.model.joint_X_p)
+
             # FK to populate body_q from joint_q
             newton.eval_fk(self.model, state_0.joint_q, state_0.joint_qd, state_0)
+            wp.synchronize()
+
+            print(f"{DBG} After eval_fk:")
+            self._dbg_wp("state_0.joint_q", state_0.joint_q)
+            self._dbg_wp("state_0.body_q", state_0.body_q)
+
+            # Root positions for world 0 (x,y,z)
+            jq0 = state_0.joint_q.numpy()
+            print(f"{DBG} World 0 root pos: x={jq0[0]:.4f}, y={jq0[1]:.4f}, z={jq0[2]:.4f}")
+            print(f"{DBG} World 0 root quat: {jq0[3:7]}")
 
             # Store initial joint_q (for forward distance computation)
             wp.copy(self.joint_q_initial, state_0.joint_q)
@@ -728,6 +799,61 @@ class DiffG1Eval:
 
                     physics_step += 1
 
+                # Periodic state health check (every 10 macro-steps + first + last)
+                if step == 0 or step == self.horizon - 1 or step % 10 == 0:
+                    wp.synchronize()
+                    dst_check = self.states[physics_step]
+                    jq = dst_check.joint_q.numpy()
+                    jqd = dst_check.joint_qd.numpy()
+                    bq = dst_check.body_q.numpy()
+                    has_nan_q = np.any(np.isnan(jq))
+                    has_nan_qd = np.any(np.isnan(jqd))
+                    has_nan_bq = np.any(np.isnan(bq))
+                    has_inf_q = np.any(np.isinf(jq))
+                    has_inf_qd = np.any(np.isinf(jqd))
+
+                    # Per-world root x position
+                    root_xs = [jq[w * self.joint_q_size] for w in range(self.num_worlds)]
+                    root_zs = [jq[w * self.joint_q_size + 2] for w in range(self.num_worlds)]
+
+                    energy_so_far = float(self.energy_buf.numpy()[0])
+
+                    tag = ""
+                    if has_nan_q or has_nan_qd or has_nan_bq:
+                        tag = " *** NaN DETECTED ***"
+                        if first_nan_step is None:
+                            first_nan_step = step
+                    if has_inf_q or has_inf_qd:
+                        tag += " *** Inf DETECTED ***"
+
+                    print(f"{DBG} Step {step}/{self.horizon} (phys={physics_step}): "
+                          f"root_x=[{min(root_xs):.3f}..{max(root_xs):.3f}] "
+                          f"root_z=[{min(root_zs):.3f}..{max(root_zs):.3f}] "
+                          f"|jq|max={np.abs(jq[np.isfinite(jq)]).max():.3g} "
+                          f"|jqd|max={np.abs(jqd[np.isfinite(jqd)]).max() if np.any(np.isfinite(jqd)) else float('nan'):.3g} "
+                          f"energy={energy_so_far:.4f}{tag}")
+
+                    if has_nan_q or has_nan_qd:
+                        nan_q_idx = np.where(np.isnan(jq))[0]
+                        nan_qd_idx = np.where(np.isnan(jqd))[0]
+                        if len(nan_q_idx) > 0:
+                            # Map to world and local index
+                            worlds = nan_q_idx // self.joint_q_size
+                            locals_ = nan_q_idx % self.joint_q_size
+                            print(f"{DBG}   NaN joint_q at {len(nan_q_idx)} indices, "
+                                  f"worlds={np.unique(worlds).tolist()}, "
+                                  f"local_idx={np.unique(locals_).tolist()[:20]}")
+                        if len(nan_qd_idx) > 0:
+                            worlds = nan_qd_idx // self.joint_qd_size
+                            locals_ = nan_qd_idx % self.joint_qd_size
+                            print(f"{DBG}   NaN joint_qd at {len(nan_qd_idx)} indices, "
+                                  f"worlds={np.unique(worlds).tolist()}, "
+                                  f"local_idx={np.unique(locals_).tolist()[:20]}")
+
+                    if has_nan_bq:
+                        nan_bq_idx = np.where(np.isnan(bq.ravel()))[0]
+                        print(f"{DBG}   NaN body_q at {len(nan_bq_idx)} elements")
+
             # Compute loss: CoT = energy / (m * g * d)
             final_state = self.states[physics_step]
             wp.launch(
@@ -751,42 +877,118 @@ class DiffG1Eval:
         mean_forward_dist = float(self.fwd_dist_buf.numpy()[0])
         energy_val = float(self.energy_buf.numpy()[0])
 
-        print(f"    [DiffG1Eval] energy={energy_val:.4f}, "
-              f"fwd_dist={mean_forward_dist:.4f}, CoT={cot_val:.4f}")
+        print(f"{DBG} === Forward pass summary ===")
+        print(f"{DBG} energy={energy_val:.6g}, fwd_dist={mean_forward_dist:.6g}, "
+              f"CoT={cot_val:.6g}, total_mass={self.total_mass:.2f}")
+        print(f"{DBG} loss_buf={cot_val:.6g} "
+              f"(nan={np.isnan(cot_val)}, inf={np.isinf(cot_val)})")
+        if first_nan_step is not None:
+            print(f"{DBG} *** First NaN appeared at macro-step {first_nan_step} ***")
+
+        # Per-world forward distances
+        jq_final = self.states[physics_step].joint_q.numpy()
+        jq_init = self.joint_q_initial.numpy()
+        per_world_fwd = []
+        for w in range(self.num_worlds):
+            idx = w * self.joint_q_size
+            per_world_fwd.append(jq_final[idx] - jq_init[idx])
+        per_world_fwd = np.array(per_world_fwd)
+        print(f"{DBG} Per-world fwd_dist: min={per_world_fwd.min():.4f}, "
+              f"max={per_world_fwd.max():.4f}, mean={per_world_fwd.mean():.4f}, "
+              f"std={per_world_fwd.std():.4f}")
+        print(f"{DBG} Per-world fwd_dist values: {per_world_fwd.tolist()}")
 
         if np.isnan(cot_val) or np.isinf(cot_val):
-            print("    [WARN] CoT is NaN/Inf, skipping backward")
+            print(f"{DBG} *** CoT is NaN/Inf — skipping backward ***")
+            print(f"{DBG}   energy={energy_val}, fwd_dist={mean_forward_dist}")
+            print(f"{DBG}   Denominator would be: m*g*d = "
+                  f"{self.total_mass}*9.81*{max(mean_forward_dist,0.1):.4f} = "
+                  f"{self.total_mass * 9.81 * max(mean_forward_dist, 0.1):.4f}")
             tape.zero()
             return np.zeros(NUM_DESIGN_PARAMS), 0.0, float('inf')
 
         # Backward: minimize CoT
+        print(f"{DBG} === PHASE 3: Backward pass ===")
         tape.backward(self.loss_buf)
         wp.synchronize()
 
         # ---------------------------------------------------------------
         # Phase 3: Extract gradients
         # ---------------------------------------------------------------
+        # Check intermediate gradients
+        print(f"{DBG} Checking intermediate gradients...")
+
+        # joint_X_p gradient
+        if self.model.joint_X_p.grad is not None:
+            self._dbg_wp("joint_X_p.grad", self.model.joint_X_p.grad)
+        else:
+            print(f"{DBG}   joint_X_p.grad = None")
+
+        # base_quats gradient
+        if self.base_quats_wp.grad is not None:
+            self._dbg_wp("base_quats.grad", self.base_quats_wp.grad)
+        else:
+            print(f"{DBG}   base_quats.grad = None")
+
+        # energy_buf gradient
+        if self.energy_buf.grad is not None:
+            self._dbg_wp("energy_buf.grad", self.energy_buf.grad)
+        else:
+            print(f"{DBG}   energy_buf.grad = None")
+
+        # loss_buf gradient
+        if self.loss_buf.grad is not None:
+            self._dbg_wp("loss_buf.grad", self.loss_buf.grad)
+        else:
+            print(f"{DBG}   loss_buf.grad = None")
+
+        # Spot-check a few state gradients (first, middle, last physics step)
+        total_phys = self.horizon * self.num_substeps
+        for si in [0, total_phys // 2, total_phys]:
+            if si < len(self.states):
+                s = self.states[si]
+                label = f"states[{si}]"
+                if s.joint_q.grad is not None:
+                    self._dbg_wp(f"{label}.joint_q.grad", s.joint_q.grad)
+                else:
+                    print(f"{DBG}   {label}.joint_q.grad = None")
+                if s.joint_qd.grad is not None:
+                    self._dbg_wp(f"{label}.joint_qd.grad", s.joint_qd.grad)
+                else:
+                    print(f"{DBG}   {label}.joint_qd.grad = None")
+                if s.body_q.grad is not None:
+                    self._dbg_wp(f"{label}.body_q.grad", s.body_q.grad)
+                else:
+                    print(f"{DBG}   {label}.body_q.grad = None")
+
+        # theta gradient
         theta_grad = self.theta_wp.grad
         if theta_grad is None:
-            print("    [WARN] No theta gradient available")
+            print(f"{DBG} *** theta_wp.grad = None — gradient chain broken ***")
             tape.zero()
             return np.zeros(NUM_DESIGN_PARAMS), mean_forward_dist, float(cot_val)
 
         grad_np = theta_grad.numpy().copy()
+        print(f"{DBG} theta_wp.grad = {grad_np.tolist()}")
 
         # Guard against NaN/Inf gradients (degenerate backward pass)
         if np.any(np.isnan(grad_np)) or np.any(np.isinf(grad_np)):
-            print("    [WARN] NaN/Inf in theta gradient, returning zeros")
+            print(f"{DBG} *** NaN/Inf in theta gradient ***")
+            print(f"{DBG}   grad values: {grad_np.tolist()}")
+            print(f"{DBG}   nan mask: {np.isnan(grad_np).tolist()}")
+            print(f"{DBG}   inf mask: {np.isinf(grad_np).tolist()}")
             tape.zero()
             return np.zeros(NUM_DESIGN_PARAMS), float(mean_forward_dist), float(cot_val)
 
         # loss = CoT → minimize CoT
         # reward_grad = -∂loss/∂theta (gradient ascent on -CoT = descent on CoT)
         reward_grad = -grad_np
+        print(f"{DBG} reward_grad (before clip) = {reward_grad.tolist()}")
 
         # Clip gradients
         grad_clip = 10.0
         reward_grad = np.clip(reward_grad, -grad_clip, grad_clip)
+        print(f"{DBG} reward_grad (after clip)  = {reward_grad.tolist()}")
 
         tape.zero()
 
