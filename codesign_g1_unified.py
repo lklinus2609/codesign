@@ -6,26 +6,33 @@ Eliminates subprocess overhead by importing MimicKit as a library and keeping
 all GPU resources persistent across outer iterations.
 
 Architecture:
-    Single process, single CUDA context:
-    1. Build MimicKit AMPEnv + AMPAgent ONCE (N training worlds)
+    Single process per GPU, single CUDA context per rank:
+    1. Build MimicKit AMPEnv + AMPAgent ONCE (N/num_gpus training worlds per GPU)
     2. OUTER LOOP:
         a. Update training model joint_X_p in-place from theta
-        b. Inner loop: agent._train_iter() until convergence
-        c. Collect actions (frozen policy, slice M worlds from training env)
-        d. Build DiffG1Eval lazily (M eval worlds, requires_grad=True)
-        e. BPTT gradient via DiffG1Eval.compute_gradient()
-        f. Free DiffG1Eval (reclaim 2-4 GiB VRAM for next inner loop)
-        g. Adam update theta, clip to +/-30 deg
-        h. Check outer convergence (theta stable over last 5 iters)
+        b. Inner loop: agent._train_iter() until convergence (all GPUs)
+        c. Collect actions (frozen policy, rank 0 only)
+        d. Build DiffG1Eval lazily (rank 0 only, requires_grad=True)
+        e. BPTT gradient via DiffG1Eval.compute_gradient() (rank 0 only)
+        f. Free DiffG1Eval (reclaim 2-4 GiB VRAM)
+        g. Broadcast theta to all ranks
+        h. Adam update theta, clip to +/-30 deg
+        i. Check outer convergence (theta stable over last 5 iters)
 
 Run:
-    python codesign_g1_unified.py --wandb --num-train-envs 4096 --num-eval-worlds 32
+    # Single GPU (unchanged)
+    python codesign_g1_unified.py --wandb --num-train-envs 4096
+
+    # Multi-GPU (4x)
+    python codesign_g1_unified.py --wandb --num-train-envs 4096 \
+        --devices cuda:0 cuda:1 cuda:2 cuda:3
 """
 
 import os
 os.environ["PYGLET_HEADLESS"] = "1"
 
 import argparse
+import random
 import shutil
 import sys
 import time
@@ -70,7 +77,6 @@ import learning.base_agent as base_agent_mod
 # set it True right before building DiffG1Eval for BPTT. Warp kernel compilation
 # is lazy (first launch), so training kernels compile WITHOUT adjoint code,
 # and BPTT kernels compile WITH it — each set only compiles once.
-# wp.config.enable_backward = True  # COMMENTED OUT: was causing instability
 
 # Co-design modules
 from g1_mjcf_modifier import (
@@ -191,13 +197,18 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
 # ---------------------------------------------------------------------------
 
 class InnerLoopController:
-    """Drives MimicKit agent._train_iter() with convergence detection."""
+    """Drives MimicKit agent._train_iter() with convergence detection.
+
+    Multi-GPU aware: all ranks call _train_iter() and _log_train_info()
+    (which contain collective ops). Root decides convergence and broadcasts.
+    """
 
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
                  min_plateau_outputs=10, max_samples=200_000_000,
                  min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
-                 video_interval=100):
+                 video_interval=100,
+                 is_root=True, device="cuda:0"):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
@@ -208,6 +219,8 @@ class InnerLoopController:
         self.viewer = viewer
         self.engine = engine
         self.video_interval = video_interval
+        self.is_root = is_root
+        self.device = device
 
     def _check_plateau(self, values):
         n_required = max(self.plateau_window, self.min_plateau_outputs)
@@ -226,6 +239,10 @@ class InnerLoopController:
         Convergence is detected when disc_reward_mean (sampled at output
         iterations, before env reset) plateaus. AMP's env reward is 0 —
         the discriminator reward is the real quality signal.
+
+        All ranks participate in training (collective ops in _train_iter,
+        _update_sample_count, _log_train_info). Root decides convergence
+        and broadcasts the decision to prevent deadlocks.
 
         Returns (converged: bool, disc_rewards: list[float]).
         """
@@ -248,8 +265,8 @@ class InnerLoopController:
         inner_iters = 0
 
         while agent._sample_count < self.max_samples:
-            train_info = agent._train_iter()
-            agent._sample_count = agent._update_sample_count()
+            train_info = agent._train_iter()                      # COLLECTIVE
+            agent._sample_count = agent._update_sample_count()    # COLLECTIVE
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
@@ -262,52 +279,68 @@ class InnerLoopController:
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
 
-                test_info = agent.test_model(agent._test_episodes)
+                test_info = agent.test_model(agent._test_episodes)  # ALL ranks
 
-            # MimicKit native logging: populate logger + print every iter
+            # MimicKit native logging: populate logger (contains collective ops)
             env_diag_info = env.get_diagnostics()
             agent._log_train_info(train_info, test_info, env_diag_info,
-                                  start_time)
-            agent._logger.print_log()
+                                  start_time)                     # COLLECTIVE
+
+            # Only root prints/writes logs
+            if self.is_root:
+                agent._logger.print_log()
 
             if output_iter:
-                agent._logger.write_log()
-                agent.save(checkpoint_path)
+                if self.is_root:
+                    agent._logger.write_log()
+                    agent.save(checkpoint_path)
 
-                # wandb: forward inner loop metrics (only on output iters,
-                # matching vanilla MimicKit's tensorboard write frequency)
-                if self.use_wandb:
-                    wlog = {}
-                    for k, entry in agent._logger.log_current_row.items():
-                        v = entry.val
+                    # wandb: forward inner loop metrics
+                    if self.use_wandb:
+                        wlog = {}
+                        for k, entry in agent._logger.log_current_row.items():
+                            v = entry.val
+                            try:
+                                wlog[f"inner/{k}"] = float(v)
+                            except (TypeError, ValueError):
+                                pass
+                        if wlog:
+                            wandb.log(wlog)
+
+                    # Video capture every video_interval iterations
+                    if (self.use_wandb and self.viewer is not None
+                            and agent._iter % self.video_interval == 0):
                         try:
-                            wlog[f"inner/{k}"] = float(v)
-                        except (TypeError, ValueError):
-                            pass
-                    if wlog:
-                        wandb.log(wlog)
+                            video = capture_video(
+                                self.viewer, agent, env, self.engine,
+                                num_steps=200,
+                            )
+                            if video is not None:
+                                wandb.log({"inner/video": wandb.Video(
+                                    video, fps=30, format="mp4",
+                                )})
+                        except Exception as e:
+                            print(f"  [Inner Loop] Video logging failed: {e}")
 
-                # Video capture every video_interval iterations
-                if (self.use_wandb and self.viewer is not None
-                        and agent._iter % self.video_interval == 0):
-                    try:
-                        video = capture_video(
-                            self.viewer, agent, env, self.engine,
-                            num_steps=200,
-                        )
-                        if video is not None:
-                            wandb.log({"inner/video": wandb.Video(
-                                video, fps=30, format="mp4",
-                            )})
-                    except Exception as e:
-                        print(f"  [Inner Loop] Video logging failed: {e}")
+                # Convergence check: root decides, broadcast to all ranks
+                should_stop = False
+                if self.is_root:
+                    should_stop = (inner_iters >= self.min_inner_iters
+                                   and self._check_plateau(disc_rewards))
 
-                if inner_iters >= self.min_inner_iters and self._check_plateau(disc_rewards):
-                    recent = disc_rewards[-self.plateau_window:]
-                    spread = max(recent) - min(recent)
-                    print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
-                          f"{inner_iters} iters, "
-                          f"disc_reward={np.mean(recent):.4f}, spread={spread:.4f})")
+                if mp_util.enable_mp():
+                    flag = torch.tensor([int(should_stop)], dtype=torch.int32,
+                                        device=self.device)
+                    flag = mp_util.broadcast(flag)
+                    should_stop = flag.item() == 1
+
+                if should_stop:
+                    if self.is_root:
+                        recent = disc_rewards[-self.plateau_window:]
+                        spread = max(recent) - min(recent)
+                        print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
+                              f"{inner_iters} iters, "
+                              f"disc_reward={np.mean(recent):.4f}, spread={spread:.4f})")
                     converged = True
                     break
 
@@ -319,8 +352,9 @@ class InnerLoopController:
             inner_iters += 1
 
         if not converged:
-            agent.save(checkpoint_path)
-            print(f"    [Inner] Sample cap reached ({agent._sample_count:,})")
+            if self.is_root:
+                agent.save(checkpoint_path)
+                print(f"    [Inner] Sample cap reached ({agent._sample_count:,})")
 
         return converged, disc_rewards
 
@@ -401,84 +435,110 @@ def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
 
 
 # ---------------------------------------------------------------------------
-# Main PGHC loop
+# Main PGHC loop (one per GPU rank)
 # ---------------------------------------------------------------------------
 
-def pghc_codesign_g1_unified(args):
-    """Unified single-process PGHC co-design for G1 humanoid."""
-    print("=" * 70)
-    print("PGHC Co-Design for G1 Humanoid (Level 3 — Unified Single-Process)")
-    print("=" * 70)
+def pghc_worker(rank, num_procs, device, master_port, args):
+    """Unified single-process PGHC co-design for G1 humanoid.
 
-    device = "cuda:0"
+    Each GPU rank runs this function. The inner loop (MimicKit training) is
+    distributed across all ranks via torch.distributed collective ops. BPTT
+    gradient computation runs on rank 0 only; theta is broadcast after.
+    """
+    is_root = (rank == 0)
+    per_rank_envs = args.num_train_envs // num_procs
+
+    # Seed per rank for diverse rollouts
+    seed = int(np.uint64(42) + np.uint64(41 * rank))
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+
+    # Initialize torch.distributed (NCCL on Linux, gloo on Windows)
+    mp_util.init(rank, num_procs, device, master_port)
+
+    if is_root:
+        print("=" * 70)
+        print("PGHC Co-Design for G1 Humanoid (Level 3 — Unified Single-Process)")
+        if num_procs > 1:
+            print(f"  Multi-GPU: {num_procs} GPUs, {per_rank_envs} envs/GPU "
+                  f"({args.num_train_envs} total)")
+        print("=" * 70)
+
     out_dir = Path(args.out_dir).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    if is_root:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    if mp_util.enable_mp():
+        torch.distributed.barrier()
 
-    # --- wandb ---
-    use_wandb = args.wandb and WANDB_AVAILABLE
+    # --- wandb (root only) ---
+    use_wandb = is_root and args.wandb and WANDB_AVAILABLE
     if use_wandb:
         wandb.init(
             project="pghc-codesign",
-            name=f"g1-unified-{args.num_train_envs}env",
+            name=f"g1-unified-{args.num_train_envs}env-{num_procs}gpu",
             config=vars(args),
         )
-    elif args.wandb:
+    elif is_root and args.wandb:
         print("  [wandb] Not available, continuing without")
 
     # =========================================================
     # One-time initialization
     # =========================================================
-    print("\n[1/4] Initializing MimicKit...")
-    try:
-        mp_util.init(0, 1, device, np.random.randint(6000, 7000))
-    except (AssertionError, Exception):
-        pass  # Already initialized
+    if is_root:
+        print("\n[1/4] Initializing MimicKit...")
 
     # Generate initial MJCF (theta=0 = unmodified base G1)
     theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
     mjcf_modifier = G1MJCFModifier(str(BASE_MJCF_PATH))
 
     modified_mjcf = out_dir / "g1_modified.xml"
-    mjcf_modifier.generate(theta, str(modified_mjcf))
-
-    # Mesh directory symlink for MJCF relative paths
-    mesh_src = BASE_MJCF_PATH.parent / "meshes"
-    mesh_dst = out_dir / "meshes"
-    if not mesh_dst.exists():
-        try:
-            mesh_dst.symlink_to(mesh_src)
-        except (OSError, NotImplementedError):
-            shutil.copytree(str(mesh_src), str(mesh_dst))
-
-    # Env config pointing to modified MJCF
     modified_env_config = out_dir / "env_config.yaml"
-    mjcf_modifier.generate_env_config(
-        str(modified_mjcf), str(BASE_ENV_CONFIG), str(modified_env_config)
-    )
 
-    print("[2/4] Building training env and agent...")
+    if is_root:
+        mjcf_modifier.generate(theta, str(modified_mjcf))
+
+        # Mesh directory symlink for MJCF relative paths
+        mesh_src = BASE_MJCF_PATH.parent / "meshes"
+        mesh_dst = out_dir / "meshes"
+        if not mesh_dst.exists():
+            try:
+                mesh_dst.symlink_to(mesh_src)
+            except (OSError, NotImplementedError):
+                shutil.copytree(str(mesh_src), str(mesh_dst))
+
+        # Env config pointing to modified MJCF
+        mjcf_modifier.generate_env_config(
+            str(modified_mjcf), str(BASE_ENV_CONFIG), str(modified_env_config)
+        )
+
+    if mp_util.enable_mp():
+        torch.distributed.barrier()  # all ranks wait for MJCF + config files
+
+    if is_root:
+        print("[2/4] Building training env and agent...")
     env = env_builder.build_env(
         str(modified_env_config), str(BASE_ENGINE_CONFIG),
-        args.num_train_envs, device, visualize=False,
+        per_rank_envs, device, visualize=False,
     )
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
 
     if args.resume_checkpoint:
         agent.load(args.resume_checkpoint)
-        print(f"  Resumed from {args.resume_checkpoint}")
+        if is_root:
+            print(f"  Resumed from {args.resume_checkpoint}")
 
-    # Logger for MimicKit internals (test_model() logs via agent._logger)
-    log_file = str(out_dir / "training_log.txt")
+    # Logger for MimicKit internals (all ranks need it for _log_train_info)
+    log_file = str(out_dir / f"training_log_rank{rank}.txt")
     agent._logger = agent._build_logger("tb", log_file, agent._config)
 
-    # Extract joint info from training Newton model
+    # Extract joint info from training Newton model (per-rank model)
     engine = env._engine
     sim_model = engine._sim_model
     base_quats_dict, joint_idx_map = extract_joint_info(
-        sim_model, args.num_train_envs
+        sim_model, per_rank_envs
     )
 
-    # Headless viewer for video capture (wandb)
+    # Headless viewer for video capture (root only)
     viewer = None
     if use_wandb:
         try:
@@ -495,26 +555,16 @@ def pghc_codesign_g1_unified(args):
             viewer = None
 
     # DiffG1Eval is built LAZILY in the outer loop (right before BPTT) and
-    # freed immediately after. This prevents 2-4 GiB VRAM from coexisting
-    # with the training model during the inner loop.
-    # --- COMMENTED OUT: was built at startup, wasting VRAM during training ---
-    # print("[3/4] Building differentiable eval model...")
-    # diff_eval = DiffG1Eval(
-    #     mjcf_modifier=mjcf_modifier,
-    #     theta_np=theta,
-    #     num_worlds=args.num_eval_worlds,
-    #     horizon=args.eval_horizon,
-    #     dt=1.0 / 30.0,
-    #     num_substeps=8,
-    #     device=device,
-    # )
-    diff_eval = None  # Built lazily in outer loop
-    print("[3/4] DiffG1Eval will be built lazily before each BPTT phase")
+    # freed immediately after. Only rank 0 builds it.
+    diff_eval = None
+    if is_root:
+        print("[3/4] DiffG1Eval will be built lazily before each BPTT phase")
 
     # =========================================================
     # Outer loop setup
     # =========================================================
-    print("[4/4] Starting PGHC outer loop...\n")
+    if is_root:
+        print("[4/4] Starting PGHC outer loop...\n")
 
     design_optimizer = AdamOptimizer(NUM_DESIGN_PARAMS, lr=args.design_lr)
     theta_bounds = (-0.5236, 0.5236)  # +/-30 deg
@@ -535,6 +585,8 @@ def pghc_codesign_g1_unified(args):
         viewer=viewer,
         engine=engine,
         video_interval=args.video_interval,
+        is_root=is_root,
+        device=device,
     )
 
     history = {
@@ -546,34 +598,39 @@ def pghc_codesign_g1_unified(args):
     }
     theta_history = deque(maxlen=5)
 
-    print(f"Configuration:")
-    print(f"  Training envs:     {args.num_train_envs}")
-    print(f"  Eval worlds:       {args.num_eval_worlds}")
-    print(f"  Eval horizon:      {args.eval_horizon} steps "
-          f"({args.eval_horizon / 30:.1f}s)")
-    print(f"  Max inner samples: {args.max_inner_samples:,}")
-    print(f"  Design optimizer:  Adam (lr={args.design_lr})")
-    print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
-    print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
-    if args.kickoff_min_iters > 0:
-        print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
+    if is_root:
+        print(f"Configuration:")
+        print(f"  Training envs:     {args.num_train_envs} total "
+              f"({per_rank_envs}/GPU x {num_procs} GPUs)")
+        print(f"  Eval worlds:       {args.num_eval_worlds}")
+        print(f"  Eval horizon:      {args.eval_horizon} steps "
+              f"({args.eval_horizon / 30:.1f}s)")
+        print(f"  Max inner samples: {args.max_inner_samples:,}")
+        print(f"  Design optimizer:  Adam (lr={args.design_lr})")
+        print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
+        print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
+        if args.kickoff_min_iters > 0:
+            print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
 
     # =========================================================
     # Outer loop
     # =========================================================
     for outer_iter in range(args.outer_iters):
-        print(f"\n{'=' * 70}")
-        print(f"Outer Iteration {outer_iter + 1}/{args.outer_iters}")
-        print(f"{'=' * 70}")
+        if is_root:
+            print(f"\n{'=' * 70}")
+            print(f"Outer Iteration {outer_iter + 1}/{args.outer_iters}")
+            print(f"{'=' * 70}")
 
-        theta_deg = np.degrees(theta)
-        for i, name in enumerate(param_names):
-            print(f"  {name}: {theta[i]:+.4f} rad ({theta_deg[i]:+.2f} deg)")
+            theta_deg = np.degrees(theta)
+            for i, name in enumerate(param_names):
+                print(f"  {name}: {theta[i]:+.4f} rad ({theta_deg[i]:+.2f} deg)")
 
         iter_dir = out_dir / f"outer_{outer_iter:03d}"
 
-        # ----- Inner Loop -----
-        print(f"\n  [Inner Loop] Training ({args.num_train_envs} envs)...")
+        # ----- Inner Loop (ALL ranks) -----
+        if is_root:
+            print(f"\n  [Inner Loop] Training ({per_rank_envs} envs/GPU "
+                  f"x {num_procs} GPUs)...")
         t0 = time.time()
 
         try:
@@ -581,11 +638,13 @@ def pghc_codesign_g1_unified(args):
                 iter_dir
             )
             inner_time = time.time() - t0
-            print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min")
+            if is_root:
+                print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min")
         except Exception as e:
-            print(f"  [Inner Loop] FAILED: {e}")
-            import traceback
-            traceback.print_exc()
+            if is_root:
+                print(f"  [Inner Loop] FAILED: {e}")
+                import traceback
+                traceback.print_exc()
             history["inner_times"].append(time.time() - t0)
             continue
 
@@ -593,143 +652,176 @@ def pghc_codesign_g1_unified(args):
 
         # After kickoff, allow convergence without minimum iter gate
         if outer_iter == 0 and inner_ctrl.min_inner_iters > 0:
-            print(f"  [Kickoff] Disabling min_inner_iters "
-                  f"({inner_ctrl.min_inner_iters}) for subsequent iters")
+            if is_root:
+                print(f"  [Kickoff] Disabling min_inner_iters "
+                      f"({inner_ctrl.min_inner_iters}) for subsequent iters")
             inner_ctrl.min_inner_iters = 0
 
-        # ----- Collect Actions -----
-        print(f"\n  [Actions] Collecting ({args.num_eval_worlds} worlds x "
-              f"{args.eval_horizon} steps)...")
+        # ----- BPTT Phase (rank 0 only) -----
+        # Non-root ranks wait at the theta broadcast below.
+        grad_theta = None
+        fwd_dist = None
+        cot = None
 
-        actions_list = collect_actions_from_agent(
-            agent, env, args.num_eval_worlds, args.eval_horizon
-        )
-        print(f"    Got {len(actions_list)} steps x {actions_list[0].shape}")
+        if is_root:
+            # Collect actions from frozen policy
+            print(f"\n  [Actions] Collecting ({args.num_eval_worlds} worlds x "
+                  f"{args.eval_horizon} steps)...")
 
-        # ----- BPTT Gradient -----
-        print(f"\n  [BPTT] Building DiffG1Eval lazily...")
+            actions_list = collect_actions_from_agent(
+                agent, env, args.num_eval_worlds, args.eval_horizon
+            )
+            print(f"    Got {len(actions_list)} steps x {actions_list[0].shape}")
 
-        # Enable backward ONLY for BPTT kernel compilation
-        wp.config.enable_backward = True
+            # Build DiffG1Eval lazily
+            print(f"\n  [BPTT] Building DiffG1Eval lazily...")
 
-        diff_eval = DiffG1Eval(
-            mjcf_modifier=mjcf_modifier,
-            theta_np=theta.copy(),
-            num_worlds=args.num_eval_worlds,
-            horizon=args.eval_horizon,
-            dt=1.0 / 30.0,
-            num_substeps=8,
-            device=device,
-        )
+            # Enable backward ONLY for BPTT kernel compilation
+            wp.config.enable_backward = True
 
-        print(f"  [BPTT] Computing gradient...")
-        grad_theta, fwd_dist, cot = diff_eval.compute_gradient(actions_list)
+            diff_eval = DiffG1Eval(
+                mjcf_modifier=mjcf_modifier,
+                theta_np=theta.copy(),
+                num_worlds=args.num_eval_worlds,
+                horizon=args.eval_horizon,
+                dt=1.0 / 30.0,
+                num_substeps=8,
+                device=device,
+            )
 
-        # Free DiffG1Eval immediately (reclaim 2-4 GiB VRAM)
-        diff_eval.cleanup()
-        diff_eval = None
-        gc.collect()
-        torch.cuda.empty_cache()
+            print(f"  [BPTT] Computing gradient...")
+            grad_theta, fwd_dist, cot = diff_eval.compute_gradient(actions_list)
 
-        # Restore enable_backward = False for next inner loop
-        wp.config.enable_backward = False
-        print(f"  [BPTT] DiffG1Eval freed, VRAM reclaimed")
+            # Free DiffG1Eval immediately (reclaim 2-4 GiB VRAM)
+            diff_eval.cleanup()
+            diff_eval = None
+            gc.collect()
+            torch.cuda.empty_cache()
 
-        print(f"    BPTT gradients:")
-        for i, name in enumerate(param_names):
-            print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
-        print(f"    Forward distance = {fwd_dist:.3f} m")
-        print(f"    Cost of Transport = {cot:.4f}")
+            # Restore enable_backward = False for next inner loop
+            wp.config.enable_backward = False
+            print(f"  [BPTT] DiffG1Eval freed, VRAM reclaimed")
 
-        history["forward_dist"].append(fwd_dist)
-        history["cot"].append(cot)
-        history["gradients"].append(grad_theta.copy())
+            print(f"    BPTT gradients:")
+            for i, name in enumerate(param_names):
+                print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
+            print(f"    Forward distance = {fwd_dist:.3f} m")
+            print(f"    Cost of Transport = {cot:.4f}")
 
-        # ----- Design Update -----
-        if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
-            print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — terminating.")
+            history["forward_dist"].append(fwd_dist)
+            history["cot"].append(cot)
+            history["gradients"].append(grad_theta.copy())
+
+            # ----- Design Update -----
+            if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
+                print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
+                      f"signaling all ranks to stop.")
+                # Signal via NaN theta — all ranks will detect and break
+                theta[:] = np.nan
+            else:
+                old_theta = theta.copy()
+                theta = design_optimizer.step(theta, grad_theta)
+                theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
+
+                print(f"\n  Design update:")
+                for i, name in enumerate(param_names):
+                    delta = theta[i] - old_theta[i]
+                    print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
+                          f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
+
+        # ----- Broadcast theta to all ranks -----
+        # Non-root ranks block here until root finishes BPTT
+        theta_tensor = torch.from_numpy(theta).float().to(device)
+        if mp_util.enable_mp():
+            theta_tensor = mp_util.broadcast(theta_tensor)
+        theta = theta_tensor.cpu().double().numpy()
+
+        # Check for NaN signal (degenerate gradient on root)
+        if np.any(np.isnan(theta)):
             break
-
-        old_theta = theta.copy()
-        theta = design_optimizer.step(theta, grad_theta)
-        theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
-
-        print(f"\n  Design update:")
-        for i, name in enumerate(param_names):
-            delta = theta[i] - old_theta[i]
-            print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
-                  f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
 
         history["theta"].append(theta.copy())
 
-        # Update training model for next outer iteration
+        # ALL ranks: update their local Newton model
         update_training_joint_X_p(
             sim_model, theta, base_quats_dict, joint_idx_map,
-            args.num_train_envs
+            per_rank_envs
         )
 
-        # Save checkpoints
-        np.save(str(out_dir / "theta_latest.npy"), theta)
-        np.save(str(iter_dir / "theta.npy"), theta)
-        np.save(str(iter_dir / "grad.npy"), grad_theta)
+        # Root: save checkpoints + wandb
+        if is_root:
+            np.save(str(out_dir / "theta_latest.npy"), theta)
+            np.save(str(iter_dir / "theta.npy"), theta)
+            np.save(str(iter_dir / "grad.npy"), grad_theta)
 
-        # wandb logging
-        if use_wandb:
-            log_dict = {
-                "outer/iteration": outer_iter + 1,
-                "outer/eval_forward_distance": fwd_dist,
-                "outer/cot": cot,
-                "outer/inner_time_min": inner_time / 60.0,
-                "outer/grad_norm": np.linalg.norm(grad_theta),
-            }
-            for i, name in enumerate(param_names):
-                log_dict[f"outer/{name}_rad"] = theta[i]
-                log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
-                log_dict[f"outer/grad_{name}"] = grad_theta[i]
-            if disc_rewards:
-                log_dict["outer/final_disc_reward"] = disc_rewards[-1]
-            wandb.log(log_dict)
+            if use_wandb:
+                log_dict = {
+                    "outer/iteration": outer_iter + 1,
+                    "outer/eval_forward_distance": fwd_dist,
+                    "outer/cot": cot,
+                    "outer/inner_time_min": inner_time / 60.0,
+                    "outer/grad_norm": np.linalg.norm(grad_theta),
+                }
+                for i, name in enumerate(param_names):
+                    log_dict[f"outer/{name}_rad"] = theta[i]
+                    log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
+                    log_dict[f"outer/grad_{name}"] = grad_theta[i]
+                if disc_rewards:
+                    log_dict["outer/final_disc_reward"] = disc_rewards[-1]
+                wandb.log(log_dict)
 
-            # Save artifacts to wandb files
-            wandb.save(str(iter_dir / "model.pt"), base_path=str(out_dir))
-            wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
-            wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
-            wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
+                # Save artifacts to wandb files
+                wandb.save(str(iter_dir / "model.pt"), base_path=str(out_dir))
+                wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
+                wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
+                wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
 
-        # Outer convergence check
-        theta_history.append(theta.copy())
-        if len(theta_history) >= 5:
-            theta_stack = np.array(list(theta_history))
-            ranges = theta_stack.max(axis=0) - theta_stack.min(axis=0)
-            max_range = ranges.max()
-            if max_range < np.radians(0.5):
-                print(f"\n  OUTER CONVERGED: theta stable "
-                      f"(max range = {np.degrees(max_range):.3f} deg)")
-                break
+        # ----- Outer convergence check -----
+        outer_converged = False
+        if is_root:
+            theta_history.append(theta.copy())
+            if len(theta_history) >= 5:
+                theta_stack = np.array(list(theta_history))
+                ranges = theta_stack.max(axis=0) - theta_stack.min(axis=0)
+                max_range = ranges.max()
+                if max_range < np.radians(0.5):
+                    print(f"\n  OUTER CONVERGED: theta stable "
+                          f"(max range = {np.degrees(max_range):.3f} deg)")
+                    outer_converged = True
+
+        if mp_util.enable_mp():
+            flag = torch.tensor([int(outer_converged)], dtype=torch.int32,
+                                device=device)
+            flag = mp_util.broadcast(flag)
+            outer_converged = flag.item() == 1
+
+        if outer_converged:
+            break
 
     # =========================================================
     # Final results
     # =========================================================
-    print("\n" + "=" * 70)
-    print("PGHC Co-Design Complete!")
-    print("=" * 70)
+    if is_root:
+        print("\n" + "=" * 70)
+        print("PGHC Co-Design Complete!")
+        print("=" * 70)
 
-    initial = history["theta"][0]
-    final = history["theta"][-1]
-    for i, name in enumerate(param_names):
-        print(f"  {name}: {initial[i]:+.4f} -> {final[i]:+.4f} "
-              f"({np.degrees(initial[i]):+.2f} -> "
-              f"{np.degrees(final[i]):+.2f} deg)")
+        initial = history["theta"][0]
+        final = history["theta"][-1]
+        for i, name in enumerate(param_names):
+            print(f"  {name}: {initial[i]:+.4f} -> {final[i]:+.4f} "
+                  f"({np.degrees(initial[i]):+.2f} -> "
+                  f"{np.degrees(final[i]):+.2f} deg)")
 
-    if history["forward_dist"]:
-        print(f"\nForward distance: {history['forward_dist'][0]:.3f} -> "
-              f"{history['forward_dist'][-1]:.3f} m")
-    if history["cot"]:
-        print(f"Cost of Transport: {history['cot'][0]:.4f} -> "
-              f"{history['cot'][-1]:.4f}")
+        if history["forward_dist"]:
+            print(f"\nForward distance: {history['forward_dist'][0]:.3f} -> "
+                  f"{history['forward_dist'][-1]:.3f} m")
+        if history["cot"]:
+            print(f"Cost of Transport: {history['cot'][0]:.4f} -> "
+                  f"{history['cot'][-1]:.4f}")
 
-    total_time = sum(history["inner_times"])
-    print(f"Total inner loop time: {total_time / 3600:.1f} hours")
+        total_time = sum(history["inner_times"])
+        print(f"Total inner loop time: {total_time / 3600:.1f} hours")
 
     # Cleanup
     if diff_eval is not None:
@@ -752,7 +844,8 @@ if __name__ == "__main__":
                         help="Enable wandb logging for outer loop")
     parser.add_argument("--outer-iters", type=int, default=20)
     parser.add_argument("--design-lr", type=float, default=0.005)
-    parser.add_argument("--num-train-envs", type=int, default=4096)
+    parser.add_argument("--num-train-envs", type=int, default=4096,
+                        help="Total training envs (divided across GPUs)")
     parser.add_argument("--num-eval-worlds", type=int, default=32)
     parser.add_argument("--eval-horizon", type=int, default=100)
     parser.add_argument("--max-inner-samples", type=int, default=2_000_000_000)
@@ -769,6 +862,38 @@ if __name__ == "__main__":
                         help="Min inner iters before convergence on first outer iter (0=disabled)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
+    # Multi-GPU arguments
+    parser.add_argument("--devices", nargs="+", default=["cuda:0"],
+                        help="CUDA devices for multi-GPU training "
+                             "(e.g., cuda:0 cuda:1 cuda:2 cuda:3)")
+    parser.add_argument("--master-port", type=int, default=None,
+                        help="Port for torch.distributed (default: random 6000-7000)")
     args = parser.parse_args()
 
-    pghc_codesign_g1_unified(args)
+    num_workers = len(args.devices)
+    assert args.num_train_envs % num_workers == 0, (
+        f"--num-train-envs ({args.num_train_envs}) must be divisible by "
+        f"number of devices ({num_workers})"
+    )
+
+    master_port = args.master_port if args.master_port is not None else random.randint(6000, 7000)
+
+    if num_workers > 1:
+        torch.multiprocessing.set_start_method("spawn")
+        processes = []
+        for r in range(1, num_workers):
+            p = torch.multiprocessing.Process(
+                target=pghc_worker,
+                args=[r, num_workers, args.devices[r], master_port, args],
+            )
+            p.start()
+            processes.append(p)
+
+        # Root process runs in main thread
+        pghc_worker(0, num_workers, args.devices[0], master_port, args)
+
+        for p in processes:
+            p.join()
+    else:
+        # Single GPU — backward compatible, no spawn overhead
+        pghc_worker(0, 1, args.devices[0], master_port, args)
