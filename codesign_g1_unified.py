@@ -270,14 +270,17 @@ class InnerLoopController:
                 # Video capture every video_interval iterations
                 if (self.use_wandb and self.viewer is not None
                         and agent._iter % self.video_interval == 0):
-                    video = capture_video(
-                        self.viewer, agent, env, self.engine,
-                        num_steps=200,
-                    )
-                    if video is not None:
-                        wandb.log({"inner/video": wandb.Video(
-                            video, fps=30, format="mp4",
-                        )})
+                    try:
+                        video = capture_video(
+                            self.viewer, agent, env, self.engine,
+                            num_steps=200,
+                        )
+                        if video is not None:
+                            wandb.log({"inner/video": wandb.Video(
+                                video, fps=30, format="mp4",
+                            )})
+                    except Exception as e:
+                        print(f"  [Inner Loop] Video logging failed: {e}")
 
                 if self._check_plateau(test_returns):
                     recent = test_returns[-self.plateau_window:]
