@@ -146,7 +146,10 @@ def extract_joint_info(model, num_worlds):
                 else:
                     print(f"  [WARN] Body/joint not found: {body_name}")
                     continue
-            base_quats_dict[body_name] = tuple(joint_X_p_np[idx, 3:7].tolist())
+            # joint_X_p numpy layout: [px,py,pz, qx,qy,qz,qw] (xyzw)
+            # Reorder to (qw,qx,qy,qz) for g1_mjcf_modifier's wxyz convention
+            raw = joint_X_p_np[idx, 3:7].tolist()  # [qx,qy,qz,qw]
+            base_quats_dict[body_name] = (raw[3], raw[0], raw[1], raw[2])  # (qw,qx,qy,qz)
             joint_idx_map[body_name] = idx
 
     print(f"  [JointInfo] Found {len(joint_idx_map)} parameterized joints "
@@ -172,11 +175,12 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
             if body_name not in joint_idx_map:
                 continue
             base_q = base_quats_dict[body_name]
-            new_q = quat_normalize(quat_multiply(delta_q, base_q))
+            new_q = quat_normalize(quat_multiply(delta_q, base_q))  # (w,x,y,z)
             local_idx = joint_idx_map[body_name]
             for w in range(num_worlds):
                 global_idx = w * joints_per_world + local_idx
-                joint_X_p_np[global_idx, 3:7] = new_q
+                # Convert wxyz → xyzw for joint_X_p numpy layout
+                joint_X_p_np[global_idx, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
 
     model.joint_X_p.assign(joint_X_p_np)
     wp.synchronize()
@@ -231,7 +235,9 @@ class InnerLoopController:
 
         # Reset counters and buffers (preserves network weights = warm-start)
         agent._curr_obs, agent._curr_info = agent._reset_envs()
+        saved_iter = agent._iter  # preserve continuous iter count across outer loops
         agent._init_train()
+        agent._iter = saved_iter  # restore so wandb x-axis is monotonic
 
         disc_rewards = []
         converged = False
@@ -626,6 +632,10 @@ def pghc_codesign_g1_unified(args):
         history["gradients"].append(grad_theta.copy())
 
         # ----- Design Update -----
+        if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
+            print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — terminating.")
+            break
+
         old_theta = theta.copy()
         theta = design_optimizer.step(theta, grad_theta)
         theta = np.clip(theta, theta_bounds[0], theta_bounds[1])

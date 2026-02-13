@@ -64,8 +64,8 @@ def update_joint_X_p_from_theta_kernel(
     Launched with dim = num_param_joints * num_worlds.
     Each thread handles one (parameterized joint, world) pair.
     joint_X_p has dtype=transformf (pos: vec3f, rot: quatf).
-    base_quats stores the 4 quaternion components extracted from
-    joint_X_p.numpy()[:, 3:7] in the same memory layout order.
+    base_quats stores the 4 quaternion components in (w, x, y, z) order,
+    reordered from joint_X_p's native (x, y, z, w) layout at extraction.
     """
     tid = wp.tid()
     j = tid // num_worlds   # parameterized joint index (0..11)
@@ -81,7 +81,7 @@ def update_joint_X_p_from_theta_kernel(
     dw = wp.cos(half)
     dx = wp.sin(half)
 
-    # Base quat components (same order as joint_X_p numpy layout)
+    # Base quat components in (w, x, y, z) order (reordered at extraction)
     bw = base_quats[j, 0]
     bx = base_quats[j, 1]
     by = base_quats[j, 2]
@@ -104,9 +104,9 @@ def update_joint_X_p_from_theta_kernel(
     # Read current transform (preserves position), write new rotation
     global_idx = w * joints_per_world + joint_local_indices[j]
     pos = wp.transform_get_translation(joint_X_p[global_idx])
-    # quatf(x, y, z, w) maps to byte positions [3,4,5,6] — same layout as
-    # the old direct writes to joint_X_p[idx, 3..6]
-    joint_X_p[global_idx] = wp.transformf(pos, wp.quatf(nw, nx, ny, nz))
+    # wp.quatf() takes (x, y, z, w); Hamilton product gives (nw, nx, ny, nz)
+    # in wxyz order, so pass as quatf(nx, ny, nz, nw) to convert to xyzw.
+    joint_X_p[global_idx] = wp.transformf(pos, wp.quatf(nx, ny, nz, nw))
 
 
 @wp.kernel
@@ -374,7 +374,9 @@ class DiffG1Eval:
                 ignore_names=["floor", "ground"],
             )
 
-            single_builder.add_ground_plane()
+            # Match MimicKit ground friction (newton_engine.py _build_ground)
+            ground_cfg = single_builder.ShapeConfig(mu=1.0, restitution=0)
+            single_builder.add_ground_plane(cfg=ground_cfg)
 
             # Replicate for parallel worlds
             builder = newton.ModelBuilder()
@@ -383,6 +385,31 @@ class DiffG1Eval:
             self.model = builder.finalize(requires_grad=True)
             self.solver = newton.solvers.SolverSemiImplicit(self.model)
             self.control = self.model.control()
+
+            # Set PD gains matching MimicKit's ControlMode.pos behavior.
+            # Without this, joint_target_ke/kd are 0 and position targets
+            # produce zero torques — the robot just stands still.
+            if hasattr(self.model, 'mujoco'):
+                ke_np = self.model.mujoco.dof_passive_stiffness.numpy().copy()
+                kd_np = self.model.mujoco.dof_passive_damping.numpy().copy()
+                self.model.joint_target_ke.assign(ke_np)
+                self.model.joint_target_kd.assign(kd_np)
+                # Zero passive gains to avoid double-counting
+                self.model.mujoco.dof_passive_stiffness.assign(np.zeros_like(ke_np))
+                self.model.mujoco.dof_passive_damping.assign(np.zeros_like(kd_np))
+                nonzero_ke = ke_np[ke_np > 0]
+                nonzero_kd = kd_np[kd_np > 0]
+                print(f"    [DiffG1Eval] PD gains set: "
+                      f"ke={nonzero_ke.mean():.1f} (n={len(nonzero_ke)}), "
+                      f"kd={nonzero_kd.mean():.1f} (n={len(nonzero_kd)})")
+            else:
+                print("    [WARN] No mujoco attributes — setting default PD gains (ke=100, kd=10)")
+                ke_np = self.model.joint_target_ke.numpy()
+                kd_np = self.model.joint_target_kd.numpy()
+                ke_np[:] = 100.0
+                kd_np[:] = 10.0
+                self.model.joint_target_ke.assign(ke_np)
+                self.model.joint_target_kd.assign(kd_np)
 
             # Store joint structure info
             self.joints_per_world = self.model.joint_count // self.num_worlds
@@ -436,7 +463,10 @@ class DiffG1Eval:
                     joint_local_idx = body_name_to_idx[body_name]
                     param_joint_local_indices.append(joint_local_idx)
                     param_for_joint.append(param_idx)
-                    base_quats.append(joint_X_p_np[joint_local_idx, 3:7].copy())
+                    # joint_X_p numpy layout is [px,py,pz, qx,qy,qz,qw] (xyzw)
+                    # Reorder to (w,x,y,z) for the Hamilton product in the kernel
+                    raw = joint_X_p_np[joint_local_idx, 3:7].copy()  # [qx,qy,qz,qw]
+                    base_quats.append([raw[3], raw[0], raw[1], raw[2]])  # [qw,qx,qy,qz]
                 else:
                     # Try joint name (replace _link with _joint)
                     joint_name = body_name.replace("_link", "_joint")
@@ -444,7 +474,8 @@ class DiffG1Eval:
                         joint_local_idx = joint_name_to_idx[joint_name]
                         param_joint_local_indices.append(joint_local_idx)
                         param_for_joint.append(param_idx)
-                        base_quats.append(joint_X_p_np[joint_local_idx, 3:7].copy())
+                        raw = joint_X_p_np[joint_local_idx, 3:7].copy()
+                        base_quats.append([raw[3], raw[0], raw[1], raw[2]])
                     else:
                         print(f"    [WARN] Body/joint not found: {body_name}")
 
@@ -522,7 +553,13 @@ class DiffG1Eval:
             requires_grad=True, device=self.device,
         )
 
-        # Build init qpos from env config
+        # Build init qpos from env config.
+        # MimicKit init_pose format: [x,y,z, rx,ry,rz, dof0,dof1,...] where
+        # rotation is exp-map. For G1, root rot is [0,0,0] (identity) and
+        # the only non-zero DOFs are shoulder pitch (1.57 rad) at arms, which
+        # don't affect lower-body locomotion evaluation.
+        # Full DOF mapping is complex (ball-joint conversion changes indices),
+        # so we use MJCF defaults for joint angles and only override root pose.
         with open(str(BASE_ENV_CONFIG), "r") as f:
             env_cfg = yaml.safe_load(f)
         init_pose_list = env_cfg.get("init_pose", [])
@@ -532,12 +569,16 @@ class DiffG1Eval:
         wp.synchronize()
         init_qpos = init_state.joint_q.numpy().copy()
 
-        # Override: set z-height for each world's root
+        # Override root pose: z-height and identity quaternion
         z_height = float(init_pose_list[2]) if len(init_pose_list) > 2 else 0.8
         for w in range(self.num_worlds):
             q_start = w * self.joint_q_size
             init_qpos[q_start + 2] = z_height  # z position
+            # joint_q root quat: [qw, qx, qy, qz] at indices 3:7
             init_qpos[q_start + 3] = 1.0       # qw = 1
+            init_qpos[q_start + 4] = 0.0       # qx = 0
+            init_qpos[q_start + 5] = 0.0       # qy = 0
+            init_qpos[q_start + 6] = 0.0       # qz = 0
 
         self.init_qpos_wp = wp.array(init_qpos, dtype=float, device=self.device)
 
@@ -643,13 +684,18 @@ class DiffG1Eval:
                     ],
                 )
 
+                # Collide once per macro-step (not per substep) to avoid
+                # GPU memory accumulation — same fix as Known Issue #15.
+                macro_src = self.states[physics_step]
+                macro_src.clear_forces()
+                contacts = self.model.collide(macro_src)
+
                 # Substeps
                 for sub in range(self.num_substeps):
                     src = self.states[physics_step]
                     dst = self.states[physics_step + 1]
 
                     src.clear_forces()
-                    contacts = self.model.collide(src)
                     self.solver.step(src, dst, self.control, contacts, self.sub_dt)
 
                     # Accumulate joint velocity energy on tape
@@ -714,6 +760,12 @@ class DiffG1Eval:
             return np.zeros(NUM_DESIGN_PARAMS), mean_forward_dist, float(cot_val)
 
         grad_np = theta_grad.numpy().copy()
+
+        # Guard against NaN/Inf gradients (degenerate backward pass)
+        if np.any(np.isnan(grad_np)) or np.any(np.isinf(grad_np)):
+            print("    [WARN] NaN/Inf in theta gradient, returning zeros")
+            tape.zero()
+            return np.zeros(NUM_DESIGN_PARAMS), float(mean_forward_dist), float(cot_val)
 
         # loss = CoT → minimize CoT
         # reward_grad = -∂loss/∂theta (gradient ascent on -CoT = descent on CoT)
