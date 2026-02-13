@@ -189,14 +189,14 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
 class InnerLoopController:
     """Drives MimicKit agent._train_iter() with convergence detection."""
 
-    def __init__(self, agent, plateau_threshold=0.02, plateau_window=50,
-                 min_plateau_iters=200, max_samples=200_000_000,
+    def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
+                 min_plateau_outputs=10, max_samples=200_000_000,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
-        self.min_plateau_iters = min_plateau_iters
+        self.min_plateau_outputs = min_plateau_outputs
         self.max_samples = max_samples
         self.use_wandb = use_wandb
         self.viewer = viewer
@@ -204,7 +204,7 @@ class InnerLoopController:
         self.video_interval = video_interval
 
     def _check_plateau(self, values):
-        n_required = max(self.plateau_window, self.min_plateau_iters)
+        n_required = max(self.plateau_window, self.min_plateau_outputs)
         if len(values) < n_required:
             return False
         recent = values[-self.plateau_window:]
@@ -217,11 +217,11 @@ class InnerLoopController:
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or sample cap.
 
-        Convergence is detected when the training disc_reward_mean plateaus,
-        since AMP's env reward is 0 (discriminator reward is the real signal)
-        and episode length alone can plateau once the robot learns to stand.
+        Convergence is detected when disc_reward_mean (sampled at output
+        iterations, before env reset) plateaus. AMP's env reward is 0 —
+        the discriminator reward is the real quality signal.
 
-        Returns (converged: bool, disc_reward_ema_history: list[float]).
+        Returns (converged: bool, disc_rewards: list[float]).
         """
         agent = self.agent
         env = agent._env
@@ -233,9 +233,7 @@ class InnerLoopController:
         agent._curr_obs, agent._curr_info = agent._reset_envs()
         agent._init_train()
 
-        disc_reward_ema = None
-        disc_reward_ema_history = []
-        ema_alpha = 0.05  # smoothing factor — lower = smoother
+        disc_rewards = []
         converged = False
         start_time = time.time()
         test_info = None
@@ -246,18 +244,15 @@ class InnerLoopController:
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
-            # Track EMA of disc_reward_mean (smooths out sawtooth from env resets)
-            disc_r = train_info.get("disc_reward_mean")
-            if disc_r is not None:
-                if torch.is_tensor(disc_r):
-                    disc_r = disc_r.item()
-                if disc_reward_ema is None:
-                    disc_reward_ema = disc_r
-                else:
-                    disc_reward_ema = ema_alpha * disc_r + (1 - ema_alpha) * disc_reward_ema
-                disc_reward_ema_history.append(disc_reward_ema)
-
             if output_iter:
+                # Sample disc_reward_mean here — before env reset, so no
+                # sawtooth spike (spike happens on the iter AFTER reset)
+                disc_r = train_info.get("disc_reward_mean")
+                if disc_r is not None:
+                    if torch.is_tensor(disc_r):
+                        disc_r = disc_r.item()
+                    disc_rewards.append(disc_r)
+
                 test_info = agent.test_model(agent._test_episodes)
 
             # MimicKit native logging: populate logger + print every iter
@@ -298,11 +293,11 @@ class InnerLoopController:
                     except Exception as e:
                         print(f"  [Inner Loop] Video logging failed: {e}")
 
-                if self._check_plateau(disc_reward_ema_history):
-                    recent = disc_reward_ema_history[-self.plateau_window:]
+                if self._check_plateau(disc_rewards):
+                    recent = disc_rewards[-self.plateau_window:]
                     spread = max(recent) - min(recent)
-                    print(f"    [Inner] CONVERGED ({len(disc_reward_ema_history)} iters, "
-                          f"disc_reward_ema={np.mean(recent):.4f}, spread={spread:.4f})")
+                    print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
+                          f"disc_reward={np.mean(recent):.4f}, spread={spread:.4f})")
                     converged = True
                     break
 
@@ -316,7 +311,7 @@ class InnerLoopController:
             agent.save(checkpoint_path)
             print(f"    [Inner] Sample cap reached ({agent._sample_count:,})")
 
-        return converged, disc_reward_ema_history
+        return converged, disc_rewards
 
 
 # ---------------------------------------------------------------------------
@@ -522,7 +517,7 @@ def pghc_codesign_g1_unified(args):
         agent,
         plateau_threshold=args.plateau_threshold,
         plateau_window=args.plateau_window,
-        min_plateau_iters=args.min_plateau_iters,
+        min_plateau_outputs=args.min_plateau_outputs,
         max_samples=args.max_inner_samples,
         use_wandb=use_wandb,
         viewer=viewer,
@@ -568,7 +563,7 @@ def pghc_codesign_g1_unified(args):
         t0 = time.time()
 
         try:
-            converged, disc_ema_hist = inner_ctrl.train_until_converged(
+            converged, disc_rewards = inner_ctrl.train_until_converged(
                 iter_dir
             )
             inner_time = time.time() - t0
@@ -667,8 +662,8 @@ def pghc_codesign_g1_unified(args):
                 log_dict[f"outer/{name}_rad"] = theta[i]
                 log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
                 log_dict[f"outer/grad_{name}"] = grad_theta[i]
-            if disc_ema_hist:
-                log_dict["outer/final_disc_reward_ema"] = disc_ema_hist[-1]
+            if disc_rewards:
+                log_dict["outer/final_disc_reward"] = disc_rewards[-1]
             wandb.log(log_dict)
 
         # Outer convergence check
@@ -736,10 +731,10 @@ if __name__ == "__main__":
                         help="MimicKit checkpoint to resume from")
     parser.add_argument("--plateau-threshold", type=float, default=0.02,
                         help="Inner convergence: relative change threshold")
-    parser.add_argument("--plateau-window", type=int, default=50,
-                        help="Inner convergence: window size (in training iters)")
-    parser.add_argument("--min-plateau-iters", type=int, default=200,
-                        help="Inner convergence: min iters before early stop")
+    parser.add_argument("--plateau-window", type=int, default=5,
+                        help="Inner convergence: window size (in output intervals)")
+    parser.add_argument("--min-plateau-outputs", type=int, default=10,
+                        help="Inner convergence: min output intervals before early stop")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     args = parser.parse_args()
