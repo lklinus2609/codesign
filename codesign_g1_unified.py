@@ -31,6 +31,26 @@ Run:
 import os
 os.environ["PYGLET_HEADLESS"] = "1"
 
+# ---------------------------------------------------------------------------
+# Multi-GPU device isolation (must run BEFORE any GPU library imports)
+#
+# Spawned worker processes inherit _PGHC_GPU_INDEX from the parent.  We read
+# it here — at module import time — and restrict CUDA_VISIBLE_DEVICES to that
+# single physical GPU.  This ensures warp/torch/newton only see one device,
+# avoiding cross-device allocation failures on HPC nodes.
+# ---------------------------------------------------------------------------
+_PGHC_GPU_INDEX = os.environ.pop("_PGHC_GPU_INDEX", None)
+if _PGHC_GPU_INDEX is not None:
+    _orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if _orig_cvd:
+        _gpu_list = [g.strip() for g in _orig_cvd.split(",")]
+        _idx = int(_PGHC_GPU_INDEX)
+        os.environ["CUDA_VISIBLE_DEVICES"] = (
+            _gpu_list[_idx] if _idx < len(_gpu_list) else _PGHC_GPU_INDEX
+        )
+    else:
+        os.environ["CUDA_VISIBLE_DEVICES"] = _PGHC_GPU_INDEX
+
 import argparse
 import random
 import shutil
@@ -56,7 +76,7 @@ BASE_AGENT_CONFIG = MIMICKIT_DIR / "data" / "agents" / "amp_g1_agent.yaml"
 BASE_ENGINE_CONFIG = MIMICKIT_DIR / "data" / "engines" / "newton_engine.yaml"
 
 # ---------------------------------------------------------------------------
-# MimicKit + GPU imports (single process, single CUDA context)
+# MimicKit + GPU imports (single process, single CUDA context per rank)
 # ---------------------------------------------------------------------------
 if str(MIMICKIT_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(MIMICKIT_SRC_DIR))
@@ -876,21 +896,48 @@ if __name__ == "__main__":
         f"number of devices ({num_workers})"
     )
 
+    # Parse logical GPU indices from device strings (e.g., "cuda:2" -> 2)
+    gpu_indices = []
+    for d in args.devices:
+        assert "cuda" in d, f"Expected CUDA device, got {d}"
+        gpu_indices.append(int(d.split(":")[1]))
+
     master_port = args.master_port if args.master_port is not None else random.randint(6000, 7000)
 
     if num_workers > 1:
+        # Save original CUDA_VISIBLE_DEVICES for physical GPU remapping
+        # (handles Slurm/scheduler GPU assignments correctly)
+        orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+
         torch.multiprocessing.set_start_method("spawn")
         processes = []
         for r in range(1, num_workers):
+            # Child processes read _PGHC_GPU_INDEX at module import time
+            # (see top of file) and restrict CUDA_VISIBLE_DEVICES before
+            # warp/torch initialize CUDA.
+            os.environ["_PGHC_GPU_INDEX"] = str(gpu_indices[r])
             p = torch.multiprocessing.Process(
                 target=pghc_worker,
-                args=[r, num_workers, args.devices[r], master_port, args],
+                args=[r, num_workers, "cuda:0", master_port, args],
             )
             p.start()
             processes.append(p)
 
-        # Root process runs in main thread
-        pghc_worker(0, num_workers, args.devices[0], master_port, args)
+        # Clean up env var so it doesn't leak
+        os.environ.pop("_PGHC_GPU_INDEX", None)
+
+        # Restrict root process to its GPU (before first CUDA operation,
+        # which happens inside pghc_worker — warp/torch init lazily).
+        if orig_cvd:
+            _gpu_list = [g.strip() for g in orig_cvd.split(",")]
+            idx = gpu_indices[0]
+            os.environ["CUDA_VISIBLE_DEVICES"] = (
+                _gpu_list[idx] if idx < len(_gpu_list) else str(idx)
+            )
+        else:
+            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_indices[0])
+
+        pghc_worker(0, num_workers, "cuda:0", master_port, args)
 
         for p in processes:
             p.join()
