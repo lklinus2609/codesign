@@ -52,6 +52,7 @@ if _PGHC_GPU_INDEX is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = _PGHC_GPU_INDEX
 
 import argparse
+import platform
 import random
 import shutil
 import sys
@@ -228,7 +229,7 @@ class InnerLoopController:
                  min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100,
-                 is_root=True, device="cuda:0"):
+                 is_root=True, device="cuda:0", rank=0):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
@@ -241,6 +242,7 @@ class InnerLoopController:
         self.video_interval = video_interval
         self.is_root = is_root
         self.device = device
+        self.rank = rank
 
     def _check_plateau(self, values):
         n_required = max(self.plateau_window, self.min_plateau_outputs)
@@ -281,12 +283,31 @@ class InnerLoopController:
         disc_rewards = []
         converged = False
         start_time = time.time()
-        test_info = None
+        # Initialize with dummy test_info — _log_train_info accesses
+        # test_info["mean_return"] on EVERY iteration, not just output iters
+        test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
         inner_iters = 0
 
+        _DEBUG_ITERS = 3  # per-rank prints for first N iters to diagnose hangs
+
         while agent._sample_count < self.max_samples:
+            if inner_iters < _DEBUG_ITERS:
+                print(f"  [Rank {self.rank}] iter {inner_iters}: "
+                      f"entering _train_iter()...", flush=True)
+
             train_info = agent._train_iter()                      # COLLECTIVE
+
+            if inner_iters < _DEBUG_ITERS:
+                print(f"  [Rank {self.rank}] iter {inner_iters}: "
+                      f"_train_iter() done, entering _update_sample_count()...",
+                      flush=True)
+
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
+
+            if inner_iters < _DEBUG_ITERS:
+                print(f"  [Rank {self.rank}] iter {inner_iters}: "
+                      f"_update_sample_count() done "
+                      f"(samples={agent._sample_count:,})", flush=True)
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
@@ -311,8 +332,19 @@ class InnerLoopController:
 
             # MimicKit native logging: populate logger (contains collective ops)
             env_diag_info = env.get_diagnostics()
+
+            if inner_iters < _DEBUG_ITERS:
+                print(f"  [Rank {self.rank}] iter {inner_iters}: "
+                      f"entering _log_train_info() "
+                      f"(test_info={'set' if test_info is not None else 'None'})...",
+                      flush=True)
+
             agent._log_train_info(train_info, test_info, env_diag_info,
                                   start_time)                     # COLLECTIVE
+
+            if inner_iters < _DEBUG_ITERS:
+                print(f"  [Rank {self.rank}] iter {inner_iters}: "
+                      f"_log_train_info() done", flush=True)
 
             # Only root prints/writes logs
             if self.is_root:
@@ -497,8 +529,30 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if "cuda" in device:
         torch.cuda.manual_seed(seed)
 
-    # Initialize torch.distributed (NCCL on Linux, gloo on Windows)
-    mp_util.init(rank, num_procs, device, master_port)
+    # Initialize torch.distributed with backend override
+    # (bypasses mp_util.init so we can control the backend via --dist-backend)
+    mp_util.global_mp_device = device
+    mp_util.global_num_procs = num_procs
+
+    if num_procs > 1:
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(master_port)
+
+        backend = getattr(args, "dist_backend", "nccl")
+        if backend == "auto":
+            if "cuda" in device:
+                backend = "nccl"
+                os_platform = platform.system()
+                if os_platform == "Windows":
+                    backend = "gloo"
+            else:
+                backend = "gloo"
+
+        print(f"  [Rank {rank}] init_process_group(backend={backend}, "
+              f"rank={rank}, world_size={num_procs})", flush=True)
+        torch.distributed.init_process_group(backend, rank=rank,
+                                             world_size=num_procs)
+        print(f"  [Rank {rank}] init_process_group DONE", flush=True)
 
     if is_root:
         print("=" * 70)
@@ -631,6 +685,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         video_interval=args.video_interval,
         is_root=is_root,
         device=device,
+        rank=rank,
     )
 
     history = {
@@ -912,6 +967,10 @@ if __name__ == "__main__":
                              "(e.g., cuda:0 cuda:1 cuda:2 cuda:3)")
     parser.add_argument("--master-port", type=int, default=None,
                         help="Port for torch.distributed (default: random 6000-7000)")
+    parser.add_argument("--dist-backend", type=str, default="nccl",
+                        choices=["nccl", "gloo", "auto"],
+                        help="torch.distributed backend "
+                             "(try 'gloo' if nccl hangs, 'auto' for platform default)")
     args = parser.parse_args()
 
     num_workers = len(args.devices)
