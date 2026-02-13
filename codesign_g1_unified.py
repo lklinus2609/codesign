@@ -299,10 +299,15 @@ class InnerLoopController:
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
 
-                if self.is_root:
-                    print(f"    [Iter {agent._iter}] Running test rollout...",
-                          flush=True)
-                test_info = agent.test_model(agent._test_episodes)  # ALL ranks
+                # Skip test_model() — its unbounded rollout hangs with early
+                # random policies (waits for ALL envs to finish episodes).
+                # We use disc_reward_mean for convergence, not test returns.
+                # Provide dummy test_info so _log_train_info doesn't crash.
+                test_info = {
+                    "mean_return": 0.0,
+                    "mean_ep_len": 0.0,
+                    "num_eps": 0,
+                }
 
             # MimicKit native logging: populate logger (contains collective ops)
             env_diag_info = env.get_diagnostics()
