@@ -638,6 +638,13 @@ class DiffG1Eval:
 
             self.pre_actions[step].assign(actions_np)
 
+        # Diagnostic: verify actions are non-zero
+        act0 = self.pre_actions[0].numpy()
+        act_abs_mean = np.abs(act0).mean()
+        act_abs_max = np.abs(act0).max()
+        print(f"    [DiffG1Eval] Actions check: mean|a|={act_abs_mean:.4f}, "
+              f"max|a|={act_abs_max:.4f} (should be >0)")
+
         # ---------------------------------------------------------------
         # Phase 2: Replay on tape for gradients
         # ---------------------------------------------------------------
@@ -697,6 +704,12 @@ class DiffG1Eval:
 
                     src.clear_forces()
                     self.solver.step(src, dst, self.control, contacts, self.sub_dt)
+
+                    # SolverSemiImplicit only updates body_q/body_qd (maximal
+                    # coords). Our loss/energy kernels read joint_q/joint_qd
+                    # (generalized coords), so we must run eval_ik to map
+                    # body-space → joint-space after each integration step.
+                    newton.eval_ik(self.model, dst, dst.joint_q, dst.joint_qd)
 
                     # Accumulate joint velocity energy on tape
                     wp.launch(
