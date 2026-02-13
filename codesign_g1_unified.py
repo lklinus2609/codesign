@@ -468,10 +468,17 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
 
+    # Explicitly set the CUDA device before any GPU operations.
+    # With CUDA_VISIBLE_DEVICES isolation, each process sees one GPU as cuda:0.
+    if "cuda" in device:
+        torch.cuda.set_device(device)
+
     # Seed per rank for diverse rollouts
     seed = int(np.uint64(42) + np.uint64(41 * rank))
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
+    if "cuda" in device:
+        torch.cuda.manual_seed(seed)
 
     # Initialize torch.distributed (NCCL on Linux, gloo on Windows)
     mp_util.init(rank, num_procs, device, master_port)
