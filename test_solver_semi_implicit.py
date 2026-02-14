@@ -91,7 +91,7 @@ def dump_model_info(model):
         print(f"    damping:   {len(nz_pd)} nonzero" + (f", range [{nz_pd.min():.1f}, {nz_pd.max():.1f}]" if len(nz_pd) else ""))
 
     # Gravity
-    g = model.gravity
+    g = model.gravity.numpy().ravel()
     print(f"\n  Gravity: ({g[0]:.2f}, {g[1]:.2f}, {g[2]:.2f})")
 
 
