@@ -383,7 +383,45 @@ class DiffG1Eval:
             builder.replicate(single_builder, self.num_worlds, spacing=(5.0, 5.0, 0.0))
 
             self.model = builder.finalize(requires_grad=True)
-            self.solver = newton.solvers.SolverSemiImplicit(self.model)
+
+            # Clamp minimum body mass and inertia for semi-implicit stability.
+            # SolverSemiImplicit uses penalty springs (joint_attach_ke/kd) to
+            # enforce joint constraints.  Angular stability requires
+            # kd * dt / I_min < 2.  The G1's wrist/ankle links have I ~ 1e-6,
+            # making even kd=1 unstable.  Clamping to min_I=1.0 provides
+            # sufficient margin for the 30-body articulated chain.
+            MIN_BODY_MASS = 1.0    # kg
+            MIN_INERTIA_DIAG = 1.0 # kg·m²
+            mass_np = self.model.body_mass.numpy()
+            inv_mass_np = self.model.body_inv_mass.numpy()
+            light = mass_np < MIN_BODY_MASS
+            n_mass_clamped = int(light.sum())
+            if n_mass_clamped > 0:
+                mass_np[light] = MIN_BODY_MASS
+                inv_mass_np[light] = 1.0 / MIN_BODY_MASS
+                self.model.body_mass.assign(mass_np)
+                self.model.body_inv_mass.assign(inv_mass_np)
+
+            inertia_np = self.model.body_inertia.numpy()
+            inv_inertia_np = self.model.body_inv_inertia.numpy()
+            n_inertia_clamped = 0
+            for bi in range(len(inertia_np)):
+                modified = False
+                for d in range(3):
+                    if inertia_np[bi, d, d] < MIN_INERTIA_DIAG:
+                        inertia_np[bi, d, d] = MIN_INERTIA_DIAG
+                        modified = True
+                if modified:
+                    n_inertia_clamped += 1
+                    inv_inertia_np[bi] = np.linalg.inv(inertia_np[bi])
+            self.model.body_inertia.assign(inertia_np)
+            self.model.body_inv_inertia.assign(inv_inertia_np)
+            print(f"    [DiffG1Eval] Body clamping: {n_mass_clamped} masses -> {MIN_BODY_MASS} kg, "
+                  f"{n_inertia_clamped} inertias -> diag >= {MIN_INERTIA_DIAG}")
+
+            self.solver = newton.solvers.SolverSemiImplicit(
+                self.model, joint_attach_ke=1.0e4, joint_attach_kd=10.0
+            )
             self.control = self.model.control()
 
             # Set PD gains matching MimicKit's ControlMode.pos behavior.
@@ -410,39 +448,6 @@ class DiffG1Eval:
                 kd_np[:] = 10.0
                 self.model.joint_target_ke.assign(ke_np)
                 self.model.joint_target_kd.assign(kd_np)
-
-            # --- Model sanity checks (identify NaN sources) ---
-            def _check_arr(name, arr):
-                a = arr.numpy() if hasattr(arr, 'numpy') else np.asarray(arr)
-                nans = int(np.isnan(a.ravel()).sum())
-                infs = int(np.isinf(a.ravel()).sum())
-                tag = ""
-                if nans:
-                    tag += f" *** {nans} NaN ***"
-                if infs:
-                    tag += f" *** {infs} Inf ***"
-                flat = a.ravel()
-                finite = flat[np.isfinite(flat)]
-                if len(finite) > 0:
-                    print(f"    [ModelCheck] {name}: shape={a.shape} "
-                          f"min={finite.min():.6g} max={finite.max():.6g} "
-                          f"mean={finite.mean():.6g}{tag}")
-                else:
-                    print(f"    [ModelCheck] {name}: shape={a.shape} ALL NaN/Inf{tag}")
-
-            _check_arr("body_com", self.model.body_com)
-            _check_arr("body_mass", self.model.body_mass)
-            _check_arr("body_inv_mass", self.model.body_inv_mass)
-            _check_arr("body_inertia", self.model.body_inertia)
-            _check_arr("body_inv_inertia", self.model.body_inv_inertia)
-            _check_arr("gravity", self.model.gravity)
-            _check_arr("joint_X_p", self.model.joint_X_p)
-            _check_arr("joint_X_c", self.model.joint_X_c)
-            _check_arr("joint_axis", self.model.joint_axis)
-            _check_arr("joint_target_ke", self.model.joint_target_ke)
-            _check_arr("joint_target_kd", self.model.joint_target_kd)
-            _check_arr("joint_limit_lower", self.model.joint_limit_lower)
-            _check_arr("joint_limit_upper", self.model.joint_limit_upper)
 
             # Store joint structure info
             self.joints_per_world = self.model.joint_count // self.num_worlds
@@ -801,12 +806,6 @@ class DiffG1Eval:
                 macro_src.clear_forces()
                 contacts = self.model.collide(macro_src)
 
-                # Debug: check contacts on first macro-step
-                if step == 0:
-                    wp.synchronize()
-                    n_contacts = int(contacts.rigid_contact_count.numpy()[0]) if contacts is not None and contacts.rigid_contact_max else 0
-                    print(f"{DBG} Macro-step 0: {n_contacts} rigid contacts")
-
                 # Substeps
                 for sub in range(self.num_substeps):
                     src = self.states[physics_step]
@@ -814,35 +813,6 @@ class DiffG1Eval:
 
                     src.clear_forces()
                     self.solver.step(src, dst, self.control, contacts, self.sub_dt)
-
-                    # Debug: after first substep, check forces and integrated state
-                    if step == 0 and sub == 0:
-                        wp.synchronize()
-                        # body_f: spatial_vector (6) per body → numpy (N, 6)
-                        bf = src.body_f.numpy().reshape(-1, 6)
-                        bf_nans = np.isnan(bf).sum(axis=1)  # per-body NaN count
-                        bodies_with_nan_f = int((bf_nans > 0).sum())
-                        bf_lin_nan = int(np.isnan(bf[:, :3]).sum())
-                        bf_ang_nan = int(np.isnan(bf[:, 3:]).sum())
-                        bf_finite = bf[np.isfinite(bf)]
-                        bf_max = float(np.abs(bf_finite).max()) if len(bf_finite) > 0 else float('nan')
-                        print(f"{DBG} [Sub0] body_f: {bodies_with_nan_f}/{len(bf)} bodies with NaN "
-                              f"(lin_nan={bf_lin_nan}, ang_nan={bf_ang_nan}, |max|={bf_max:.4g})")
-                        if bodies_with_nan_f > 0 and bodies_with_nan_f <= 5:
-                            nan_bodies = np.where(bf_nans > 0)[0]
-                            for bi in nan_bodies[:5]:
-                                local = bi % self.bodies_per_world
-                                print(f"{DBG}   body {bi} (local={local}): f={bf[bi]}")
-                        # dst body_q: transform (7) per body → numpy (N, 7)
-                        dq = dst.body_q.numpy().reshape(-1, 7)
-                        pos_nan = int(np.isnan(dq[:, :3]).any(axis=1).sum())
-                        rot_nan = int(np.isnan(dq[:, 3:]).any(axis=1).sum())
-                        print(f"{DBG} [Sub0] dst.body_q: {pos_nan} bodies pos NaN, {rot_nan} bodies rot NaN")
-                        # dst body_qd: spatial_vector (6) → numpy (N, 6)
-                        dqd = dst.body_qd.numpy().reshape(-1, 6)
-                        lin_nan = int(np.isnan(dqd[:, :3]).any(axis=1).sum())
-                        ang_nan = int(np.isnan(dqd[:, 3:]).any(axis=1).sum())
-                        print(f"{DBG} [Sub0] dst.body_qd: {lin_nan} bodies lin_vel NaN, {ang_nan} bodies ang_vel NaN")
 
                     # SolverSemiImplicit only updates body_q/body_qd (maximal
                     # coords). Our loss/energy kernels read joint_q/joint_qd
