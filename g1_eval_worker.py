@@ -368,9 +368,9 @@ class DiffG1Eval:
                 mjcf_path,
                 floating=True,
                 ignore_inertial_definitions=False,
-                collapse_fixed_joints=False,
+                collapse_fixed_joints=True,
                 enable_self_collisions=False,
-                convert_3d_hinge_to_ball_joints=True,
+                convert_3d_hinge_to_ball_joints=False,
                 ignore_names=["floor", "ground"],
             )
 
