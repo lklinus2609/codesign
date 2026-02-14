@@ -48,8 +48,9 @@ def build_model(device="cuda:0"):
     return model
 
 
-def run_test(model, ke, kd, label, enable_contacts=True, device="cuda:0"):
+def run_test(model, ke, kd, label, enable_contacts=True, num_substeps=NUM_SUBSTEPS, device="cuda:0"):
     """Run simulation with given joint_attach params. Returns True if stable."""
+    sub_dt = DT / num_substeps
     solver = newton.solvers.SolverSemiImplicit(model, joint_attach_ke=ke, joint_attach_kd=kd)
     control = model.control()
 
@@ -81,9 +82,9 @@ def run_test(model, ke, kd, label, enable_contacts=True, device="cuda:0"):
             src.clear_forces()
             contacts = model.collide(src) if enable_contacts else None
 
-        for sub in range(NUM_SUBSTEPS):
+        for sub in range(num_substeps):
             src.clear_forces()
-            solver.step(src, dst, control, contacts, SUB_DT)
+            solver.step(src, dst, control, contacts, sub_dt)
             newton.eval_ik(model, dst, dst.joint_q, dst.joint_qd)
             src, dst = dst, src
 
@@ -153,12 +154,10 @@ def main():
 
     # Try more substeps with default params
     print(f"\n--- More substeps (ke=1e4, kd=100) ---")
-    global NUM_SUBSTEPS, SUB_DT
     for ns in [16, 32, 64]:
-        NUM_SUBSTEPS = ns
-        SUB_DT = DT / ns
-        label = f"{ns} substeps (sub_dt={SUB_DT:.6f})"
-        run_test(model, ke=1e4, kd=100, label=label, device=device)
+        sub_dt = DT / ns
+        label = f"{ns} substeps (sub_dt={sub_dt:.6f})"
+        run_test(model, ke=1e4, kd=100, label=label, num_substeps=ns, device=device)
 
     return 0
 
