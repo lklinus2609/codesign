@@ -135,7 +135,7 @@ def run_sim(model, solver, control, init_qpos, label, device="cuda:0"):
             solver.step(src, dst, control, contacts, SUB_DT)
 
             # After integration, run IK to update joint_q/joint_qd
-            newton.eval_ik(model, dst)
+            newton.eval_ik(model, dst, dst.joint_q, dst.joint_qd)
 
             physics_step += 1
 
