@@ -360,6 +360,22 @@ class InnerLoopController:
                       flush=True)
 
             if output_iter:
+                # Convergence check: root decides, broadcast to all ranks.
+                # This MUST happen before root-only I/O (save, wandb, video)
+                # to prevent non-root ranks from reaching the broadcast first
+                # and hanging while root does slow I/O.
+                should_stop = False
+                if self.is_root:
+                    should_stop = (inner_iters >= self.min_inner_iters
+                                   and self._check_plateau(disc_rewards))
+
+                if mp_util.enable_mp():
+                    flag = torch.tensor([int(should_stop)], dtype=torch.int32,
+                                        device=self.device)
+                    flag = mp_util.broadcast(flag)
+                    should_stop = flag.item() == 1
+
+                # Root-only I/O: save, wandb, video (after broadcast)
                 if self.is_root:
                     agent._logger.write_log()
                     agent.save(checkpoint_path)
@@ -390,18 +406,6 @@ class InnerLoopController:
                                 )})
                         except Exception as e:
                             print(f"  [Inner Loop] Video logging failed: {e}")
-
-                # Convergence check: root decides, broadcast to all ranks
-                should_stop = False
-                if self.is_root:
-                    should_stop = (inner_iters >= self.min_inner_iters
-                                   and self._check_plateau(disc_rewards))
-
-                if mp_util.enable_mp():
-                    flag = torch.tensor([int(should_stop)], dtype=torch.int32,
-                                        device=self.device)
-                    flag = mp_util.broadcast(flag)
-                    should_stop = flag.item() == 1
 
                 if should_stop:
                     if self.is_root:
@@ -847,7 +851,29 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             per_rank_envs
         )
 
-        # Root: save checkpoints + wandb
+        # ----- Outer convergence check -----
+        # Broadcast BEFORE root-only saves to prevent non-root ranks from
+        # reaching the broadcast first and hanging while root does slow I/O.
+        outer_converged = False
+        if is_root:
+            theta_history.append(theta.copy())
+            if len(theta_history) >= 5:
+                theta_stack = np.array(list(theta_history))
+                ranges = theta_stack.max(axis=0) - theta_stack.min(axis=0)
+                max_range = ranges.max()
+                if max_range < np.radians(0.5):
+                    print(f"\n  OUTER CONVERGED: theta stable "
+                          f"(max range = {np.degrees(max_range):.3f} deg)")
+                    outer_converged = True
+
+        if mp_util.enable_mp():
+            flag = torch.tensor([int(outer_converged)], dtype=torch.int32,
+                                device=device)
+            flag = mp_util.broadcast(flag)
+            outer_converged = flag.item() == 1
+
+        # Root: save checkpoints + wandb (after broadcast, non-root ranks
+        # proceed to next iteration or break without waiting)
         if is_root:
             np.save(str(out_dir / "theta_latest.npy"), theta)
             np.save(str(iter_dir / "theta.npy"), theta)
@@ -874,25 +900,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
                 wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
                 wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
-
-        # ----- Outer convergence check -----
-        outer_converged = False
-        if is_root:
-            theta_history.append(theta.copy())
-            if len(theta_history) >= 5:
-                theta_stack = np.array(list(theta_history))
-                ranges = theta_stack.max(axis=0) - theta_stack.min(axis=0)
-                max_range = ranges.max()
-                if max_range < np.radians(0.5):
-                    print(f"\n  OUTER CONVERGED: theta stable "
-                          f"(max range = {np.degrees(max_range):.3f} deg)")
-                    outer_converged = True
-
-        if mp_util.enable_mp():
-            flag = torch.tensor([int(outer_converged)], dtype=torch.int32,
-                                device=device)
-            flag = mp_util.broadcast(flag)
-            outer_converged = flag.item() == 1
 
         if outer_converged:
             break
@@ -988,16 +995,13 @@ if __name__ == "__main__":
     master_port = args.master_port if args.master_port is not None else random.randint(6000, 7000)
 
     if num_workers > 1:
-        # Save original CUDA_VISIBLE_DEVICES for physical GPU remapping
-        # (handles Slurm/scheduler GPU assignments correctly)
-        orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
-
+        # Spawn ALL ranks (including rank 0) as subprocesses so that every
+        # worker re-imports the module after CUDA_VISIBLE_DEVICES is set.
+        # This avoids the root-process CUDA visibility asymmetry that causes
+        # NCCL topology mismatches and all_reduce deadlocks.
         torch.multiprocessing.set_start_method("spawn")
         processes = []
-        for r in range(1, num_workers):
-            # Child processes read _PGHC_GPU_INDEX at module import time
-            # (see top of file) and restrict CUDA_VISIBLE_DEVICES before
-            # warp/torch initialize CUDA.
+        for r in range(num_workers):
             os.environ["_PGHC_GPU_INDEX"] = str(gpu_indices[r])
             p = torch.multiprocessing.Process(
                 target=pghc_worker,
@@ -1005,25 +1009,19 @@ if __name__ == "__main__":
             )
             p.start()
             processes.append(p)
-
-        # Clean up env var so it doesn't leak
         os.environ.pop("_PGHC_GPU_INDEX", None)
 
-        # Restrict root process to its GPU (before first CUDA operation,
-        # which happens inside pghc_worker — warp/torch init lazily).
-        if orig_cvd:
-            _gpu_list = [g.strip() for g in orig_cvd.split(",")]
-            idx = gpu_indices[0]
-            os.environ["CUDA_VISIBLE_DEVICES"] = (
-                _gpu_list[idx] if idx < len(_gpu_list) else str(idx)
-            )
-        else:
-            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_indices[0])
-
-        pghc_worker(0, num_workers, "cuda:0", master_port, args)
-
-        for p in processes:
+        # Wait for all workers and check exit codes
+        failed = []
+        for r, p in enumerate(processes):
             p.join()
+            if p.exitcode != 0:
+                failed.append((r, p.exitcode))
+        if failed:
+            print(f"\n[ERROR] {len(failed)} worker(s) failed:")
+            for r, code in failed:
+                print(f"  Rank {r}: exit code {code}")
+            sys.exit(1)
     else:
         # Single GPU — backward compatible, no spawn overhead
         pghc_worker(0, 1, args.devices[0], master_port, args)
