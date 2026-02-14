@@ -288,63 +288,28 @@ class InnerLoopController:
         test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
         inner_iters = 0
 
-        _DEBUG_ITERS = 3  # per-rank prints for first N iters to diagnose hangs
-
         while agent._sample_count < self.max_samples:
-            if inner_iters < _DEBUG_ITERS:
-                print(f"  [Rank {self.rank}] iter {inner_iters}: "
-                      f"entering _train_iter()...", flush=True)
-
             train_info = agent._train_iter()                      # COLLECTIVE
-
-            if inner_iters < _DEBUG_ITERS:
-                print(f"  [Rank {self.rank}] iter {inner_iters}: "
-                      f"_train_iter() done, entering _update_sample_count()...",
-                      flush=True)
-
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
-
-            if inner_iters < _DEBUG_ITERS:
-                print(f"  [Rank {self.rank}] iter {inner_iters}: "
-                      f"_update_sample_count() done "
-                      f"(samples={agent._sample_count:,})", flush=True)
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
             if output_iter:
-                # Sample disc_reward_mean here — before env reset, so no
-                # sawtooth spike (spike happens on the iter AFTER reset)
                 disc_r = train_info.get("disc_reward_mean")
                 if disc_r is not None:
                     if torch.is_tensor(disc_r):
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
 
-                # Skip test_model() — its unbounded rollout hangs with early
-                # random policies (waits for ALL envs to finish episodes).
-                # We use disc_reward_mean for convergence, not test returns.
-                # Provide dummy test_info so _log_train_info doesn't crash.
                 test_info = {
                     "mean_return": 0.0,
                     "mean_ep_len": 0.0,
                     "num_eps": 0,
                 }
 
-            # MimicKit native logging: populate logger (contains collective ops)
             env_diag_info = env.get_diagnostics()
-
-            if inner_iters < _DEBUG_ITERS:
-                print(f"  [Rank {self.rank}] iter {inner_iters}: "
-                      f"entering _log_train_info() "
-                      f"(test_info={'set' if test_info is not None else 'None'})...",
-                      flush=True)
-
             agent._log_train_info(train_info, test_info, env_diag_info,
                                   start_time)                     # COLLECTIVE
-
-            if inner_iters < _DEBUG_ITERS:
-                print(f"  [Rank {self.rank}] iter {inner_iters}: "
-                      f"_log_train_info() done", flush=True)
 
             # All ranks must call print_log() — it contains a collective
             # reduce_inplace_mean. Actual printing is gated by Logger.is_root().
