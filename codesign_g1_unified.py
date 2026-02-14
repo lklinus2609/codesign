@@ -229,6 +229,7 @@ class InnerLoopController:
                  min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100,
+                 ema_alpha=0.05,
                  is_root=True, device="cuda:0", rank=0):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
@@ -240,15 +241,21 @@ class InnerLoopController:
         self.viewer = viewer
         self.engine = engine
         self.video_interval = video_interval
+        self.ema_alpha = ema_alpha
         self.is_root = is_root
         self.device = device
         self.rank = rank
 
-    def _check_plateau(self, values):
+    def _check_plateau(self, ema_values):
+        """Check if EMA-smoothed disc_reward has plateaued.
+
+        Uses smoothed values to filter out the sawtooth oscillation
+        inherent in AMP training (disc/policy co-adaptation).
+        """
         n_required = max(self.plateau_window, self.min_plateau_outputs)
-        if len(values) < n_required:
+        if len(ema_values) < n_required:
             return False
-        recent = values[-self.plateau_window:]
+        recent = ema_values[-self.plateau_window:]
         mean_val = np.mean(recent)
         if abs(mean_val) < 1e-8:
             return False
@@ -281,6 +288,8 @@ class InnerLoopController:
         agent._iter = saved_iter  # restore so wandb x-axis is monotonic
 
         disc_rewards = []
+        disc_rewards_ema = []   # EMA-smoothed values for convergence detection
+        ema_val = None
         converged = False
         start_time = time.time()
         # Initialize with dummy test_info — _log_train_info accesses
@@ -300,6 +309,12 @@ class InnerLoopController:
                     if torch.is_tensor(disc_r):
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
+                    # EMA smoothing to filter sawtooth oscillation
+                    if ema_val is None:
+                        ema_val = disc_r
+                    else:
+                        ema_val = self.ema_alpha * disc_r + (1 - self.ema_alpha) * ema_val
+                    disc_rewards_ema.append(ema_val)
 
                 test_info = {
                     "mean_return": 0.0,
@@ -323,7 +338,7 @@ class InnerLoopController:
                 should_stop = False
                 if self.is_root:
                     should_stop = (inner_iters >= self.min_inner_iters
-                                   and self._check_plateau(disc_rewards))
+                                   and self._check_plateau(disc_rewards_ema))
 
                 if mp_util.enable_mp():
                     flag = torch.tensor([int(should_stop)], dtype=torch.int32,
@@ -339,7 +354,7 @@ class InnerLoopController:
                 if self.is_root:
                     agent.save(checkpoint_path)
 
-                    # wandb: forward inner loop metrics
+                    # wandb: forward inner loop metrics + EMA
                     if self.use_wandb:
                         wlog = {}
                         for k, entry in agent._logger.log_current_row.items():
@@ -348,8 +363,12 @@ class InnerLoopController:
                                 wlog[f"inner/{k}"] = float(v)
                             except (TypeError, ValueError):
                                 pass
+                        if disc_rewards_ema:
+                            wlog["inner/disc_reward_ema"] = disc_rewards_ema[-1]
                         if wlog:
                             wandb.log(wlog)
+                        # Save model checkpoint to wandb
+                        wandb.save(checkpoint_path, base_path=str(out_dir))
 
                     # Video capture every video_interval iterations
                     if (self.use_wandb and self.viewer is not None
@@ -368,11 +387,12 @@ class InnerLoopController:
 
                 if should_stop:
                     if self.is_root:
-                        recent = disc_rewards[-self.plateau_window:]
-                        spread = max(recent) - min(recent)
+                        recent_ema = disc_rewards_ema[-self.plateau_window:]
+                        spread = max(recent_ema) - min(recent_ema)
                         print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
                               f"{inner_iters} iters, "
-                              f"disc_reward={np.mean(recent):.4f}, spread={spread:.4f})")
+                              f"disc_reward_ema={np.mean(recent_ema):.4f}, "
+                              f"spread={spread:.4f})")
                     converged = True
                     break
 
@@ -646,6 +666,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         viewer=viewer,
         engine=engine,
         video_interval=args.video_interval,
+        ema_alpha=args.ema_alpha,
         is_root=is_root,
         device=device,
         rank=rank,
@@ -917,12 +938,14 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
-    parser.add_argument("--plateau-threshold", type=float, default=0.02,
-                        help="Inner convergence: relative change threshold")
+    parser.add_argument("--plateau-threshold", type=float, default=0.05,
+                        help="Inner convergence: EMA spread/mean threshold")
     parser.add_argument("--plateau-window", type=int, default=50,
                         help="Inner convergence: window size (in output intervals)")
     parser.add_argument("--min-plateau-outputs", type=int, default=10,
                         help="Inner convergence: min output intervals before early stop")
+    parser.add_argument("--ema-alpha", type=float, default=0.05,
+                        help="EMA smoothing factor for disc_reward convergence (lower=smoother)")
     parser.add_argument("--kickoff-min-iters", type=int, default=2000,
                         help="Min inner iters before convergence on first outer iter (0=disabled)")
     parser.add_argument("--video-interval", type=int, default=100,
