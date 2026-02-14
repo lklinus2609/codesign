@@ -940,8 +940,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="PGHC Co-Design for G1 Humanoid (Unified Single-Process)"
     )
-    parser.add_argument("--wandb", action="store_true",
-                        help="Enable wandb logging for outer loop")
+    parser.add_argument("--no-wandb", action="store_true",
+                        help="Disable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=20)
     parser.add_argument("--design-lr", type=float, default=0.005)
     parser.add_argument("--num-train-envs", type=int, default=4096,
@@ -963,9 +963,8 @@ if __name__ == "__main__":
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     # Multi-GPU arguments
-    parser.add_argument("--devices", nargs="+", default=["cuda:0"],
-                        help="CUDA devices for multi-GPU training "
-                             "(e.g., cuda:0 cuda:1 cuda:2 cuda:3)")
+    parser.add_argument("--devices", nargs="+", default=None,
+                        help="CUDA devices (default: auto-detect all GPUs)")
     parser.add_argument("--master-port", type=int, default=None,
                         help="Port for torch.distributed (default: random 6000-7000)")
     parser.add_argument("--dist-backend", type=str, default="nccl",
@@ -973,6 +972,14 @@ if __name__ == "__main__":
                         help="torch.distributed backend "
                              "(try 'gloo' if nccl hangs, 'auto' for platform default)")
     args = parser.parse_args()
+
+    # Auto-detect GPUs if --devices not specified
+    if args.devices is None:
+        n_gpus = torch.cuda.device_count()
+        args.devices = [f"cuda:{i}" for i in range(n_gpus)] if n_gpus > 0 else ["cuda:0"]
+
+    # Flip --no-wandb to args.wandb for downstream use
+    args.wandb = not args.no_wandb
 
     num_workers = len(args.devices)
     assert args.num_train_envs % num_workers == 0, (
