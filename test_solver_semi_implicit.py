@@ -1,6 +1,6 @@
 """Isolated test: G1 robot with SolverSemiImplicit.
 
-Tests mass/inertia clamping to stabilize penalty-based joint attachment.
+Aggressive parameter sweep: very soft joint attachment + large inertia clamping.
 
 Usage:
     python -u -m codesign.test_solver_semi_implicit
@@ -23,7 +23,7 @@ NUM_WORLDS = 1
 DT = 1.0 / 30.0
 NUM_SUBSTEPS = 8
 SUB_DT = DT / NUM_SUBSTEPS
-NUM_STEPS = 50
+NUM_STEPS = 100
 Z_HEIGHT = 0.8
 
 
@@ -58,44 +58,46 @@ def build_model(device="cuda:0"):
     return model
 
 
-def clamp_body_properties(model, min_mass=0.0, min_inertia_diag=0.0):
-    """Clamp minimum body mass and inertia for stability."""
+def clamp_model(model, min_mass, min_I, contact_ke=None, contact_kd=None):
+    """Clamp body mass/inertia and optionally contact stiffness."""
     if min_mass > 0:
         mass = model.body_mass.numpy()
         inv_mass = model.body_inv_mass.numpy()
         light = mass < min_mass
-        n_clamped = int(light.sum())
-        if n_clamped > 0:
-            print(f"    Clamping {n_clamped} bodies from mass "
-                  f"[{mass[light].min():.4f}, {mass[light].max():.4f}] to {min_mass:.4f} kg")
+        n = int(light.sum())
+        if n > 0:
             mass[light] = min_mass
             inv_mass[light] = 1.0 / min_mass
             model.body_mass.assign(mass)
             model.body_inv_mass.assign(inv_mass)
 
-    if min_inertia_diag > 0:
-        # body_inertia is wp.mat33 — numpy gives (N, 3, 3)
+    if min_I > 0:
         inertia = model.body_inertia.numpy()
         inv_inertia = model.body_inv_inertia.numpy()
-        n_clamped = 0
         for i in range(len(inertia)):
             modified = False
             for d in range(3):
-                if inertia[i, d, d] < min_inertia_diag:
-                    inertia[i, d, d] = min_inertia_diag
+                if inertia[i, d, d] < min_I:
+                    inertia[i, d, d] = min_I
                     modified = True
             if modified:
-                n_clamped += 1
-                # Recompute inverse
                 inv_inertia[i] = np.linalg.inv(inertia[i])
-        if n_clamped > 0:
-            print(f"    Clamping {n_clamped} bodies' inertia diagonal to >= {min_inertia_diag:.2e}")
-            model.body_inertia.assign(inertia)
-            model.body_inv_inertia.assign(inv_inertia)
+        model.body_inertia.assign(inertia)
+        model.body_inv_inertia.assign(inv_inertia)
+
+    if contact_ke is not None:
+        ke = model.shape_material_ke.numpy()
+        ke[:] = contact_ke
+        model.shape_material_ke.assign(ke)
+
+    if contact_kd is not None:
+        kd = model.shape_material_kd.numpy()
+        kd[:] = contact_kd
+        model.shape_material_kd.assign(kd)
 
 
 def run_test(model, ke, kd, label, device="cuda:0"):
-    """Run simulation and return (passed, last_root_z)."""
+    """Run simulation, return (passed, final_root_z)."""
     solver = newton.solvers.SolverSemiImplicit(model, joint_attach_ke=ke, joint_attach_kd=kd)
     control = model.control()
 
@@ -141,61 +143,44 @@ def run_test(model, ke, kd, label, device="cuda:0"):
 
     status = "PASS" if failed_step is None else f"FAIL@step{failed_step}"
     final_z = root_z if failed_step is None else float('nan')
-    print(f"  {label:55s} {status:12s} root_z={final_z:.4f}")
-    return failed_step is None, final_z
+    print(f"  {label:60s} {status:12s} z={final_z:.4f}")
+    return failed_step is None
 
 
 def main():
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
     wp.init()
     print(f"Device: {device}")
-    print(f"Config: {NUM_WORLDS} world, {NUM_STEPS} steps, {NUM_SUBSTEPS} substeps, "
-          f"sub_dt={SUB_DT:.6f}")
+    print(f"Config: {NUM_STEPS} steps x {NUM_SUBSTEPS} substeps, sub_dt={SUB_DT:.6f}\n")
 
-    # --- Show body inertia info ---
-    model = build_model(device)
-    mass = model.body_mass.numpy()
-    inertia = model.body_inertia.numpy()  # (N, 3, 3)
-    n = model.body_count // NUM_WORLDS
-    print(f"\nBody mass & min inertia diagonal (first world, {n} bodies):")
-    for i in range(n):
-        I_diag = [inertia[i, d, d] for d in range(3)]
-        I_min = min(I_diag)
-        # Stability: kd * dt / I_min < 2  =>  kd_max = 2 * I_min / dt
-        kd_max = 2.0 * I_min / SUB_DT if I_min > 0 else 0
-        print(f"  body {i:2d}: mass={mass[i]:.4f}  I_diag=({I_diag[0]:.2e}, {I_diag[1]:.2e}, {I_diag[2]:.2e})  "
-              f"I_min={I_min:.2e}  kd_max={kd_max:.1f}")
+    # Sweep 1: Very soft attachment springs + large inertia clamp
+    print("--- Sweep: joint_attach_ke/kd with min_I=1.0, min_mass=1.0 ---")
+    for att_ke in [1e4, 1e3, 100, 10]:
+        for att_kd in [10, 1, 0.1, 0.01]:
+            m = build_model(device)
+            clamp_model(m, min_mass=1.0, min_I=1.0)
+            label = f"ke={att_ke:.0f} kd={att_kd}"
+            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
 
-    I_all_min = min(inertia[i, d, d] for i in range(n) for d in range(3))
-    print(f"\nSmallest inertia diagonal: {I_all_min:.2e}")
-    print(f"Angular stability limit (kd < 2*I_min/dt): kd < {2*I_all_min/SUB_DT:.4f}")
+    # Sweep 2: Also soften contact stiffness
+    print("\n--- Sweep: soft contacts (contact_ke=100, contact_kd=10) ---")
+    for att_ke in [1e3, 100, 10]:
+        for att_kd in [1, 0.1, 0.01]:
+            m = build_model(device)
+            clamp_model(m, min_mass=1.0, min_I=1.0, contact_ke=100, contact_kd=10)
+            label = f"ke={att_ke:.0f} kd={att_kd} cke=100 ckd=10"
+            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
 
-    # --- Test 1: No clamping (baseline) ---
-    print(f"\n--- Test 1: No clamping (ke=1e4, kd=100) ---")
-    run_test(model, ke=1e4, kd=100, label="baseline", device=device)
-
-    # --- Test 2: Sweep min_inertia_diag with reduced kd ---
-    for min_I in [1e-4, 1e-3, 1e-2, 1e-1]:
-        for att_kd in [10, 50, 100]:
-            model2 = build_model(device)
-            clamp_body_properties(model2, min_mass=0.5, min_inertia_diag=min_I)
-            label = f"min_mass=0.5, min_I={min_I:.0e}, kd={att_kd}"
-            run_test(model2, ke=1e4, kd=att_kd, label=label, device=device)
-
-    # --- Test 3: Best candidate, longer run ---
-    print(f"\n--- Test 3: Best candidate, {NUM_STEPS} steps ---")
-    model3 = build_model(device)
-    clamp_body_properties(model3, min_mass=0.5, min_inertia_diag=1e-2)
-    run_test(model3, ke=1e4, kd=10, label="min_mass=0.5, min_I=1e-2, kd=10", device=device)
-
-    # Also try lower ke
-    model4 = build_model(device)
-    clamp_body_properties(model4, min_mass=0.5, min_inertia_diag=1e-2)
-    run_test(model4, ke=1e3, kd=10, label="min_mass=0.5, min_I=1e-2, ke=1e3, kd=10", device=device)
-
-    model5 = build_model(device)
-    clamp_body_properties(model5, min_mass=0.5, min_inertia_diag=1e-2)
-    run_test(model5, ke=500, kd=5, label="min_mass=0.5, min_I=1e-2, ke=500, kd=5", device=device)
+    # Sweep 3: Zero PD gains (eliminate PD torque source)
+    print("\n--- Sweep: zero PD gains + soft contacts ---")
+    for att_ke in [100, 10]:
+        for att_kd in [1, 0.1]:
+            m = build_model(device)
+            m.joint_target_ke.zero_()
+            m.joint_target_kd.zero_()
+            clamp_model(m, min_mass=1.0, min_I=1.0, contact_ke=100, contact_kd=10)
+            label = f"ke={att_ke:.0f} kd={att_kd} NO_PD cke=100 ckd=10"
+            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
 
     return 0
 
