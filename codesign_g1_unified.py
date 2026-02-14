@@ -346,9 +346,9 @@ class InnerLoopController:
                 print(f"  [Rank {self.rank}] iter {inner_iters}: "
                       f"_log_train_info() done", flush=True)
 
-            # Only root prints/writes logs
-            if self.is_root:
-                agent._logger.print_log()
+            # All ranks must call print_log() — it contains a collective
+            # reduce_inplace_mean. Actual printing is gated by Logger.is_root().
+            agent._logger.print_log()
 
             if output_iter:
                 # Convergence check: root decides, broadcast to all ranks.
@@ -366,9 +366,12 @@ class InnerLoopController:
                     flag = mp_util.broadcast(flag)
                     should_stop = flag.item() == 1
 
+                # All ranks must call write_log() — it contains a collective
+                # reduce_inplace_mean. Actual file I/O is gated by Logger.is_root().
+                agent._logger.write_log()
+
                 # Root-only I/O: save, wandb, video (after broadcast)
                 if self.is_root:
-                    agent._logger.write_log()
                     agent.save(checkpoint_path)
 
                     # wandb: forward inner loop metrics
