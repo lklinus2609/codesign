@@ -105,8 +105,11 @@ def print_body_inertias(model):
               f"I_min={I_min:.3e}, kd_max_stable={kd_max:.3f}")
 
 
-def run_test(model, ke, kd, label, solver_type="standard", device="cuda:0"):
+def run_test(model, ke, kd, label, solver_type="standard", device="cuda:0",
+             num_substeps=NUM_SUBSTEPS, num_steps=NUM_STEPS):
     """Run simulation with specified solver. Return (passed, final_root_z)."""
+    sub_dt = DT / num_substeps
+
     if solver_type == "stable":
         solver = newton.solvers.SolverSemiImplicitStable(
             model, joint_attach_ke=ke, joint_attach_kd=kd
@@ -139,13 +142,13 @@ def run_test(model, ke, kd, label, solver_type="standard", device="cuda:0"):
     src, dst = s0, s1
     failed_step = None
 
-    for step in range(NUM_STEPS):
+    for step in range(num_steps):
         src.clear_forces()
         contacts = model.collide(src)
 
-        for sub in range(NUM_SUBSTEPS):
+        for sub in range(num_substeps):
             src.clear_forces()
-            solver.step(src, dst, control, contacts, SUB_DT)
+            solver.step(src, dst, control, contacts, sub_dt)
             newton.eval_ik(model, dst, dst.joint_q, dst.joint_qd)
             src, dst = dst, src
 
@@ -268,124 +271,125 @@ def main():
         src, dst = dst, src
 
     # ---------------------------------------------------------------
-    # Test 4b: Full sweep (keeping for reference)
+    # Test 4b: Sweep ke/kd AND substep counts
     # ---------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("TEST 4b: SolverSemiImplicitStable sweep (should PASS)")
+    print("TEST 4b: SolverSemiImplicitStable sweep (ke/kd x substeps)")
     print("=" * 80)
-    for ke in [1e4, 1e3]:
-        for kd in [100, 10, 1]:
-            m = build_model(device)
-            label = f"[STABLE] ke={ke:.0f} kd={kd} NO_CLAMP"
-            run_test(m, ke=ke, kd=kd, label=label, solver_type="stable", device=device)
+    for n_sub in [8, 16, 32]:
+        print(f"\n  --- {n_sub} substeps (sub_dt={DT/n_sub:.6f}) ---")
+        for ke in [1e4, 1e3]:
+            for kd in [100, 10, 1]:
+                m = build_model(device)
+                label = f"[STABLE] ke={ke:.0f} kd={kd} sub={n_sub}"
+                run_test(m, ke=ke, kd=kd, label=label, solver_type="stable",
+                         device=device, num_substeps=n_sub)
 
     # ---------------------------------------------------------------
     # Test 5: Stable solver with gradient tracking (BPTT compatibility)
+    # Sweep over different horizon lengths to find max stable horizon.
     # ---------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("TEST 5: SolverSemiImplicitStable with requires_grad=True")
+    print("TEST 5: SolverSemiImplicitStable BPTT (requires_grad=True)")
     print("=" * 80)
-    single = newton.ModelBuilder()
-    newton.solvers.SolverMuJoCo.register_custom_attributes(single)
-    single.add_mjcf(
-        str(MJCF_PATH),
-        floating=True,
-        ignore_inertial_definitions=False,
-        collapse_fixed_joints=True,
-        enable_self_collisions=False,
-        convert_3d_hinge_to_ball_joints=False,
-        ignore_names=["floor", "ground"],
-    )
-    ground_cfg = single.ShapeConfig(mu=1.0, restitution=0)
-    single.add_ground_plane(cfg=ground_cfg)
-    builder = newton.ModelBuilder()
-    builder.replicate(single, NUM_WORLDS, spacing=(5.0, 5.0, 0.0))
-    m_grad = builder.finalize(requires_grad=True)
 
-    if hasattr(m_grad, 'mujoco'):
-        pd_ke = m_grad.mujoco.dof_passive_stiffness.numpy().copy()
-        pd_kd = m_grad.mujoco.dof_passive_damping.numpy().copy()
-        m_grad.joint_target_ke.assign(pd_ke)
-        m_grad.joint_target_kd.assign(pd_kd)
-        m_grad.mujoco.dof_passive_stiffness.assign(np.zeros_like(pd_ke))
-        m_grad.mujoco.dof_passive_damping.assign(np.zeros_like(pd_kd))
+    for num_tape_steps in [5, 10, 20, 50]:
+        print(f"\n  --- BPTT horizon: {num_tape_steps} steps "
+              f"({num_tape_steps * NUM_SUBSTEPS} physics substeps) ---")
 
-    solver = newton.solvers.SolverSemiImplicitStable(
-        m_grad, joint_attach_ke=1e4, joint_attach_kd=100
-    )
-    control = m_grad.control()
+        single = newton.ModelBuilder()
+        newton.solvers.SolverMuJoCo.register_custom_attributes(single)
+        single.add_mjcf(
+            str(MJCF_PATH),
+            floating=True,
+            ignore_inertial_definitions=False,
+            collapse_fixed_joints=True,
+            enable_self_collisions=False,
+            convert_3d_hinge_to_ball_joints=False,
+            ignore_names=["floor", "ground"],
+        )
+        ground_cfg = single.ShapeConfig(mu=1.0, restitution=0)
+        single.add_ground_plane(cfg=ground_cfg)
+        builder = newton.ModelBuilder()
+        builder.replicate(single, NUM_WORLDS, spacing=(5.0, 5.0, 0.0))
+        m_grad = builder.finalize(requires_grad=True)
 
-    s0 = m_grad.state(requires_grad=True)
-    s1 = m_grad.state(requires_grad=True)
+        if hasattr(m_grad, 'mujoco'):
+            pd_ke = m_grad.mujoco.dof_passive_stiffness.numpy().copy()
+            pd_kd = m_grad.mujoco.dof_passive_damping.numpy().copy()
+            m_grad.joint_target_ke.assign(pd_ke)
+            m_grad.joint_target_kd.assign(pd_kd)
+            m_grad.mujoco.dof_passive_stiffness.assign(np.zeros_like(pd_ke))
+            m_grad.mujoco.dof_passive_damping.assign(np.zeros_like(pd_kd))
 
-    newton.eval_fk(m_grad, s0.joint_q, s0.joint_qd, s0)
-    wp.synchronize()
+        solver = newton.solvers.SolverSemiImplicitStable(
+            m_grad, joint_attach_ke=1e4, joint_attach_kd=100
+        )
+        control = m_grad.control()
 
-    qpos = s0.joint_q.numpy().copy()
-    q_size = len(qpos) // NUM_WORLDS
-    for w in range(NUM_WORLDS):
-        s = w * q_size
-        qpos[s + 2] = Z_HEIGHT
-        qpos[s + 3] = 0.0; qpos[s + 4] = 0.0; qpos[s + 5] = 0.0; qpos[s + 6] = 1.0
+        s0 = m_grad.state(requires_grad=True)
+        newton.eval_fk(m_grad, s0.joint_q, s0.joint_qd, s0)
+        wp.synchronize()
 
-    init_qpos = wp.array(qpos, dtype=float, device=device)
+        qpos = s0.joint_q.numpy().copy()
+        q_size = len(qpos) // NUM_WORLDS
+        for w in range(NUM_WORLDS):
+            s = w * q_size
+            qpos[s + 2] = Z_HEIGHT
+            qpos[s + 3] = 0.0; qpos[s + 4] = 0.0; qpos[s + 5] = 0.0; qpos[s + 6] = 1.0
 
-    # Run a short forward pass on tape
-    num_tape_steps = 5
-    states = [m_grad.state(requires_grad=True) for _ in range(num_tape_steps * NUM_SUBSTEPS + 1)]
+        init_qpos = wp.array(qpos, dtype=float, device=device)
 
-    # Initialize state 0
-    total_q = m_grad.joint_q.numpy().shape[0]
-    total_qd = m_grad.joint_qd.numpy().shape[0]
-    wp.copy(states[0].joint_q, init_qpos)
-    states[0].joint_qd.zero_()
-    newton.eval_fk(m_grad, states[0].joint_q, states[0].joint_qd, states[0])
-    wp.synchronize()
+        states = [m_grad.state(requires_grad=True)
+                  for _ in range(num_tape_steps * NUM_SUBSTEPS + 1)]
 
-    tape = wp.Tape()
-    failed = False
-    with tape:
-        phys_step = 0
-        for step in range(num_tape_steps):
-            src = states[phys_step]
-            src.clear_forces()
-            contacts = m_grad.collide(src)
+        wp.copy(states[0].joint_q, init_qpos)
+        states[0].joint_qd.zero_()
+        newton.eval_fk(m_grad, states[0].joint_q, states[0].joint_qd, states[0])
+        wp.synchronize()
 
-            for sub in range(NUM_SUBSTEPS):
-                s_in = states[phys_step]
-                s_out = states[phys_step + 1]
-                s_in.clear_forces()
-                solver.step(s_in, s_out, control, contacts, SUB_DT)
-                newton.eval_ik(m_grad, s_out, s_out.joint_q, s_out.joint_qd)
-                phys_step += 1
+        tape = wp.Tape()
+        failed = False
+        with tape:
+            phys_step = 0
+            for step in range(num_tape_steps):
+                src = states[phys_step]
+                src.clear_forces()
+                contacts = m_grad.collide(src)
 
-            wp.synchronize()
-            jq = states[phys_step].joint_q.numpy()
-            if np.isnan(jq).any():
-                print(f"  NaN at step {step}")
-                failed = True
-                break
+                for sub in range(NUM_SUBSTEPS):
+                    s_in = states[phys_step]
+                    s_out = states[phys_step + 1]
+                    s_in.clear_forces()
+                    solver.step(s_in, s_out, control, contacts, SUB_DT)
+                    newton.eval_ik(m_grad, s_out, s_out.joint_q, s_out.joint_qd)
+                    phys_step += 1
 
-    if not failed:
-        # Check if final state is finite
-        final_jq = states[phys_step].joint_q.numpy()
-        root_z = final_jq[2]
-        print(f"  Forward pass: {num_tape_steps} steps, root_z={root_z:.4f}, "
-              f"nan={np.isnan(final_jq).any()}, inf={np.isinf(final_jq).any()}")
+                wp.synchronize()
+                jq = states[phys_step].joint_q.numpy()
+                if np.isnan(jq).any():
+                    print(f"    NaN at step {step}")
+                    failed = True
+                    break
 
-        # Try backward pass
-        try:
-            loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
-            # Simple loss: sum of final joint_q
-            final_state = states[phys_step]
-            wp.copy(loss, wp.array([float(final_jq.sum())], dtype=float, device=device))
+        if not failed:
+            final_jq = states[phys_step].joint_q.numpy()
+            root_z = final_jq[2]
+            print(f"    Forward:  {num_tape_steps} steps, root_z={root_z:.4f}")
 
-            tape.backward(loss)
-            print(f"  Backward pass: SUCCESS (tape recorded {phys_step} physics steps)")
-        except Exception as e:
-            print(f"  Backward pass: FAILED ({e})")
-    else:
-        print(f"  Forward pass: FAILED (NaN)")
+            try:
+                loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+                wp.copy(loss, wp.array([float(final_jq.sum())], dtype=float, device=device))
+                tape.backward(loss)
+                print(f"    Backward: SUCCESS ({phys_step} physics steps)")
+            except Exception as e:
+                print(f"    Backward: FAILED ({e})")
+        else:
+            print(f"    Forward:  FAILED (NaN)")
+
+        # Free states to avoid OOM on long horizons
+        del states, tape, solver, m_grad
+        wp.synchronize()
 
     print("\n" + "=" * 80)
     print("DONE")
