@@ -3,7 +3,7 @@
 G1 Eval Worker — GPU subprocess for PGHC co-design gradient computation.
 
 Runs Phase 1 (action collection via MimicKit) and Phase 2 (BPTT gradient via
-Warp/SolverSemiImplicit) in an isolated process so the parent orchestrator
+Warp/SolverSemiImplicitStable) in an isolated process so the parent orchestrator
 never touches the GPU.
 
 Called by codesign_g1.py as:
@@ -323,9 +323,13 @@ def collect_actions_mimickit(
 class DiffG1Eval:
     """Differentiable G1 eval for computing design gradients via BPTT.
 
-    Builds a small eval env with SolverSemiImplicit, runs a frozen-policy
+    Builds a small eval env with SolverSemiImplicitStable, runs a frozen-policy
     episode on wp.Tape(), then tape.backward() to get ∂reward/∂joint_X_p,
     and chains that to ∂reward/∂theta via the Warp kernel.
+
+    SolverSemiImplicitStable uses implicit joint attachment forces that are
+    unconditionally stable — no mass/inertia clamping needed, preserving
+    correct physics for meaningful BPTT gradients.
     """
 
     def __init__(
@@ -335,7 +339,7 @@ class DiffG1Eval:
         num_worlds=8,
         horizon=100,
         dt=1.0/30.0,
-        num_substeps=8,
+        num_substeps=16,
         device="cuda:0",
     ):
         self.mjcf_modifier = mjcf_modifier
@@ -352,7 +356,7 @@ class DiffG1Eval:
         self._alloc_buffers()
 
     def _build_model(self):
-        """Build Newton model with SolverSemiImplicit for BPTT."""
+        """Build Newton model with SolverSemiImplicitStable for BPTT."""
         # Generate modified MJCF
         with tempfile.NamedTemporaryFile(
             mode='w', suffix='.xml', delete=False, dir=str(BASE_MJCF_PATH.parent)
@@ -384,43 +388,20 @@ class DiffG1Eval:
 
             self.model = builder.finalize(requires_grad=True)
 
-            # Clamp minimum body mass and inertia for semi-implicit stability.
-            # SolverSemiImplicit uses penalty springs (joint_attach_ke/kd) to
-            # enforce joint constraints.  Angular stability requires
-            # kd * dt / I_min < 2.  The G1's wrist/ankle links have I ~ 1e-6,
-            # making even kd=1 unstable.  Clamping to min_I=1.0 provides
-            # sufficient margin for the 30-body articulated chain.
-            MIN_BODY_MASS = 1.0    # kg
-            MIN_INERTIA_DIAG = 1.0 # kg·m²
+            # No mass/inertia clamping needed — SolverSemiImplicitStable uses
+            # implicit joint forces that are unconditionally stable regardless
+            # of body mass or inertia (denominator m + dt²*ke + dt*kd > 0 always).
             mass_np = self.model.body_mass.numpy()
-            inv_mass_np = self.model.body_inv_mass.numpy()
-            light = mass_np < MIN_BODY_MASS
-            n_mass_clamped = int(light.sum())
-            if n_mass_clamped > 0:
-                mass_np[light] = MIN_BODY_MASS
-                inv_mass_np[light] = 1.0 / MIN_BODY_MASS
-                self.model.body_mass.assign(mass_np)
-                self.model.body_inv_mass.assign(inv_mass_np)
-
+            min_mass = float(mass_np.min())
             inertia_np = self.model.body_inertia.numpy()
-            inv_inertia_np = self.model.body_inv_inertia.numpy()
-            n_inertia_clamped = 0
-            for bi in range(len(inertia_np)):
-                modified = False
-                for d in range(3):
-                    if inertia_np[bi, d, d] < MIN_INERTIA_DIAG:
-                        inertia_np[bi, d, d] = MIN_INERTIA_DIAG
-                        modified = True
-                if modified:
-                    n_inertia_clamped += 1
-                    inv_inertia_np[bi] = np.linalg.inv(inertia_np[bi])
-            self.model.body_inertia.assign(inertia_np)
-            self.model.body_inv_inertia.assign(inv_inertia_np)
-            print(f"    [DiffG1Eval] Body clamping: {n_mass_clamped} masses -> {MIN_BODY_MASS} kg, "
-                  f"{n_inertia_clamped} inertias -> diag >= {MIN_INERTIA_DIAG}")
+            min_inertia = float(min(inertia_np[bi, d, d]
+                                    for bi in range(len(inertia_np))
+                                    for d in range(3)))
+            print(f"    [DiffG1Eval] Body stats (unmodified): "
+                  f"min_mass={min_mass:.4g} kg, min_inertia_diag={min_inertia:.4g} kg·m²")
 
-            self.solver = newton.solvers.SolverSemiImplicit(
-                self.model, joint_attach_ke=1.0e4, joint_attach_kd=10.0
+            self.solver = newton.solvers.SolverSemiImplicitStable(
+                self.model, joint_attach_ke=1.0e4, joint_attach_kd=100.0
             )
             self.control = self.model.control()
 
@@ -814,7 +795,7 @@ class DiffG1Eval:
                     src.clear_forces()
                     self.solver.step(src, dst, self.control, contacts, self.sub_dt)
 
-                    # SolverSemiImplicit only updates body_q/body_qd (maximal
+                    # SolverSemiImplicitStable only updates body_q/body_qd (maximal
                     # coords). Our loss/energy kernels read joint_q/joint_qd
                     # (generalized coords), so we must run eval_ik to map
                     # body-space → joint-space after each integration step.
@@ -1103,7 +1084,7 @@ def main():
         num_worlds=args.num_eval_worlds,
         horizon=args.eval_horizon,
         dt=1.0/30.0,
-        num_substeps=8,
+        num_substeps=16,
     )
 
     grad_theta, fwd_dist, cot_val = diff_eval.compute_gradient(actions_list)

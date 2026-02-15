@@ -212,7 +212,7 @@ class DifferentiableRollout:
             model: Newton Model object (must be finalized with requires_grad=True)
             horizon: Number of timesteps for the rollout (H in Algorithm 1)
             device: Computation device
-            use_semi_implicit: If True, use SolverSemiImplicit for BPTT compatibility
+            use_semi_implicit: If True, use SolverSemiImplicitStable for BPTT compatibility
             objective_type: "cost_of_transport", "height", or "combined"
             robot_mass: Robot mass in kg (for CoT normalization)
             target_velocity: Target forward velocity (m/s)
@@ -233,7 +233,7 @@ class DifferentiableRollout:
 
         # Create solver for differentiable simulation
         if use_semi_implicit:
-            self.solver = newton.solvers.SolverSemiImplicit(model)
+            self.solver = newton.solvers.SolverSemiImplicitStable(model)
         else:
             self.solver = newton.solvers.SolverMuJoCo(model)
 
@@ -628,8 +628,8 @@ class SimplifiedDiffRollout:
         # Use smaller timestep for stability
         self.dt = 1.0 / 120.0  # 120 Hz instead of 60 Hz
 
-        # Use SolverSemiImplicit for reliable gradients
-        self.solver = newton.solvers.SolverSemiImplicit(model)
+        # Use SolverSemiImplicitStable for reliable gradients
+        self.solver = newton.solvers.SolverSemiImplicitStable(model)
 
         # State buffers
         self.state_0 = model.state(requires_grad=True)
