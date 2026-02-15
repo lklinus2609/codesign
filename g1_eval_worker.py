@@ -368,13 +368,17 @@ class DiffG1Eval:
             single_builder = newton.ModelBuilder()
             newton.solvers.SolverMuJoCo.register_custom_attributes(single_builder)
 
-            # Match MimicKit's newton_engine.py add_mjcf flags exactly
+            # Match MimicKit's newton_engine.py add_mjcf flags where possible.
+            # enable_self_collisions=False because penalty-based contacts in
+            # SolverSemiImplicitStable can't handle inter-link self-contacts
+            # (causes immediate blowup). MuJoCo's implicit solver handles them
+            # fine, but this is an inherent solver limitation.
             single_builder.add_mjcf(
                 mjcf_path,
                 floating=True,
                 ignore_inertial_definitions=False,
                 collapse_fixed_joints=False,
-                enable_self_collisions=True,
+                enable_self_collisions=False,
                 convert_3d_hinge_to_ball_joints=True,
             )
 
