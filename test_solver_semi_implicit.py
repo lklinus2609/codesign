@@ -170,36 +170,7 @@ def main():
     print(f"Device: {device}")
     print(f"Config: {NUM_STEPS} steps x {NUM_SUBSTEPS} substeps, sub_dt={SUB_DT:.6f}")
 
-    # ---------------------------------------------------------------
-    # Test 1: Show body inertias (no clamping)
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("TEST 1: Body inertia diagnostics (real, unclamped)")
-    print("=" * 80)
-    m = build_model(device)
-    print_body_inertias(m)
-
-    # ---------------------------------------------------------------
-    # Test 2: Standard solver with REAL inertias (expected: FAIL)
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("TEST 2: Standard SolverSemiImplicit with REAL inertias (should FAIL)")
-    print("=" * 80)
-    for kd in [100, 10, 1]:
-        m = build_model(device)
-        label = f"[standard] ke=1e4 kd={kd} NO_CLAMP"
-        run_test(m, ke=1e4, kd=kd, label=label, solver_type="standard", device=device)
-
-    # ---------------------------------------------------------------
-    # Test 3: Standard solver with clamped inertias (baseline: PASS)
-    # ---------------------------------------------------------------
-    print("\n" + "=" * 80)
-    print("TEST 3: Standard SolverSemiImplicit with clamped inertias (baseline)")
-    print("=" * 80)
-    m = build_model(device)
-    clamp_model(m, min_mass=1.0, min_I=1.0)
-    label = f"[standard] ke=1e4 kd=10 min_I=1.0 min_mass=1.0"
-    run_test(m, ke=1e4, kd=10, label=label, solver_type="standard", device=device)
+    # Tests 1-3 (standard solver baselines) skipped — already validated.
 
     # ---------------------------------------------------------------
     # Test 4: DEBUG stable solver — before/after implicit correction
