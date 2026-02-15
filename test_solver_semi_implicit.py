@@ -34,14 +34,14 @@ Z_HEIGHT = 0.8
 def build_model(device="cuda:0", requires_grad=False):
     single = newton.ModelBuilder()
     newton.solvers.SolverMuJoCo.register_custom_attributes(single)
+    # Match MimicKit's newton_engine.py add_mjcf flags exactly
     single.add_mjcf(
         str(MJCF_PATH),
         floating=True,
         ignore_inertial_definitions=False,
-        collapse_fixed_joints=True,
-        enable_self_collisions=False,
-        convert_3d_hinge_to_ball_joints=False,
-        ignore_names=["floor", "ground"],
+        collapse_fixed_joints=False,
+        enable_self_collisions=True,
+        convert_3d_hinge_to_ball_joints=True,
     )
     ground_cfg = single.ShapeConfig(mu=1.0, restitution=0)
     single.add_ground_plane(cfg=ground_cfg)
