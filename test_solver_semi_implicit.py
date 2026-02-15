@@ -202,10 +202,134 @@ def main():
     run_test(m, ke=1e4, kd=10, label=label, solver_type="standard", device=device)
 
     # ---------------------------------------------------------------
-    # Test 4: NEW stable solver with REAL inertias (THE KEY TEST)
+    # Test 4: DEBUG stable solver — single substep with diagnostics
     # ---------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("TEST 4: SolverSemiImplicitStable with REAL inertias (should PASS)")
+    print("TEST 4: SolverSemiImplicitStable DEBUG (single substep)")
+    print("=" * 80)
+
+    m = build_model(device)
+    ke_test, kd_test = 1e4, 100
+    bodies_per_world = m.body_count // NUM_WORLDS
+    body_keys = m.body_key
+
+    # Manual step-by-step to find where NaN appears
+    from newton.solvers import SolverSemiImplicitStable
+    solver = SolverSemiImplicitStable(m, joint_attach_ke=ke_test, joint_attach_kd=kd_test)
+    control = m.control()
+
+    s0 = m.state(requires_grad=False)
+    s1 = m.state(requires_grad=False)
+
+    newton.eval_fk(m, s0.joint_q, s0.joint_qd, s0)
+    wp.synchronize()
+
+    # Set initial pose
+    qpos = s0.joint_q.numpy().copy()
+    q_size = len(qpos) // NUM_WORLDS
+    for w in range(NUM_WORLDS):
+        s = w * q_size
+        qpos[s + 2] = Z_HEIGHT
+        qpos[s + 3] = 0.0; qpos[s + 4] = 0.0; qpos[s + 5] = 0.0; qpos[s + 6] = 1.0
+    s0.joint_q.assign(qpos)
+    s0.joint_qd.zero_()
+    newton.eval_fk(m, s0.joint_q, s0.joint_qd, s0)
+    wp.synchronize()
+
+    # Check initial state
+    bq0 = s0.body_q.numpy()
+    bqd0 = s0.body_qd.numpy()
+    print(f"\n  Initial state:")
+    print(f"    body_q  NaN: {np.isnan(bq0).any()}, inf: {np.isinf(bq0).any()}")
+    print(f"    body_qd NaN: {np.isnan(bqd0).any()}, inf: {np.isinf(bqd0).any()}")
+    print(f"    body_qd max: {np.abs(bqd0).max():.6f}")
+
+    # Check body_f before step
+    bf0 = s0.body_f.numpy()
+    print(f"    body_f  NaN: {np.isnan(bf0).any()}, max: {np.abs(bf0).max():.6f}")
+
+    # Print a few body positions/velocities
+    for i in range(min(5, bodies_per_world)):
+        name = body_keys[i] if i < len(body_keys) else f"body_{i}"
+        print(f"    body {i} ({name}): q={bq0[i]}, qd={bqd0[i]}")
+
+    # --- Run phases manually ---
+    s0.clear_forces()
+    contacts = m.collide(s0)
+    wp.synchronize()
+
+    # Phase 1: Force accumulation + integration (no joint forces)
+    # We need to manually run the solver's step but check intermediate states.
+    # Easiest: run the full step and check state_out
+    s0.clear_forces()
+    solver.step(s0, s1, control, contacts, SUB_DT)
+    wp.synchronize()
+
+    bq1 = s1.body_q.numpy()
+    bqd1 = s1.body_qd.numpy()
+
+    print(f"\n  After solver.step (1 substep):")
+    print(f"    body_q  NaN: {np.isnan(bq1).any()}, inf: {np.isinf(bq1).any()}")
+    print(f"    body_qd NaN: {np.isnan(bqd1).any()}, inf: {np.isinf(bqd1).any()}")
+    print(f"    body_qd max: {np.abs(bqd1[~np.isnan(bqd1)]).max():.6f}" if not np.isnan(bqd1).all() else "    all NaN")
+
+    # Find which bodies have NaN
+    if np.isnan(bqd1).any():
+        print(f"\n  NaN bodies after solver.step:")
+        for i in range(bodies_per_world):
+            q_nan = np.isnan(bq1[i]).any()
+            qd_nan = np.isnan(bqd1[i]).any()
+            if q_nan or qd_nan:
+                name = body_keys[i] if i < len(body_keys) else f"body_{i}"
+                print(f"    body {i:2d} ({name:30s}): q_nan={q_nan}, qd_nan={qd_nan}")
+                if not np.isnan(bqd1[i]).all():
+                    print(f"      qd = {bqd1[i]}")
+
+    # Now test: run ONLY integration (no implicit correction) to isolate
+    print(f"\n  --- Isolating: integration only (no implicit correction) ---")
+    s0.clear_forces()
+    # Manually replicate what the solver does minus the implicit kernel
+    from newton._src.solvers.semi_implicit.solver_semi_implicit_stable import apply_free_joint_wrench
+    s2 = m.state(requires_grad=False)
+
+    # Apply free joint wrenches
+    if m.joint_count:
+        wp.launch(
+            kernel=apply_free_joint_wrench,
+            dim=m.joint_count,
+            inputs=[m.joint_type, m.joint_enabled, m.joint_child, m.joint_qd_start,
+                    control.joint_f, s0.body_f],
+            device=m.device,
+        )
+    # Contact forces
+    from newton._src.solvers.semi_implicit.kernels_contact import eval_body_contact_forces
+    eval_body_contact_forces(m, s0, contacts, friction_smoothing=1.0)
+    wp.synchronize()
+
+    bf_pre = s0.body_f.numpy()
+    print(f"  body_f before integration: NaN={np.isnan(bf_pre).any()}, max={np.abs(bf_pre).max():.6f}")
+
+    # Integrate
+    solver.integrate_bodies(m, s0, s2, SUB_DT, solver.angular_damping)
+    wp.synchronize()
+
+    bq2 = s2.body_q.numpy()
+    bqd2 = s2.body_qd.numpy()
+    print(f"  After integration only (no implicit correction):")
+    print(f"    body_q  NaN: {np.isnan(bq2).any()}")
+    print(f"    body_qd NaN: {np.isnan(bqd2).any()}")
+    print(f"    body_qd max: {np.abs(bqd2[~np.isnan(bqd2)]).max():.6f}" if not np.isnan(bqd2).all() else "    all NaN")
+
+    if not np.isnan(bqd2).any():
+        print(f"  => Integration alone is STABLE. Bug is in the implicit correction kernel.")
+    else:
+        print(f"  => Integration itself produces NaN. Bug is in force accumulation or integration.")
+
+    # ---------------------------------------------------------------
+    # Test 4b: Full sweep (keeping for reference)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 4b: SolverSemiImplicitStable sweep (should PASS)")
     print("=" * 80)
     for ke in [1e4, 1e3]:
         for kd in [100, 10, 1]:
