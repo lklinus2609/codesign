@@ -368,14 +368,14 @@ class DiffG1Eval:
             single_builder = newton.ModelBuilder()
             newton.solvers.SolverMuJoCo.register_custom_attributes(single_builder)
 
+            # Match MimicKit's newton_engine.py add_mjcf flags exactly
             single_builder.add_mjcf(
                 mjcf_path,
                 floating=True,
                 ignore_inertial_definitions=False,
-                collapse_fixed_joints=True,
-                enable_self_collisions=False,
-                convert_3d_hinge_to_ball_joints=False,
-                ignore_names=["floor", "ground"],
+                collapse_fixed_joints=False,
+                enable_self_collisions=True,
+                convert_3d_hinge_to_ball_joints=True,
             )
 
             # Match MimicKit ground friction (newton_engine.py _build_ground)
