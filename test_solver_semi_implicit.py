@@ -202,10 +202,10 @@ def main():
     run_test(m, ke=1e4, kd=10, label=label, solver_type="standard", device=device)
 
     # ---------------------------------------------------------------
-    # Test 4: DEBUG stable solver — single substep with diagnostics
+    # Test 4: DEBUG stable solver — before/after implicit correction
     # ---------------------------------------------------------------
     print("\n" + "=" * 80)
-    print("TEST 4: SolverSemiImplicitStable DEBUG (per-substep)")
+    print("TEST 4: SolverSemiImplicitStable DEBUG (before/after implicit)")
     print("=" * 80)
 
     m = build_model(device)
@@ -213,8 +213,19 @@ def main():
     bodies_per_world = m.body_count // NUM_WORLDS
     body_keys = m.body_key
 
+    # Print body inertia info for reference
+    mass = m.body_mass.numpy()
+    inertia = m.body_inertia.numpy()
+    print(f"\n  Body info ({bodies_per_world} bodies):")
+    for i in range(min(bodies_per_world, 20)):
+        name = body_keys[i] if i < len(body_keys) else f"body_{i}"
+        I_diag = [inertia[i, d, d] for d in range(3)]
+        I_ratio = max(I_diag) / max(min(I_diag), 1e-20)
+        print(f"    {i:2d} {name:30s}: m={mass[i]:.4f}  I=({I_diag[0]:.3e}, {I_diag[1]:.3e}, {I_diag[2]:.3e})  ratio={I_ratio:.1f}")
+
     from newton.solvers import SolverSemiImplicitStable
     solver = SolverSemiImplicitStable(m, joint_attach_ke=ke_test, joint_attach_kd=kd_test)
+    solver._debug = True  # Enable debug buffer
     control = m.control()
 
     s0 = m.state(requires_grad=False)
@@ -235,8 +246,8 @@ def main():
     newton.eval_fk(m, s0.joint_q, s0.joint_qd, s0)
     wp.synchronize()
 
-    print(f"\n  Running {NUM_SUBSTEPS} substeps with per-substep diagnostics:")
-    print(f"  ke={ke_test}, kd={kd_test}")
+    print(f"\n  Running {NUM_SUBSTEPS} substeps with before/after implicit diagnostics:")
+    print(f"  ke={ke_test}, kd={kd_test}, sub_dt={SUB_DT:.6f}")
 
     src, dst = s0, s1
     src.clear_forces()
@@ -248,43 +259,41 @@ def main():
         solver.step(src, dst, control, contacts, SUB_DT)
         wp.synchronize()
 
-        bq = dst.body_q.numpy()
-        bqd = dst.body_qd.numpy()
-        bq_nan = np.isnan(bq).any()
-        bqd_nan = np.isnan(bqd).any()
-        bqd_max = np.abs(bqd[~np.isnan(bqd)]).max() if not np.isnan(bqd).all() else float('nan')
+        bqd_pre = solver._debug_qd_buf.numpy()   # body_qd after integration, BEFORE implicit
+        bqd_post = dst.body_qd.numpy()            # body_qd AFTER implicit + reintegration
 
-        # Also check eval_ik
-        newton.eval_ik(m, dst, dst.joint_q, dst.joint_qd)
-        wp.synchronize()
-        jq = dst.joint_q.numpy()
-        jqd = dst.joint_qd.numpy()
-        jq_nan = np.isnan(jq).any()
-        jqd_nan = np.isnan(jqd).any()
+        bqd_nan = np.isnan(bqd_post).any()
+        bqd_max_pre = np.abs(bqd_pre[~np.isnan(bqd_pre)]).max() if not np.isnan(bqd_pre).all() else float('nan')
+        bqd_max_post = np.abs(bqd_post[~np.isnan(bqd_post)]).max() if not np.isnan(bqd_post).all() else float('nan')
 
-        status = "OK" if not (bq_nan or bqd_nan or jq_nan or jqd_nan) else "NaN!"
-        print(f"    sub {sub}: body_q_nan={bq_nan} body_qd_nan={bqd_nan} "
-              f"joint_q_nan={jq_nan} joint_qd_nan={jqd_nan} "
-              f"bqd_max={bqd_max:.4f} [{status}]")
+        # Compute per-body correction magnitude
+        delta = bqd_post - bqd_pre
+        delta_mag = np.linalg.norm(delta[:bodies_per_world], axis=1)
+        pre_mag = np.linalg.norm(bqd_pre[:bodies_per_world], axis=1)
+        post_mag = np.linalg.norm(bqd_post[:bodies_per_world], axis=1)
 
-        if bq_nan or bqd_nan or jq_nan or jqd_nan:
-            # Report which arrays have NaN and which bodies
-            if bqd_nan:
-                print(f"\n    NaN in body_qd:")
-                for i in range(bodies_per_world):
-                    if np.isnan(bqd[i]).any():
-                        name = body_keys[i] if i < len(body_keys) else f"body_{i}"
-                        print(f"      body {i:2d} ({name:30s}): qd={bqd[i]}")
-            if jq_nan and not bq_nan:
-                print(f"\n    NaN ONLY in joint_q (eval_ik issue):")
-                nan_indices = np.where(np.isnan(jq))[0]
-                print(f"      NaN at joint_q indices: {nan_indices[:20]}")
-            if jqd_nan and not bqd_nan:
-                print(f"\n    NaN ONLY in joint_qd (eval_ik issue):")
-                nan_indices = np.where(np.isnan(jqd))[0]
-                print(f"      NaN at joint_qd indices: {nan_indices[:20]}")
+        print(f"\n    --- sub {sub} ---")
+        print(f"    bqd_max: pre={bqd_max_pre:.6f}  post={bqd_max_post:.6f}")
+
+        # Show top 10 bodies by correction magnitude
+        top_idx = np.argsort(delta_mag)[::-1][:10]
+        print(f"    Top 10 bodies by |correction|:")
+        for idx in top_idx:
+            name = body_keys[idx] if idx < len(body_keys) else f"body_{idx}"
+            print(f"      {idx:2d} {name:30s}: |pre|={pre_mag[idx]:.6f}  |post|={post_mag[idx]:.6f}  "
+                  f"|delta|={delta_mag[idx]:.6f}")
+            if delta_mag[idx] > 0.001:  # Show components for significant corrections
+                print(f"         pre ={bqd_pre[idx]}")
+                print(f"         post={bqd_post[idx]}")
+                print(f"         delta={delta[idx]}")
+
+        if bqd_nan or bqd_max_post > 1e6:
+            print(f"\n    STOPPING: {'NaN' if bqd_nan else 'velocity > 1e6'}")
             break
 
+        # eval_ik for next substep
+        newton.eval_ik(m, dst, dst.joint_q, dst.joint_qd)
+        wp.synchronize()
         src, dst = dst, src
 
     # ---------------------------------------------------------------
