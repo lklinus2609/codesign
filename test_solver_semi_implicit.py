@@ -17,6 +17,7 @@ if str(SCRIPT_DIR.parent) not in sys.path:
 
 import warp as wp
 import newton
+from newton import JointType
 
 MJCF_PATH = SCRIPT_DIR.parent / "MimicKit" / "data" / "assets" / "g1" / "g1.xml"
 
@@ -75,6 +76,77 @@ def init_state(model, state, device="cuda:0"):
     newton.eval_fk(model, state.joint_q, state.joint_qd, state)
     wp.synchronize()
     return qpos
+
+
+# JointType enum → name mapping
+JOINT_TYPE_NAMES = {}
+for _name in ['FREE', 'REVOLUTE', 'PRISMATIC', 'BALL', 'FIXED', 'DISTANCE',
+              'COMPOUND', 'UNIVERSAL', 'D6']:
+    _val = getattr(JointType, _name, None)
+    if _val is not None:
+        JOINT_TYPE_NAMES[int(_val)] = _name
+
+FREE_TYPE = int(JointType.FREE)
+
+
+def find_deep_test_body(model):
+    """Find a body deep in the kinematic chain for morphology gradient testing.
+
+    Returns (test_body_idx, ancestor_joint_indices, non_ancestor_joint_idx).
+    ancestor_joint_indices are ordered from the test body up to the root.
+    """
+    joints_per_world = model.joint_count // NUM_WORLDS
+    bodies_per_world = model.body_count // NUM_WORLDS
+    joint_type_np = model.joint_type.numpy()
+    joint_parent_np = model.joint_parent.numpy()
+    joint_child_np = model.joint_child.numpy()
+
+    # Build body → (creating_joint, parent_body) mapping
+    creating_joint = {}
+    parent_body_map = {}
+    for j in range(joints_per_world):
+        c = int(joint_child_np[j])
+        p = int(joint_parent_np[j])
+        creating_joint[c] = j
+        parent_body_map[c] = p
+
+    # Compute depth of each body
+    def get_depth(b):
+        d = 0
+        cur = b
+        while cur in parent_body_map and parent_body_map[cur] >= 0:
+            cur = parent_body_map[cur]
+            d += 1
+        return d
+
+    # Pick first body with depth >= 3
+    test_body = -1
+    for b in range(bodies_per_world):
+        if get_depth(b) >= 3:
+            test_body = b
+            break
+    if test_body < 0:
+        # Fallback: deepest body
+        test_body = max(range(bodies_per_world), key=get_depth)
+
+    # Walk up to find ancestor joints
+    ancestors = []
+    b = test_body
+    while b in creating_joint:
+        ancestors.append(creating_joint[b])
+        b = parent_body_map.get(b, -1)
+        if b < 0:
+            break
+
+    # Find a non-ancestor joint (for negative control)
+    ancestor_set = set(ancestors)
+    non_ancestor = -1
+    for j in range(joints_per_world):
+        if j not in ancestor_set and int(joint_type_np[j]) != FREE_TYPE:
+            non_ancestor = j
+            break
+
+    return test_body, ancestors, non_ancestor
 
 
 # ===================================================================
@@ -741,24 +813,22 @@ def test_f_model_param_gradients(device):
 
     m = build_model(device, requires_grad=True)
 
+    # --- Print JointType enum values ---
+    print(f"\n  JointType enum: {JOINT_TYPE_NAMES}")
+
     # --- Print model structure ---
     joints_per_world = m.joint_count // NUM_WORLDS
     bodies_per_world = m.body_count // NUM_WORLDS
-    print(f"\n  Model: {joints_per_world} joints, {bodies_per_world} bodies (per world)")
+    print(f"  Model: {joints_per_world} joints, {bodies_per_world} bodies (per world)")
 
     joint_type_np = m.joint_type.numpy()
     joint_parent_np = m.joint_parent.numpy()
     joint_child_np = m.joint_child.numpy()
     xp_np = m.joint_X_p.numpy()
 
-    type_names = {0: "FREE", 1: "REVOLUTE", 2: "PRISMATIC", 3: "BALL", 4: "FIXED", 5: "DISTANCE"}
-
     print(f"\n  Joint structure (first world):")
     print(f"  {'j':>3s}  {'type':>9s}  {'parent':>6s}  {'child':>6s}  "
           f"{'parent_name':>25s}  {'child_name':>25s}  X_p pos")
-
-    test_joint = -1
-    test_body = -1
 
     for j in range(min(joints_per_world, 15)):
         p = joint_parent_np[j]
@@ -766,7 +836,7 @@ def test_f_model_param_gradients(device):
         jt = joint_type_np[j]
         p_name = m.body_key[p] if 0 <= p < len(m.body_key) else "world"
         c_name = m.body_key[c] if 0 <= c < len(m.body_key) else f"body_{c}"
-        t_name = type_names.get(jt, f"type_{jt}")
+        t_name = JOINT_TYPE_NAMES.get(int(jt), f"type_{jt}")
 
         if xp_np.ndim == 2:
             pos = xp_np[j, :3]
@@ -776,16 +846,12 @@ def test_f_model_param_gradients(device):
         print(f"  {j:3d}  {t_name:>9s}  {p:6d}  {c:6d}  {p_name:>25s}  {c_name:>25s}  "
               f"({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})")
 
-        if test_joint < 0 and jt != 0:  # First non-FREE joint
-            test_joint = j
-            test_body = c
-
-    if test_joint < 0:
-        print("\n  ERROR: No non-FREE joints found.")
-        return
-
+    # --- Find deep test body ---
+    test_body, ancestor_joints, non_ancestor = find_deep_test_body(m)
     test_body_name = m.body_key[test_body] if test_body < len(m.body_key) else f"body_{test_body}"
-    print(f"\n  Test target: joint {test_joint} -> body {test_body} ({test_body_name})")
+    print(f"\n  Loss body: {test_body} ({test_body_name}), depth={len(ancestor_joints)}")
+    print(f"  Ancestor joints: {ancestor_joints}")
+    print(f"  Non-ancestor joint (negative control): {non_ancestor}")
 
     # --- Forward pass with tape ---
     solver = newton.solvers.SolverSemiImplicitStable(m, joint_attach_ke=ke, joint_attach_kd=kd)
@@ -862,13 +928,15 @@ def test_f_model_param_gradients(device):
         gxp = grad_Xp.numpy()
         if np.any(gxp != 0):
             print(f"\n  Per-joint joint_X_p gradient (non-zero only):")
+            ancestor_set = set(ancestor_joints)
             for j in range(joints_per_world):
                 row = gxp[j] if gxp.ndim == 2 else np.array([float(gxp[j][k]) for k in range(7)])
                 if np.any(row != 0):
                     c = joint_child_np[j]
                     c_name = m.body_key[c] if 0 <= c < len(m.body_key) else f"body_{c}"
-                    jt = type_names.get(joint_type_np[j], "?")
-                    print(f"    joint {j:2d} ({jt:>8s}) -> {c_name:25s}: "
+                    jt = JOINT_TYPE_NAMES.get(int(joint_type_np[j]), "?")
+                    is_anc = "ANC" if j in ancestor_set else "   "
+                    print(f"    {is_anc} joint {j:2d} ({jt:>8s}) -> {c_name:25s}: "
                           f"pos=({row[0]:+.4e}, {row[1]:+.4e}, {row[2]:+.4e})  "
                           f"rot=({row[3]:+.4e}, {row[4]:+.4e}, {row[5]:+.4e}, {row[6]:+.4e})")
 
@@ -924,28 +992,27 @@ def test_g_morphology_fd(device):
     num_steps = 3
     eps = 1e-4
 
-    # --- Find test targets ---
+    # --- Find deep test body and its ancestor joints ---
     m_probe = build_model(device, requires_grad=False)
-    joints_per_world = m_probe.joint_count // NUM_WORLDS
-    joint_type_np = m_probe.joint_type.numpy()
+    loss_body, ancestor_joints, non_ancestor = find_deep_test_body(m_probe)
     joint_child_np = m_probe.joint_child.numpy()
 
-    test_joints = []  # (joint_idx, child_body_idx, name)
-    for j in range(joints_per_world):
-        if joint_type_np[j] != 0 and len(test_joints) < 4:
-            c = joint_child_np[j]
-            c_name = m_probe.body_key[c] if c < len(m_probe.body_key) else f"body_{c}"
-            test_joints.append((j, c, c_name))
+    loss_body_name = m_probe.body_key[loss_body] if loss_body < len(m_probe.body_key) else f"body_{loss_body}"
+    print(f"\n  Loss body: {loss_body} ({loss_body_name}), depth={len(ancestor_joints)}")
+    print(f"  Ancestor joints: {ancestor_joints}")
+    print(f"  Non-ancestor joint (negative control): {non_ancestor}")
 
-    if not test_joints:
-        print("  ERROR: No non-FREE joints found")
-        del m_probe
-        return
+    # Build test_joints list: ancestor joints + non-ancestor for control
+    test_joints = []
+    for j in ancestor_joints[:4]:  # up to 4 ancestors
+        c = int(joint_child_np[j])
+        c_name = m_probe.body_key[c] if c < len(m_probe.body_key) else f"body_{c}"
+        test_joints.append((j, c, c_name))
+    if non_ancestor >= 0:
+        c = int(joint_child_np[non_ancestor])
+        c_name = m_probe.body_key[c] if c < len(m_probe.body_key) else f"body_{c}"
+        test_joints.append((non_ancestor, c, c_name + " [NEG]"))
 
-    # Use the first test joint's child as the common loss body
-    loss_body = test_joints[0][1]
-    loss_body_name = test_joints[0][2]
-    print(f"\n  Loss body: {loss_body} ({loss_body_name})")
     print(f"  Testing joints: {[j for j, _, _ in test_joints]}")
     del m_probe
 
@@ -1038,11 +1105,23 @@ def test_g_morphology_fd(device):
             else:
                 tape_val = float(gxp[j_idx][2])
             fd_val = fd_grads.get(j_idx, float('nan'))
-            ratio = tape_val / fd_val if abs(fd_val) > 1e-12 else float('nan')
-            ok = abs(ratio - 1.0) < 0.1 if not np.isnan(ratio) else False
-            status = "OK" if ok else "MISMATCH"
-            if not ok:
+
+            # Determine match status
+            if abs(fd_val) < 1e-12 and abs(tape_val) < 1e-12:
+                ratio = 0.0
+                status = "OK (both~0)"
+            elif abs(fd_val) < 1e-12:
+                ratio = float('inf')
+                status = "MISMATCH (FD~0)"
                 all_ok = False
+            else:
+                ratio = tape_val / fd_val
+                if abs(ratio - 1.0) < 0.1:
+                    status = "OK"
+                else:
+                    status = "MISMATCH"
+                    all_ok = False
+
             print(f"  {j_idx:5d}  {c_name:>25s}  {tape_val:+14.6e}  {fd_val:+14.6e}  {ratio:8.4f}  {status}")
 
         if all_ok:
@@ -1083,25 +1162,12 @@ def test_h_control_gradients(device):
     print(f"\n  DOF count: {dof_count}")
     print(f"  Setting joint_target_pos += {offset} for all DOFs")
 
-    # Find test body
-    joints_per_world = m.joint_count // NUM_WORLDS
-    joint_type_np = m.joint_type.numpy()
-    joint_child_np = m.joint_child.numpy()
-
-    test_joint = -1
-    test_body = -1
-    for j in range(joints_per_world):
-        if joint_type_np[j] != 0:
-            test_joint = j
-            test_body = joint_child_np[j]
-            break
-
-    if test_body < 0:
-        print("  ERROR: No non-FREE joints found")
-        return
-
+    # Find deep test body (same as Tests F/G)
+    test_body, ancestor_joints, non_ancestor = find_deep_test_body(m)
     test_body_name = m.body_key[test_body] if test_body < len(m.body_key) else f"body_{test_body}"
-    print(f"  Loss body: {test_body} ({test_body_name})")
+    test_joint = ancestor_joints[0] if ancestor_joints else -1
+    print(f"  Loss body: {test_body} ({test_body_name}), depth={len(ancestor_joints)}")
+    print(f"  Ancestor joints: {ancestor_joints}")
 
     # --- Forward with tape ---
     total_phys = num_steps * NUM_SUBSTEPS
@@ -1178,9 +1244,16 @@ def test_h_control_gradients(device):
     s_tmp2 = m_fd.state(requires_grad=False)
     base_qpos_fd = init_state(m_fd, s_tmp2, device)
 
-    # Pick a few DOFs to FD test (first 3 non-zero DOFs or first 3 overall)
-    fd_dofs = list(range(min(3, dof_count)))
-    print(f"  Testing DOFs: {fd_dofs}")
+    # Pick DOFs that correspond to ancestor joints (these affect the test body)
+    qd_start_np = m_fd.joint_qd_start.numpy()
+    fd_dofs = []
+    for j in ancestor_joints[:3]:
+        dof_idx = int(qd_start_np[j])
+        if dof_idx < dof_count:
+            fd_dofs.append(dof_idx)
+    if not fd_dofs:
+        fd_dofs = list(range(min(3, dof_count)))
+    print(f"  Testing DOFs: {fd_dofs} (from ancestor joints {ancestor_joints[:3]})")
 
     grad_target = tape.gradients.get(control.joint_target_pos)
     tape_target_np = grad_target.numpy() if grad_target is not None else None
