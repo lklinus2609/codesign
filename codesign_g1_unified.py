@@ -754,7 +754,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 num_worlds=args.num_eval_worlds,
                 horizon=args.eval_horizon,
                 dt=1.0 / 30.0,
-                num_substeps=8,
+                num_substeps=16,
                 device=device,
             )
 
