@@ -583,10 +583,30 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
     if is_root:
         print("[2/4] Building training env and agent...")
-    env = env_builder.build_env(
-        str(modified_env_config), str(BASE_ENGINE_CONFIG),
-        per_rank_envs, device, visualize=False,
-    )
+
+    # Build env/agent with staggered startup to avoid Warp NVRTC cache race.
+    # When the Newton submodule is updated, all Warp kernels need recompilation.
+    # If all workers build simultaneously, they race on the shared disk cache.
+    # Rank 0 builds first (compiling + caching kernels), then the rest build
+    # and find the warm cache.
+    if mp_util.enable_mp():
+        if is_root:
+            env = env_builder.build_env(
+                str(modified_env_config), str(BASE_ENGINE_CONFIG),
+                per_rank_envs, device, visualize=False,
+            )
+            wp.synchronize()
+        torch.distributed.barrier()  # non-root waits for rank 0's cache to be warm
+        if not is_root:
+            env = env_builder.build_env(
+                str(modified_env_config), str(BASE_ENGINE_CONFIG),
+                per_rank_envs, device, visualize=False,
+            )
+    else:
+        env = env_builder.build_env(
+            str(modified_env_config), str(BASE_ENGINE_CONFIG),
+            per_rank_envs, device, visualize=False,
+        )
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
 
     if args.resume_checkpoint:
