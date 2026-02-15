@@ -348,6 +348,17 @@ def extract_root_z(joint_q: wp.array(dtype=float), out: wp.array(dtype=float)):
     out[0] = joint_q[2]
 
 
+@wp.kernel
+def extract_body_pos_z(
+    body_q: wp.array(dtype=wp.transform),
+    body_idx: int,
+    out: wp.array(dtype=float),
+):
+    """Extract z-position of a specific body from body_q transforms."""
+    pos = wp.transform_get_translation(body_q[body_idx])
+    out[0] = pos[2]
+
+
 def test_c_gradient_quality(device):
     print("\n" + "=" * 80)
     print("TEST C: Gradient quality (root_z loss, BPTT)")
@@ -715,6 +726,520 @@ def test_e_contact_gradients(device):
 
 
 # ===================================================================
+# TEST F: Model parameter gradient flow
+# Verify gradients reach joint_X_p, joint_X_c, body_com from a
+# non-root body position loss.  Uses free-fall only (3 steps).
+# ===================================================================
+
+def test_f_model_param_gradients(device):
+    print("\n" + "=" * 80)
+    print("TEST F: Model parameter gradient flow (joint_X_p, joint_X_c, body_com)")
+    print("=" * 80)
+
+    ke, kd = 1e4, 100
+    num_steps = 3  # Free-fall only
+
+    m = build_model(device, requires_grad=True)
+
+    # --- Print model structure ---
+    joints_per_world = m.joint_count // NUM_WORLDS
+    bodies_per_world = m.body_count // NUM_WORLDS
+    print(f"\n  Model: {joints_per_world} joints, {bodies_per_world} bodies (per world)")
+
+    joint_type_np = m.joint_type.numpy()
+    joint_parent_np = m.joint_parent.numpy()
+    joint_child_np = m.joint_child.numpy()
+    xp_np = m.joint_X_p.numpy()
+
+    type_names = {0: "FREE", 1: "REVOLUTE", 2: "PRISMATIC", 3: "BALL", 4: "FIXED", 5: "DISTANCE"}
+
+    print(f"\n  Joint structure (first world):")
+    print(f"  {'j':>3s}  {'type':>9s}  {'parent':>6s}  {'child':>6s}  "
+          f"{'parent_name':>25s}  {'child_name':>25s}  X_p pos")
+
+    test_joint = -1
+    test_body = -1
+
+    for j in range(min(joints_per_world, 15)):
+        p = joint_parent_np[j]
+        c = joint_child_np[j]
+        jt = joint_type_np[j]
+        p_name = m.body_key[p] if 0 <= p < len(m.body_key) else "world"
+        c_name = m.body_key[c] if 0 <= c < len(m.body_key) else f"body_{c}"
+        t_name = type_names.get(jt, f"type_{jt}")
+
+        if xp_np.ndim == 2:
+            pos = xp_np[j, :3]
+        else:
+            pos = [float(xp_np[j][k]) for k in range(3)]
+
+        print(f"  {j:3d}  {t_name:>9s}  {p:6d}  {c:6d}  {p_name:>25s}  {c_name:>25s}  "
+              f"({pos[0]:+.4f}, {pos[1]:+.4f}, {pos[2]:+.4f})")
+
+        if test_joint < 0 and jt != 0:  # First non-FREE joint
+            test_joint = j
+            test_body = c
+
+    if test_joint < 0:
+        print("\n  ERROR: No non-FREE joints found.")
+        return
+
+    test_body_name = m.body_key[test_body] if test_body < len(m.body_key) else f"body_{test_body}"
+    print(f"\n  Test target: joint {test_joint} -> body {test_body} ({test_body_name})")
+
+    # --- Forward pass with tape ---
+    solver = newton.solvers.SolverSemiImplicitStable(m, joint_attach_ke=ke, joint_attach_kd=kd)
+    control = m.control()
+
+    total_phys = num_steps * NUM_SUBSTEPS
+    states = [m.state(requires_grad=True) for _ in range(total_phys + 1)]
+
+    s_tmp = m.state(requires_grad=True)
+    qpos = init_state(m, s_tmp, device)
+    wp.copy(states[0].joint_q, wp.array(qpos, dtype=float, device=device, requires_grad=True))
+    states[0].joint_qd.zero_()
+    wp.synchronize()
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        # eval_fk INSIDE tape: joint_X_p -> body_q connection recorded
+        newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
+
+        phys_step = 0
+        for step in range(num_steps):
+            states[phys_step].clear_forces()
+            contacts = m.collide(states[phys_step])
+            for sub in range(NUM_SUBSTEPS):
+                s_in = states[phys_step]
+                s_out = states[phys_step + 1]
+                s_in.clear_forces()
+                solver.step(s_in, s_out, control, contacts, SUB_DT)
+                newton.eval_ik(m, s_out, s_out.joint_q, s_out.joint_qd)
+                phys_step += 1
+
+        # Loss: z-position of test body (read from solver output, no extra eval_fk)
+        wp.launch(extract_body_pos_z, dim=1,
+                  inputs=[states[phys_step].body_q, test_body],
+                  outputs=[loss], device=device)
+
+    wp.synchronize()
+    loss_val = loss.numpy()[0]
+    print(f"\n  Forward: {num_steps} steps -> loss (body {test_body} z) = {loss_val:.6f}")
+
+    # --- Backward ---
+    tape.backward(loss)
+    wp.synchronize()
+
+    # --- Check gradients ---
+    param_checks = [
+        ("joint_X_p", m.joint_X_p),
+        ("joint_X_c", m.joint_X_c),
+        ("body_com",  m.body_com),
+        ("body_mass", m.body_mass),
+        ("body_inertia", m.body_inertia),
+        ("joint_axis", m.joint_axis),
+    ]
+
+    for name, param in param_checks:
+        grad = tape.gradients.get(param)
+        if grad is not None:
+            g = grad.numpy()
+            n_nz = np.count_nonzero(g)
+            has_nan = np.isnan(g).any()
+            has_inf = np.isinf(g).any()
+            max_abs = np.nanmax(np.abs(g)) if n_nz > 0 else 0.0
+            print(f"\n  Gradient on {name}:")
+            print(f"    shape: {g.shape}, non-zero: {n_nz}/{g.size}, "
+                  f"NaN: {has_nan}, Inf: {has_inf}, max|g|: {max_abs:.6e}")
+        else:
+            print(f"\n  Gradient on {name}: NOT TRACKED")
+
+    # Detailed per-joint breakdown for joint_X_p
+    grad_Xp = tape.gradients.get(m.joint_X_p)
+    if grad_Xp is not None:
+        gxp = grad_Xp.numpy()
+        if np.any(gxp != 0):
+            print(f"\n  Per-joint joint_X_p gradient (non-zero only):")
+            for j in range(joints_per_world):
+                row = gxp[j] if gxp.ndim == 2 else np.array([float(gxp[j][k]) for k in range(7)])
+                if np.any(row != 0):
+                    c = joint_child_np[j]
+                    c_name = m.body_key[c] if 0 <= c < len(m.body_key) else f"body_{c}"
+                    jt = type_names.get(joint_type_np[j], "?")
+                    print(f"    joint {j:2d} ({jt:>8s}) -> {c_name:25s}: "
+                          f"pos=({row[0]:+.4e}, {row[1]:+.4e}, {row[2]:+.4e})  "
+                          f"rot=({row[3]:+.4e}, {row[4]:+.4e}, {row[5]:+.4e}, {row[6]:+.4e})")
+
+    del states, tape, solver, m
+    wp.synchronize()
+
+
+# ===================================================================
+# TEST G: Morphology FD validation
+# FD-validate d(body_z) / d(joint_X_p_z) for several joints.
+# One tape run gives gradients for ALL joints; FD perturbs one at a time.
+# ===================================================================
+
+def run_forward_get_body_z(model, solver, init_qpos, num_steps, body_idx, device,
+                           target_pos=None):
+    """Run forward sim and return z-position of a specific body."""
+    control = model.control()
+    if target_pos is not None:
+        control.joint_target_pos.assign(target_pos)
+
+    s0 = model.state(requires_grad=False)
+    s1 = model.state(requires_grad=False)
+
+    s0.joint_q.assign(init_qpos)
+    s0.joint_qd.zero_()
+    newton.eval_fk(model, s0.joint_q, s0.joint_qd, s0)
+    wp.synchronize()
+
+    src, dst = s0, s1
+    for step in range(num_steps):
+        src.clear_forces()
+        contacts = model.collide(src)
+        for sub in range(NUM_SUBSTEPS):
+            src.clear_forces()
+            solver.step(src, dst, control, contacts, SUB_DT)
+            newton.eval_ik(model, dst, dst.joint_q, dst.joint_qd)
+            src, dst = dst, src
+
+    out = wp.zeros(1, dtype=float, device=device)
+    wp.launch(extract_body_pos_z, dim=1,
+              inputs=[src.body_q, body_idx],
+              outputs=[out], device=device)
+    wp.synchronize()
+    return out.numpy()[0]
+
+
+def test_g_morphology_fd(device):
+    print("\n" + "=" * 80)
+    print("TEST G: Morphology FD validation (d(body_z)/d(joint_X_p_z))")
+    print("=" * 80)
+
+    ke, kd = 1e4, 100
+    num_steps = 3
+    eps = 1e-4
+
+    # --- Find test targets ---
+    m_probe = build_model(device, requires_grad=False)
+    joints_per_world = m_probe.joint_count // NUM_WORLDS
+    joint_type_np = m_probe.joint_type.numpy()
+    joint_child_np = m_probe.joint_child.numpy()
+
+    test_joints = []  # (joint_idx, child_body_idx, name)
+    for j in range(joints_per_world):
+        if joint_type_np[j] != 0 and len(test_joints) < 4:
+            c = joint_child_np[j]
+            c_name = m_probe.body_key[c] if c < len(m_probe.body_key) else f"body_{c}"
+            test_joints.append((j, c, c_name))
+
+    if not test_joints:
+        print("  ERROR: No non-FREE joints found")
+        del m_probe
+        return
+
+    # Use the first test joint's child as the common loss body
+    loss_body = test_joints[0][1]
+    loss_body_name = test_joints[0][2]
+    print(f"\n  Loss body: {loss_body} ({loss_body_name})")
+    print(f"  Testing joints: {[j for j, _, _ in test_joints]}")
+    del m_probe
+
+    # --- FD gradient ---
+    m_fd = build_model(device, requires_grad=False)
+    solver_fd = newton.solvers.SolverSemiImplicitStable(m_fd, joint_attach_ke=ke, joint_attach_kd=kd)
+
+    s_tmp = m_fd.state(requires_grad=False)
+    base_qpos = init_state(m_fd, s_tmp, device)
+    xp_base = m_fd.joint_X_p.numpy().copy()
+    print(f"  joint_X_p numpy shape: {xp_base.shape}, dtype: {xp_base.dtype}")
+
+    # Baseline
+    z_base = run_forward_get_body_z(m_fd, solver_fd, base_qpos, num_steps, loss_body, device)
+    print(f"  Baseline body z: {z_base:.6f}")
+
+    print(f"\n  FD d(body_{loss_body}_z)/d(joint_X_p[j, 2]) with eps={eps}:")
+    print(f"  {'joint':>5s}  {'child':>25s}  {'FD':>14s}  {'z+':>10s}  {'z-':>10s}")
+
+    fd_grads = {}
+    for j_idx, c_idx, c_name in test_joints:
+        xp_plus = xp_base.copy()
+        xp_minus = xp_base.copy()
+        if xp_plus.ndim == 2:
+            xp_plus[j_idx, 2] += eps
+            xp_minus[j_idx, 2] -= eps
+        else:
+            xp_plus[j_idx][2] += eps
+            xp_minus[j_idx][2] -= eps
+
+        m_fd.joint_X_p.assign(xp_plus)
+        z_plus = run_forward_get_body_z(m_fd, solver_fd, base_qpos, num_steps, loss_body, device)
+
+        m_fd.joint_X_p.assign(xp_minus)
+        z_minus = run_forward_get_body_z(m_fd, solver_fd, base_qpos, num_steps, loss_body, device)
+
+        m_fd.joint_X_p.assign(xp_base)  # restore
+
+        fd_val = (z_plus - z_minus) / (2.0 * eps)
+        fd_grads[j_idx] = fd_val
+        print(f"  {j_idx:5d}  {c_name:>25s}  {fd_val:+14.6e}  {z_plus:10.6f}  {z_minus:10.6f}")
+
+    del solver_fd, m_fd
+
+    # --- Tape gradient (one run) ---
+    print(f"\n  Tape gradient (single run):")
+
+    m2 = build_model(device, requires_grad=True)
+    solver2 = newton.solvers.SolverSemiImplicitStable(m2, joint_attach_ke=ke, joint_attach_kd=kd)
+    control2 = m2.control()
+
+    total_phys = num_steps * NUM_SUBSTEPS
+    states = [m2.state(requires_grad=True) for _ in range(total_phys + 1)]
+    wp.copy(states[0].joint_q, wp.array(base_qpos, dtype=float, device=device, requires_grad=True))
+    states[0].joint_qd.zero_()
+    wp.synchronize()
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+    tape = wp.Tape()
+    with tape:
+        newton.eval_fk(m2, states[0].joint_q, states[0].joint_qd, states[0])
+
+        phys_step = 0
+        for step in range(num_steps):
+            states[phys_step].clear_forces()
+            contacts = m2.collide(states[phys_step])
+            for sub in range(NUM_SUBSTEPS):
+                s_in = states[phys_step]
+                s_out = states[phys_step + 1]
+                s_in.clear_forces()
+                solver2.step(s_in, s_out, control2, contacts, SUB_DT)
+                newton.eval_ik(m2, s_out, s_out.joint_q, s_out.joint_qd)
+                phys_step += 1
+
+        wp.launch(extract_body_pos_z, dim=1,
+                  inputs=[states[phys_step].body_q, loss_body],
+                  outputs=[loss], device=device)
+
+    tape.backward(loss)
+    wp.synchronize()
+
+    grad_Xp = tape.gradients.get(m2.joint_X_p)
+    if grad_Xp is not None:
+        gxp = grad_Xp.numpy()
+        print(f"  {'joint':>5s}  {'child':>25s}  {'tape':>14s}  {'FD':>14s}  {'ratio':>8s}  {'status'}")
+        all_ok = True
+        for j_idx, c_idx, c_name in test_joints:
+            if gxp.ndim == 2:
+                tape_val = gxp[j_idx, 2]
+            else:
+                tape_val = float(gxp[j_idx][2])
+            fd_val = fd_grads.get(j_idx, float('nan'))
+            ratio = tape_val / fd_val if abs(fd_val) > 1e-12 else float('nan')
+            ok = abs(ratio - 1.0) < 0.1 if not np.isnan(ratio) else False
+            status = "OK" if ok else "MISMATCH"
+            if not ok:
+                all_ok = False
+            print(f"  {j_idx:5d}  {c_name:>25s}  {tape_val:+14.6e}  {fd_val:+14.6e}  {ratio:8.4f}  {status}")
+
+        if all_ok:
+            print("\n  RESULT: All tape gradients match FD within 10%")
+        else:
+            print("\n  RESULT: MISMATCH detected - investigate")
+    else:
+        print("  WARNING: No gradient found for joint_X_p")
+
+    del states, tape, solver2, m2
+    wp.synchronize()
+
+
+# ===================================================================
+# TEST H: Control actions + gradients
+# Set non-zero PD targets, verify morphology gradients still work
+# and that control.joint_target_pos receives gradients.
+# ===================================================================
+
+def test_h_control_gradients(device):
+    print("\n" + "=" * 80)
+    print("TEST H: Control actions + gradients (PD targets active)")
+    print("=" * 80)
+
+    ke, kd = 1e4, 100
+    num_steps = 3
+
+    m = build_model(device, requires_grad=True)
+    solver = newton.solvers.SolverSemiImplicitStable(m, joint_attach_ke=ke, joint_attach_kd=kd)
+    control = m.control()
+
+    # Set non-zero PD targets (offset all joints by 0.1 rad)
+    target_pos_np = control.joint_target_pos.numpy().copy()
+    dof_count = len(target_pos_np)
+    offset = 0.1
+    target_pos_np[:] += offset
+    control.joint_target_pos.assign(target_pos_np)
+    print(f"\n  DOF count: {dof_count}")
+    print(f"  Setting joint_target_pos += {offset} for all DOFs")
+
+    # Find test body
+    joints_per_world = m.joint_count // NUM_WORLDS
+    joint_type_np = m.joint_type.numpy()
+    joint_child_np = m.joint_child.numpy()
+
+    test_joint = -1
+    test_body = -1
+    for j in range(joints_per_world):
+        if joint_type_np[j] != 0:
+            test_joint = j
+            test_body = joint_child_np[j]
+            break
+
+    if test_body < 0:
+        print("  ERROR: No non-FREE joints found")
+        return
+
+    test_body_name = m.body_key[test_body] if test_body < len(m.body_key) else f"body_{test_body}"
+    print(f"  Loss body: {test_body} ({test_body_name})")
+
+    # --- Forward with tape ---
+    total_phys = num_steps * NUM_SUBSTEPS
+    states = [m.state(requires_grad=True) for _ in range(total_phys + 1)]
+
+    s_tmp = m.state(requires_grad=True)
+    qpos = init_state(m, s_tmp, device)
+    wp.copy(states[0].joint_q, wp.array(qpos, dtype=float, device=device, requires_grad=True))
+    states[0].joint_qd.zero_()
+    wp.synchronize()
+
+    loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+
+    tape = wp.Tape()
+    with tape:
+        newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
+
+        phys_step = 0
+        for step in range(num_steps):
+            states[phys_step].clear_forces()
+            contacts = m.collide(states[phys_step])
+            for sub in range(NUM_SUBSTEPS):
+                s_in = states[phys_step]
+                s_out = states[phys_step + 1]
+                s_in.clear_forces()
+                solver.step(s_in, s_out, control, contacts, SUB_DT)
+                newton.eval_ik(m, s_out, s_out.joint_q, s_out.joint_qd)
+                phys_step += 1
+
+        wp.launch(extract_body_pos_z, dim=1,
+                  inputs=[states[phys_step].body_q, test_body],
+                  outputs=[loss], device=device)
+
+    wp.synchronize()
+    loss_val = loss.numpy()[0]
+    print(f"\n  Forward: {num_steps} steps -> loss (body {test_body} z) = {loss_val:.6f}")
+
+    tape.backward(loss)
+    wp.synchronize()
+
+    # --- Check gradients ---
+    checks = [
+        ("joint_X_p",              m.joint_X_p),
+        ("initial joint_q",        states[0].joint_q),
+        ("control.joint_target_pos", control.joint_target_pos),
+        ("joint_target_ke",        m.joint_target_ke),
+        ("joint_target_kd",        m.joint_target_kd),
+    ]
+
+    for name, param in checks:
+        grad = tape.gradients.get(param)
+        if grad is not None:
+            g = grad.numpy()
+            n_nz = np.count_nonzero(g)
+            has_nan = np.isnan(g).any()
+            has_inf = np.isinf(g).any()
+            max_abs = np.nanmax(np.abs(g)) if n_nz > 0 else 0.0
+            print(f"\n  Gradient on {name}:")
+            print(f"    non-zero: {n_nz}/{g.size}, NaN: {has_nan}, Inf: {has_inf}, max|g|: {max_abs:.6e}")
+            # Print first few non-zero entries for control targets
+            if "target_pos" in name and n_nz > 0:
+                nz_idx = np.nonzero(g)[0][:5]
+                for i in nz_idx:
+                    print(f"      DOF {i}: {g[i]:+.6e}")
+        else:
+            print(f"\n  Gradient on {name}: NOT TRACKED")
+
+    # --- FD validation: d(body_z)/d(target_pos[dof_idx]) ---
+    print(f"\n  FD validation: d(body_z)/d(joint_target_pos[i]):")
+    eps = 1e-4
+
+    m_fd = build_model(device, requires_grad=False)
+    solver_fd = newton.solvers.SolverSemiImplicitStable(m_fd, joint_attach_ke=ke, joint_attach_kd=kd)
+    s_tmp2 = m_fd.state(requires_grad=False)
+    base_qpos_fd = init_state(m_fd, s_tmp2, device)
+
+    # Pick a few DOFs to FD test (first 3 non-zero DOFs or first 3 overall)
+    fd_dofs = list(range(min(3, dof_count)))
+    print(f"  Testing DOFs: {fd_dofs}")
+
+    grad_target = tape.gradients.get(control.joint_target_pos)
+    tape_target_np = grad_target.numpy() if grad_target is not None else None
+
+    print(f"  {'DOF':>5s}  {'tape':>14s}  {'FD':>14s}  {'ratio':>8s}")
+    for dof_idx in fd_dofs:
+        tgt_plus = target_pos_np.copy()
+        tgt_plus[dof_idx] += eps
+        z_plus = run_forward_get_body_z(m_fd, solver_fd, base_qpos_fd, num_steps,
+                                        test_body, device, target_pos=tgt_plus)
+
+        tgt_minus = target_pos_np.copy()
+        tgt_minus[dof_idx] -= eps
+        z_minus = run_forward_get_body_z(m_fd, solver_fd, base_qpos_fd, num_steps,
+                                         test_body, device, target_pos=tgt_minus)
+
+        fd_val = (z_plus - z_minus) / (2.0 * eps)
+        tape_val = tape_target_np[dof_idx] if tape_target_np is not None else float('nan')
+        ratio = tape_val / fd_val if abs(fd_val) > 1e-12 else float('nan')
+        print(f"  {dof_idx:5d}  {tape_val:+14.6e}  {fd_val:+14.6e}  {ratio:8.4f}")
+
+    # --- FD validation: d(body_z)/d(joint_X_p_z) with PD active ---
+    print(f"\n  FD validation: d(body_z)/d(joint_X_p[{test_joint}, z]) with PD active:")
+
+    xp_base = m_fd.joint_X_p.numpy().copy()
+
+    xp_plus = xp_base.copy()
+    xp_minus = xp_base.copy()
+    if xp_plus.ndim == 2:
+        xp_plus[test_joint, 2] += eps
+        xp_minus[test_joint, 2] -= eps
+    else:
+        xp_plus[test_joint][2] += eps
+        xp_minus[test_joint][2] -= eps
+
+    m_fd.joint_X_p.assign(xp_plus)
+    z_plus = run_forward_get_body_z(m_fd, solver_fd, base_qpos_fd, num_steps,
+                                    test_body, device, target_pos=target_pos_np)
+    m_fd.joint_X_p.assign(xp_minus)
+    z_minus = run_forward_get_body_z(m_fd, solver_fd, base_qpos_fd, num_steps,
+                                     test_body, device, target_pos=target_pos_np)
+    m_fd.joint_X_p.assign(xp_base)
+
+    fd_xp = (z_plus - z_minus) / (2.0 * eps)
+
+    grad_Xp = tape.gradients.get(m.joint_X_p)
+    tape_xp = float('nan')
+    if grad_Xp is not None:
+        gxp = grad_Xp.numpy()
+        tape_xp = gxp[test_joint, 2] if gxp.ndim == 2 else float(gxp[test_joint][2])
+
+    ratio = tape_xp / fd_xp if abs(fd_xp) > 1e-12 else float('nan')
+    print(f"    tape={tape_xp:+.6e}  FD={fd_xp:+.6e}  ratio={ratio:.4f}")
+
+    del states, tape, solver, m, solver_fd, m_fd
+    wp.synchronize()
+
+
+# ===================================================================
 # MAIN
 # ===================================================================
 
@@ -729,6 +1254,9 @@ def main():
     test_c_gradient_quality(device)
     test_d_finite_difference(device)
     test_e_contact_gradients(device)
+    test_f_model_param_gradients(device)
+    test_g_morphology_fd(device)
+    test_h_control_gradients(device)
 
     print("\n" + "=" * 80)
     print("ALL TESTS COMPLETE")
