@@ -1,6 +1,8 @@
-"""Isolated test: G1 robot with SolverSemiImplicit.
+"""Isolated test: G1 robot with SolverSemiImplicit vs SolverSemiImplicitStable.
 
-Aggressive parameter sweep: very soft joint attachment + large inertia clamping.
+Tests the new implicit joint attachment solver against the original solver.
+The key test: SolverSemiImplicitStable should survive with REAL body inertias
+(no clamping) where SolverSemiImplicit explodes.
 
 Usage:
     python -u -m codesign.test_solver_semi_implicit
@@ -58,8 +60,8 @@ def build_model(device="cuda:0"):
     return model
 
 
-def clamp_model(model, min_mass, min_I, contact_ke=None, contact_kd=None):
-    """Clamp body mass/inertia and optionally contact stiffness."""
+def clamp_model(model, min_mass, min_I):
+    """Clamp body mass/inertia for stability testing."""
     if min_mass > 0:
         mass = model.body_mass.numpy()
         inv_mass = model.body_inv_mass.numpy()
@@ -85,20 +87,35 @@ def clamp_model(model, min_mass, min_I, contact_ke=None, contact_kd=None):
         model.body_inertia.assign(inertia)
         model.body_inv_inertia.assign(inv_inertia)
 
-    if contact_ke is not None:
-        ke = model.shape_material_ke.numpy()
-        ke[:] = contact_ke
-        model.shape_material_ke.assign(ke)
 
-    if contact_kd is not None:
-        kd = model.shape_material_kd.numpy()
-        kd[:] = contact_kd
-        model.shape_material_kd.assign(kd)
+def print_body_inertias(model):
+    """Print all body masses and minimum inertia diagonals."""
+    mass = model.body_mass.numpy()
+    inertia = model.body_inertia.numpy()
+    body_keys = model.body_key
+    bodies_per_world = model.body_count // NUM_WORLDS
+
+    print(f"\n  Body inertia diagnostics ({bodies_per_world} bodies/world):")
+    for i in range(bodies_per_world):
+        name = body_keys[i] if i < len(body_keys) else f"body_{i}"
+        I_diag = [inertia[i, d, d] for d in range(3)]
+        I_min = min(I_diag)
+        kd_max = 2.0 * I_min / SUB_DT
+        print(f"    body {i:2d} ({name:30s}): mass={mass[i]:.4f} kg, "
+              f"I_min={I_min:.3e}, kd_max_stable={kd_max:.3f}")
 
 
-def run_test(model, ke, kd, label, device="cuda:0"):
-    """Run simulation, return (passed, final_root_z)."""
-    solver = newton.solvers.SolverSemiImplicit(model, joint_attach_ke=ke, joint_attach_kd=kd)
+def run_test(model, ke, kd, label, solver_type="standard", device="cuda:0"):
+    """Run simulation with specified solver. Return (passed, final_root_z)."""
+    if solver_type == "stable":
+        solver = newton.solvers.SolverSemiImplicitStable(
+            model, joint_attach_ke=ke, joint_attach_kd=kd
+        )
+    else:
+        solver = newton.solvers.SolverSemiImplicit(
+            model, joint_attach_ke=ke, joint_attach_kd=kd
+        )
+
     control = model.control()
 
     s0 = model.state(requires_grad=False)
@@ -143,7 +160,7 @@ def run_test(model, ke, kd, label, device="cuda:0"):
 
     status = "PASS" if failed_step is None else f"FAIL@step{failed_step}"
     final_z = root_z if failed_step is None else float('nan')
-    print(f"  {label:60s} {status:12s} z={final_z:.4f}")
+    print(f"  {label:65s} {status:12s} z={final_z:.4f}")
     return failed_step is None
 
 
@@ -151,36 +168,162 @@ def main():
     device = "cuda:0" if wp.is_cuda_available() else "cpu"
     wp.init()
     print(f"Device: {device}")
-    print(f"Config: {NUM_STEPS} steps x {NUM_SUBSTEPS} substeps, sub_dt={SUB_DT:.6f}\n")
+    print(f"Config: {NUM_STEPS} steps x {NUM_SUBSTEPS} substeps, sub_dt={SUB_DT:.6f}")
 
-    # Sweep 1: Very soft attachment springs + large inertia clamp
-    print("--- Sweep: joint_attach_ke/kd with min_I=1.0, min_mass=1.0 ---")
-    for att_ke in [1e4, 1e3, 100, 10]:
-        for att_kd in [10, 1, 0.1, 0.01]:
-            m = build_model(device)
-            clamp_model(m, min_mass=1.0, min_I=1.0)
-            label = f"ke={att_ke:.0f} kd={att_kd}"
-            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
+    # ---------------------------------------------------------------
+    # Test 1: Show body inertias (no clamping)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 1: Body inertia diagnostics (real, unclamped)")
+    print("=" * 80)
+    m = build_model(device)
+    print_body_inertias(m)
 
-    # Sweep 2: Also soften contact stiffness
-    print("\n--- Sweep: soft contacts (contact_ke=100, contact_kd=10) ---")
-    for att_ke in [1e3, 100, 10]:
-        for att_kd in [1, 0.1, 0.01]:
-            m = build_model(device)
-            clamp_model(m, min_mass=1.0, min_I=1.0, contact_ke=100, contact_kd=10)
-            label = f"ke={att_ke:.0f} kd={att_kd} cke=100 ckd=10"
-            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
+    # ---------------------------------------------------------------
+    # Test 2: Standard solver with REAL inertias (expected: FAIL)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 2: Standard SolverSemiImplicit with REAL inertias (should FAIL)")
+    print("=" * 80)
+    for kd in [100, 10, 1]:
+        m = build_model(device)
+        label = f"[standard] ke=1e4 kd={kd} NO_CLAMP"
+        run_test(m, ke=1e4, kd=kd, label=label, solver_type="standard", device=device)
 
-    # Sweep 3: Zero PD gains (eliminate PD torque source)
-    print("\n--- Sweep: zero PD gains + soft contacts ---")
-    for att_ke in [100, 10]:
-        for att_kd in [1, 0.1]:
+    # ---------------------------------------------------------------
+    # Test 3: Standard solver with clamped inertias (baseline: PASS)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 3: Standard SolverSemiImplicit with clamped inertias (baseline)")
+    print("=" * 80)
+    m = build_model(device)
+    clamp_model(m, min_mass=1.0, min_I=1.0)
+    label = f"[standard] ke=1e4 kd=10 min_I=1.0 min_mass=1.0"
+    run_test(m, ke=1e4, kd=10, label=label, solver_type="standard", device=device)
+
+    # ---------------------------------------------------------------
+    # Test 4: NEW stable solver with REAL inertias (THE KEY TEST)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 4: SolverSemiImplicitStable with REAL inertias (should PASS)")
+    print("=" * 80)
+    for ke in [1e4, 1e3]:
+        for kd in [100, 10, 1]:
             m = build_model(device)
-            m.joint_target_ke.zero_()
-            m.joint_target_kd.zero_()
-            clamp_model(m, min_mass=1.0, min_I=1.0, contact_ke=100, contact_kd=10)
-            label = f"ke={att_ke:.0f} kd={att_kd} NO_PD cke=100 ckd=10"
-            run_test(m, ke=att_ke, kd=att_kd, label=label, device=device)
+            label = f"[STABLE] ke={ke:.0f} kd={kd} NO_CLAMP"
+            run_test(m, ke=ke, kd=kd, label=label, solver_type="stable", device=device)
+
+    # ---------------------------------------------------------------
+    # Test 5: Stable solver with gradient tracking (BPTT compatibility)
+    # ---------------------------------------------------------------
+    print("\n" + "=" * 80)
+    print("TEST 5: SolverSemiImplicitStable with requires_grad=True")
+    print("=" * 80)
+    single = newton.ModelBuilder()
+    newton.solvers.SolverMuJoCo.register_custom_attributes(single)
+    single.add_mjcf(
+        str(MJCF_PATH),
+        floating=True,
+        ignore_inertial_definitions=False,
+        collapse_fixed_joints=True,
+        enable_self_collisions=False,
+        convert_3d_hinge_to_ball_joints=False,
+        ignore_names=["floor", "ground"],
+    )
+    ground_cfg = single.ShapeConfig(mu=1.0, restitution=0)
+    single.add_ground_plane(cfg=ground_cfg)
+    builder = newton.ModelBuilder()
+    builder.replicate(single, NUM_WORLDS, spacing=(5.0, 5.0, 0.0))
+    m_grad = builder.finalize(requires_grad=True)
+
+    if hasattr(m_grad, 'mujoco'):
+        pd_ke = m_grad.mujoco.dof_passive_stiffness.numpy().copy()
+        pd_kd = m_grad.mujoco.dof_passive_damping.numpy().copy()
+        m_grad.joint_target_ke.assign(pd_ke)
+        m_grad.joint_target_kd.assign(pd_kd)
+        m_grad.mujoco.dof_passive_stiffness.assign(np.zeros_like(pd_ke))
+        m_grad.mujoco.dof_passive_damping.assign(np.zeros_like(pd_kd))
+
+    solver = newton.solvers.SolverSemiImplicitStable(
+        m_grad, joint_attach_ke=1e4, joint_attach_kd=100
+    )
+    control = m_grad.control()
+
+    s0 = m_grad.state(requires_grad=True)
+    s1 = m_grad.state(requires_grad=True)
+
+    newton.eval_fk(m_grad, s0.joint_q, s0.joint_qd, s0)
+    wp.synchronize()
+
+    qpos = s0.joint_q.numpy().copy()
+    q_size = len(qpos) // NUM_WORLDS
+    for w in range(NUM_WORLDS):
+        s = w * q_size
+        qpos[s + 2] = Z_HEIGHT
+        qpos[s + 3] = 0.0; qpos[s + 4] = 0.0; qpos[s + 5] = 0.0; qpos[s + 6] = 1.0
+
+    init_qpos = wp.array(qpos, dtype=float, device=device)
+
+    # Run a short forward pass on tape
+    num_tape_steps = 5
+    states = [m_grad.state(requires_grad=True) for _ in range(num_tape_steps * NUM_SUBSTEPS + 1)]
+
+    # Initialize state 0
+    total_q = m_grad.joint_q.numpy().shape[0]
+    total_qd = m_grad.joint_qd.numpy().shape[0]
+    wp.copy(states[0].joint_q, init_qpos)
+    states[0].joint_qd.zero_()
+    newton.eval_fk(m_grad, states[0].joint_q, states[0].joint_qd, states[0])
+    wp.synchronize()
+
+    tape = wp.Tape()
+    failed = False
+    with tape:
+        phys_step = 0
+        for step in range(num_tape_steps):
+            src = states[phys_step]
+            src.clear_forces()
+            contacts = m_grad.collide(src)
+
+            for sub in range(NUM_SUBSTEPS):
+                s_in = states[phys_step]
+                s_out = states[phys_step + 1]
+                s_in.clear_forces()
+                solver.step(s_in, s_out, control, contacts, SUB_DT)
+                newton.eval_ik(m_grad, s_out, s_out.joint_q, s_out.joint_qd)
+                phys_step += 1
+
+            wp.synchronize()
+            jq = states[phys_step].joint_q.numpy()
+            if np.isnan(jq).any():
+                print(f"  NaN at step {step}")
+                failed = True
+                break
+
+    if not failed:
+        # Check if final state is finite
+        final_jq = states[phys_step].joint_q.numpy()
+        root_z = final_jq[2]
+        print(f"  Forward pass: {num_tape_steps} steps, root_z={root_z:.4f}, "
+              f"nan={np.isnan(final_jq).any()}, inf={np.isinf(final_jq).any()}")
+
+        # Try backward pass
+        try:
+            loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
+            # Simple loss: sum of final joint_q
+            final_state = states[phys_step]
+            wp.copy(loss, wp.array([float(final_jq.sum())], dtype=float, device=device))
+
+            tape.backward(loss)
+            print(f"  Backward pass: SUCCESS (tape recorded {phys_step} physics steps)")
+        except Exception as e:
+            print(f"  Backward pass: FAILED ({e})")
+    else:
+        print(f"  Forward pass: FAILED (NaN)")
+
+    print("\n" + "=" * 80)
+    print("DONE")
+    print("=" * 80)
 
     return 0
 
