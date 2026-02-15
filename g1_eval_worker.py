@@ -401,7 +401,7 @@ class DiffG1Eval:
                   f"min_mass={min_mass:.4g} kg, min_inertia_diag={min_inertia:.4g} kg·m²")
 
             self.solver = newton.solvers.SolverSemiImplicitStable(
-                self.model, joint_attach_ke=1.0e4, joint_attach_kd=100.0
+                self.model, joint_attach_ke=1.0e3, joint_attach_kd=100.0
             )
             self.control = self.model.control()
 
