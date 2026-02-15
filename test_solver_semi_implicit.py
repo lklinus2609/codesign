@@ -363,16 +363,21 @@ def test_c_gradient_quality(device):
     total_phys = num_tape_steps * NUM_SUBSTEPS
     states = [m.state(requires_grad=True) for _ in range(total_phys + 1)]
 
-    qpos = init_state(m, states[0], device)
+    # Set initial joint_q OUTSIDE tape (this is the "input parameter")
+    s_tmp = m.state(requires_grad=True)
+    qpos = init_state(m, s_tmp, device)
     init_qpos = wp.array(qpos, dtype=float, device=device, requires_grad=True)
     wp.copy(states[0].joint_q, init_qpos)
-    newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
+    states[0].joint_qd.zero_()
     wp.synchronize()
 
     loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
 
     tape = wp.Tape()
     with tape:
+        # eval_fk INSIDE tape so joint_q → body_q connection is recorded
+        newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
+
         phys_step = 0
         for step in range(num_tape_steps):
             states[phys_step].clear_forces()
@@ -414,7 +419,6 @@ def test_c_gradient_quality(device):
         print(f"    max |grad|: {np.nanmax(np.abs(g)):.6e}")
         print(f"    min |grad| (nonzero): {np.min(np.abs(g[g != 0])):.6e}" if np.any(g != 0) else "    (all zero)")
 
-        # Print first 10 entries with labels
         q_size = len(g) // NUM_WORLDS
         labels = ["root_x", "root_y", "root_z",
                    "root_qx", "root_qy", "root_qz", "root_qw"]
@@ -425,6 +429,14 @@ def test_c_gradient_quality(device):
                 print(f"      [{i:3d}] {lbl:20s}: {g[i]:+.6e}")
     else:
         print("\n  WARNING: No gradient found for states[0].joint_q")
+        # Fallback: check body_q gradient (gradient might stop at body level)
+        grad_bq0 = tape.gradients.get(states[0].body_q)
+        if grad_bq0 is not None:
+            gb = grad_bq0.numpy()
+            print(f"    BUT gradient found on states[0].body_q: {np.count_nonzero(gb)}/{gb.size} non-zero")
+            print(f"    → eval_fk adjoint may not connect body_q → joint_q")
+        else:
+            print(f"    No gradient on states[0].body_q either — chain fully broken")
 
     # Check gradients on final state
     grad_final_jq = tape.gradients.get(states[phys_step].joint_q)
@@ -435,6 +447,19 @@ def test_c_gradient_quality(device):
         print(f"    grad[2] (d(root_z)/d(final_root_z)): {gf[2]:.6e}  (should be ~1.0)")
     else:
         print("\n  WARNING: No gradient found for final state joint_q")
+
+    # Check intermediate body_q gradients to find where chain breaks
+    print(f"\n  Gradient chain diagnosis (body_q at each macro step):")
+    for s in range(min(num_tape_steps + 1, 6)):
+        idx = s * NUM_SUBSTEPS
+        gbq = tape.gradients.get(states[idx].body_q)
+        gbqd = tape.gradients.get(states[idx].body_qd)
+        gjq = tape.gradients.get(states[idx].joint_q)
+        bq_nz = np.count_nonzero(gbq.numpy()) if gbq is not None else -1
+        bqd_nz = np.count_nonzero(gbqd.numpy()) if gbqd is not None else -1
+        jq_nz = np.count_nonzero(gjq.numpy()) if gjq is not None else -1
+        print(f"    states[{idx:3d}]: body_q={bq_nz:4d}  body_qd={bqd_nz:4d}  joint_q={jq_nz:4d}  "
+              f"(-1 = not tracked)")
 
     # Check body_mass gradient (should be non-zero if physics depends on mass)
     grad_mass = tape.gradients.get(m.body_mass)
@@ -559,12 +584,14 @@ def test_d_finite_difference(device):
     init_qpos_wp = wp.array(base_qpos, dtype=float, device=device, requires_grad=True)
     wp.copy(states[0].joint_q, init_qpos_wp)
     states[0].joint_qd.zero_()
-    newton.eval_fk(m2, states[0].joint_q, states[0].joint_qd, states[0])
     wp.synchronize()
 
     loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
     tape = wp.Tape()
     with tape:
+        # eval_fk INSIDE tape so joint_q → body_q is recorded
+        newton.eval_fk(m2, states[0].joint_q, states[0].joint_qd, states[0])
+
         phys_step = 0
         for step in range(num_steps):
             states[phys_step].clear_forces()
@@ -638,12 +665,14 @@ def test_e_contact_gradients(device):
 
         wp.copy(states[0].joint_q, init_qpos)
         states[0].joint_qd.zero_()
-        newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
         wp.synchronize()
 
         loss = wp.zeros(1, dtype=float, requires_grad=True, device=device)
         tape = wp.Tape()
         with tape:
+            # eval_fk INSIDE tape so joint_q → body_q is recorded
+            newton.eval_fk(m, states[0].joint_q, states[0].joint_qd, states[0])
+
             phys_step = 0
             for step in range(num_steps):
                 states[phys_step].clear_forces()
