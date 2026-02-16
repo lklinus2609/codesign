@@ -202,6 +202,45 @@ def accumulate_qd_energy_kernel(
 
 
 @wp.kernel
+def accumulate_mechanical_power_kernel(
+    joint_q: wp.array(dtype=float),
+    joint_qd: wp.array(dtype=float),
+    joint_target_pos: wp.array(dtype=float),
+    joint_target_ke: wp.array(dtype=float),
+    joint_target_kd: wp.array(dtype=float),
+    energy_buf: wp.array(dtype=float),
+    qd_dof_start: int,
+    q_dof_start: int,
+    num_act_dofs: int,
+    total_qd_per_world: int,
+    total_q_per_world: int,
+    num_worlds: int,
+    sub_dt: float,
+):
+    """Accumulate Σ|τ·qd| * sub_dt / num_worlds into energy_buf[0].
+
+    Mechanical power: P = |τ_i * qd_i| where τ_i = ke_i*(target_i - q_i) - kd_i*qd_i.
+    More sensitive to morphology changes than ||qd||^2 because torques depend
+    directly on joint positions which shift with body frame orientation.
+    """
+    tid = wp.tid()
+    if tid == 0:
+        total = float(0.0)
+        for w in range(num_worlds):
+            qd_base = w * total_qd_per_world + qd_dof_start
+            q_base = w * total_q_per_world + q_dof_start
+            for d in range(num_act_dofs):
+                qd_val = joint_qd[qd_base + d]
+                q_val = joint_q[q_base + d]
+                target = joint_target_pos[qd_base + d]
+                ke = joint_target_ke[qd_base + d]
+                kd = joint_target_kd[qd_base + d]
+                torque = ke * (target - q_val) - kd * qd_val
+                total = total + wp.abs(torque * qd_val)
+        energy_buf[0] = energy_buf[0] + total * sub_dt / float(num_worlds)
+
+
+@wp.kernel
 def compute_cot_loss_kernel(
     joint_q_final: wp.array(dtype=float),
     joint_q_initial: wp.array(dtype=float),
@@ -1224,8 +1263,13 @@ class FDEvaluator:
         qd_dof_end = int(joint_qd_start[body_end])
         self.num_act_dofs = qd_dof_end - self.qd_dof_start
         self.total_qd_per_world = self.joint_qd_size
+        # q-space offset: free joint has 7 q-DOFs (pos+quat) vs 6 qd-DOFs,
+        # so all hinge joints after are shifted by +1 in q-space.
+        self.q_dof_start = self.qd_dof_start + 1
+        self.total_q_per_world = self.joint_q_size
 
         print(f"    [FDEval] DOF structure: qd_dof_start={self.qd_dof_start}, "
+              f"q_dof_start={self.q_dof_start}, "
               f"num_act_dofs={self.num_act_dofs}, total_qd/world={self.total_qd_per_world}")
 
         # Pre-collected actions buffer
@@ -1383,16 +1427,22 @@ class FDEvaluator:
                 self.solver.step(state_0, state_1, self.control, contacts, self.sim_dt)
                 state_0, state_1 = state_1, state_0
 
-                # Accumulate energy on GPU (same kernel as BPTT version)
+                # Accumulate mechanical power: Σ|τ·qd| (sensitive to morphology)
                 wp.launch(
-                    accumulate_qd_energy_kernel,
+                    accumulate_mechanical_power_kernel,
                     dim=1,
                     inputs=[
+                        state_0.joint_q,
                         state_0.joint_qd,
+                        self.control.joint_target_pos,
+                        self.model.joint_target_ke,
+                        self.model.joint_target_kd,
                         energy_buf,
                         self.qd_dof_start,
+                        self.q_dof_start,
                         self.num_act_dofs,
                         self.total_qd_per_world,
+                        self.total_q_per_world,
                         self.num_worlds,
                         self.sim_dt,
                     ],

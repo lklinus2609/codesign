@@ -108,29 +108,22 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Adam optimizer for design parameters
+# Design parameter optimizer
 # ---------------------------------------------------------------------------
 
-class AdamOptimizer:
-    """Adam optimizer for numpy arrays (gradient ascent)."""
+class SGDOptimizer:
+    """SGD optimizer for numpy arrays (gradient ascent).
 
-    def __init__(self, n_params, lr=0.005, beta1=0.9, beta2=0.999, eps=1e-8):
+    Step size is proportional to gradient magnitude — safe when gradient
+    signal-to-noise is uncertain (avoids Adam's sign-only normalization).
+    """
+
+    def __init__(self, n_params, lr=0.005):
         self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.m = np.zeros(n_params)
-        self.v = np.zeros(n_params)
-        self.t = 0
 
     def step(self, params, grad):
-        """Gradient ascent: params += lr * adapted_grad."""
-        self.t += 1
-        self.m = self.beta1 * self.m + (1 - self.beta1) * grad
-        self.v = self.beta2 * self.v + (1 - self.beta2) * grad**2
-        m_hat = self.m / (1 - self.beta1**self.t)
-        v_hat = self.v / (1 - self.beta2**self.t)
-        return params + self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        """Gradient ascent: params += lr * grad."""
+        return params + self.lr * grad
 
 
 # ---------------------------------------------------------------------------
@@ -767,7 +760,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print("[4/4] Starting PGHC outer loop...\n")
 
-    design_optimizer = AdamOptimizer(NUM_DESIGN_PARAMS, lr=args.design_lr)
+    design_optimizer = SGDOptimizer(NUM_DESIGN_PARAMS, lr=args.design_lr)
     theta_bounds = (-0.5236, 0.5236)  # +/-30 deg
 
     param_names = [
@@ -809,7 +802,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  Eval horizon:      {args.eval_horizon} steps "
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner samples: {args.max_inner_samples:,}")
-        print(f"  Design optimizer:  Adam (lr={args.design_lr})")
+        print(f"  Design optimizer:  SGD (lr={args.design_lr})")
         print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
         print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
         if args.kickoff_min_iters > 0:
