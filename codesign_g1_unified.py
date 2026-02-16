@@ -8,14 +8,14 @@ all GPU resources persistent across outer iterations.
 Architecture:
     Single process per GPU, single CUDA context per rank:
     1. Build MimicKit AMPEnv + AMPAgent ONCE (N/num_gpus training worlds per GPU)
-    2. Build FDEvaluator ONCE (rank 0 only, SolverMuJoCo, no backward)
+    2. Build FDEvaluator ONCE on ALL ranks (staggered, SolverMuJoCo, no backward)
     3. OUTER LOOP:
         a. Update training model joint_X_p in-place from theta
         b. Inner loop: agent._train_iter() until convergence (all GPUs)
-        c. Collect actions (frozen policy, rank 0 only)
-        d. FD gradient via FDEvaluator (rank 0 only, 13 forward rollouts)
-        e. Broadcast theta to all ranks
-        f. Adam update theta, clip to +/-30 deg
+        c. Collect actions (frozen policy, all ranks — deterministic)
+        d. Distributed FD gradient (rollouts round-robin across all GPUs, all_reduce)
+        e. Adam update theta on rank 0, clip to +/-30 deg
+        f. Broadcast theta to all ranks
         g. Check outer convergence (theta stable over last 5 iters)
 
 Run:
@@ -417,6 +417,88 @@ def collect_actions_from_agent(agent, env, num_eval_worlds, horizon):
 
 
 # ---------------------------------------------------------------------------
+# Distributed FD gradient
+# ---------------------------------------------------------------------------
+
+def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
+                                     rank, num_procs, device, param_names,
+                                     eps=0.01):
+    """Compute FD gradient with rollouts distributed across all ranks.
+
+    Rollout indexing:
+        0          = center (theta unperturbed)
+        2*i + 1    = param i, +eps
+        2*i + 2    = param i, -eps
+
+    Each rank runs rollouts assigned by round-robin: range(rank, total, num_procs).
+    Results are combined via all_reduce(SUM).
+
+    Returns (grad, fwd_dist_center, cot_center) on all ranks.
+    """
+    n_params = len(theta_np)
+    total_rollouts = 1 + 2 * n_params  # center + 2 per param
+
+    # Tensor to collect CoT values; each rank fills only its assigned slots
+    cot_all = torch.zeros(total_rollouts, dtype=torch.float64, device=device)
+    # Separate tensor for fwd_dist of center rollout
+    fwd_dist_tensor = torch.zeros(1, dtype=torch.float64, device=device)
+
+    my_indices = list(range(rank, total_rollouts, num_procs))
+
+    if rank == 0:
+        print(f"    [FD-dist] {total_rollouts} rollouts across {num_procs} GPUs "
+              f"({len(my_indices)} on rank 0)")
+
+    for idx in my_indices:
+        if idx == 0:
+            # Center rollout
+            fwd_dist, cot = fd_eval._run_rollout(theta_np, actions_list)
+            cot_all[0] = cot
+            fwd_dist_tensor[0] = fwd_dist
+            if rank == 0:
+                print(f"    [FD] Center: fwd_dist={fwd_dist:.4f} m, CoT={cot:.4f}")
+        else:
+            # Perturbation rollout
+            param_i = (idx - 1) // 2
+            is_plus = (idx % 2 == 1)
+            theta_pert = theta_np.copy()
+            theta_pert[param_i] += eps if is_plus else -eps
+            _, cot_pert = fd_eval._run_rollout(theta_pert, actions_list)
+            cot_all[idx] = cot_pert
+
+    # Combine results across ranks
+    if num_procs > 1:
+        torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(fwd_dist_tensor, op=torch.distributed.ReduceOp.SUM)
+
+    cot_center = cot_all[0].item()
+    fwd_dist_center = fwd_dist_tensor[0].item()
+
+    # Assemble gradient from reduced CoT vector
+    grad = np.zeros(n_params, dtype=np.float64)
+    for i in range(n_params):
+        cot_plus = cot_all[2 * i + 1].item()
+        cot_minus = cot_all[2 * i + 2].item()
+
+        if np.isnan(cot_plus) or np.isnan(cot_minus):
+            grad[i] = 0.0
+        else:
+            # Negative: minimize CoT = maximize reward
+            grad[i] = -(cot_plus - cot_minus) / (2 * eps)
+
+    grad = np.clip(grad, -10.0, 10.0)
+
+    if rank == 0:
+        for i, name in enumerate(param_names):
+            cot_plus = cot_all[2 * i + 1].item()
+            cot_minus = cot_all[2 * i + 2].item()
+            print(f"    [FD] param {i}: CoT+={cot_plus:.6f}, CoT-={cot_minus:.6f}, "
+                  f"grad={grad[i]:+.6f}")
+
+    return grad, fwd_dist_center, cot_center
+
+
+# ---------------------------------------------------------------------------
 # Video capture
 # ---------------------------------------------------------------------------
 
@@ -473,12 +555,21 @@ def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
 def pghc_worker(rank, num_procs, device, master_port, args):
     """Unified single-process PGHC co-design for G1 humanoid.
 
-    Each GPU rank runs this function. The inner loop (MimicKit training) is
-    distributed across all ranks via torch.distributed collective ops. FD
-    gradient computation runs on rank 0 only; theta is broadcast after.
+    Each GPU rank runs this function. The inner loop (MimicKit training) and
+    FD gradient rollouts are both distributed across all ranks via
+    torch.distributed collective ops. Adam update runs on rank 0; theta is
+    broadcast after.
     """
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
+
+    # Clamp eval worlds to per-GPU training envs (action collection slices
+    # the first num_eval_worlds actions from the training env).
+    if args.num_eval_worlds > per_rank_envs:
+        if is_root:
+            print(f"  [WARN] --num-eval-worlds ({args.num_eval_worlds}) > "
+                  f"per-GPU envs ({per_rank_envs}), clamping to {per_rank_envs}")
+        args.num_eval_worlds = per_rank_envs
 
     # Explicitly set the CUDA device before any GPU operations.
     # With CUDA_VISIBLE_DEVICES isolation, each process sees one GPU as cuda:0.
@@ -635,12 +726,33 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             print(f"  [Viewer] Failed to create viewer: {e}")
             viewer = None
 
-    # FDEvaluator is built ONCE at init (rank 0 only) and reused across
-    # outer iterations. Much smaller VRAM footprint than DiffG1Eval (no
-    # adjoint buffers, only 2 states instead of 1601).
-    fd_eval = None
+    # FDEvaluator is built ONCE at init on ALL ranks (staggered to avoid
+    # Warp NVRTC cache races) and reused across outer iterations.
+    # Much smaller VRAM footprint than DiffG1Eval (no adjoint buffers,
+    # only 2 states instead of 1601).
     if is_root:
         print("[3/4] Building FDEvaluator (SolverMuJoCo, reused across outer iters)...")
+
+    if mp_util.enable_mp():
+        if is_root:
+            fd_eval = FDEvaluator(
+                mjcf_modifier=mjcf_modifier,
+                theta_np=theta.copy(),
+                num_worlds=args.num_eval_worlds,
+                horizon=args.eval_horizon,
+                device=device,
+            )
+            wp.synchronize()
+        torch.distributed.barrier()
+        if not is_root:
+            fd_eval = FDEvaluator(
+                mjcf_modifier=mjcf_modifier,
+                theta_np=theta.copy(),
+                num_worlds=args.num_eval_worlds,
+                horizon=args.eval_horizon,
+                device=device,
+            )
+    else:
         fd_eval = FDEvaluator(
             mjcf_modifier=mjcf_modifier,
             theta_np=theta.copy(),
@@ -748,28 +860,36 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
             inner_ctrl.min_inner_iters = 0
 
-        # ----- FD Gradient Phase (rank 0 only) -----
-        # Non-root ranks wait at the theta broadcast below.
-        grad_theta = None
-        fwd_dist = None
-        cot = None
-
+        # ----- FD Gradient Phase (ALL ranks) -----
+        # All ranks collect actions to keep env state consistent, but we
+        # broadcast rank 0's actions so every rank's FD rollouts use
+        # identical action sequences (required for valid central FD).
         if is_root:
-            # Collect actions from frozen policy
             print(f"\n  [Actions] Collecting ({args.num_eval_worlds} worlds x "
                   f"{args.eval_horizon} steps)...")
 
-            actions_list = collect_actions_from_agent(
-                agent, env, args.num_eval_worlds, args.eval_horizon
-            )
+        actions_list = collect_actions_from_agent(
+            agent, env, args.num_eval_worlds, args.eval_horizon
+        )
+
+        # Broadcast rank 0's actions to all ranks
+        if num_procs > 1:
+            actions_tensor = torch.from_numpy(np.stack(actions_list)).to(device)
+            torch.distributed.broadcast(actions_tensor, src=0)
+            actions_list = [actions_tensor[t].cpu().numpy()
+                            for t in range(actions_tensor.shape[0])]
+            del actions_tensor
+
+        if is_root:
             print(f"    Got {len(actions_list)} steps x {actions_list[0].shape}")
+            print(f"\n  [FD] Computing distributed finite difference gradient...")
 
-            # FD gradient (13 forward rollouts: 1 center + 6 params × 2)
-            print(f"\n  [FD] Computing finite difference gradient...")
-            grad_theta, fwd_dist, cot = fd_eval.compute_fd_gradient(
-                theta.copy(), actions_list
-            )
+        grad_theta, fwd_dist, cot = compute_fd_gradient_distributed(
+            fd_eval, theta.copy(), actions_list,
+            rank, num_procs, device, param_names,
+        )
 
+        if is_root:
             print(f"    FD gradients:")
             for i, name in enumerate(param_names):
                 print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
@@ -780,7 +900,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             history["cot"].append(cot)
             history["gradients"].append(grad_theta.copy())
 
-            # ----- Design Update -----
+            # ----- Design Update (rank 0 only) -----
             if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
                 print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
                       f"signaling all ranks to stop.")
@@ -917,17 +1037,19 @@ if __name__ == "__main__":
     parser.add_argument("--design-lr", type=float, default=0.005)
     parser.add_argument("--num-train-envs", type=int, default=4096,
                         help="Total training envs (divided across GPUs)")
-    parser.add_argument("--num-eval-worlds", type=int, default=32)
-    parser.add_argument("--eval-horizon", type=int, default=100)
+    parser.add_argument("--num-eval-worlds", type=int, default=1024,
+                        help="Eval worlds for FD rollouts (clamped to per-GPU train envs)")
+    parser.add_argument("--eval-horizon", type=int, default=300,
+                        help="Eval rollout length in control steps (300 = 10s full episode)")
     parser.add_argument("--max-inner-samples", type=int, default=2_000_000_000)
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
     parser.add_argument("--plateau-threshold", type=float, default=0.02,
                         help="Inner convergence: spread/mean threshold")
-    parser.add_argument("--plateau-window", type=int, default=5,
+    parser.add_argument("--plateau-window", type=int, default=10,
                         help="Inner convergence: window size (in output intervals)")
-    parser.add_argument("--min-plateau-outputs", type=int, default=10,
+    parser.add_argument("--min-plateau-outputs", type=int, default=20,
                         help="Inner convergence: min output intervals before early stop")
     parser.add_argument("--save-interval", type=int, default=100,
                         help="Save numbered model checkpoint every N inner iterations")

@@ -1420,7 +1420,7 @@ class FDEvaluator:
 
         return float(mean_dist), float(cot)
 
-    def compute_fd_gradient(self, theta_np, actions_list, eps=1e-4):
+    def compute_fd_gradient(self, theta_np, actions_list, eps=0.01):
         """Compute gradient via central finite differences.
 
         Returns:
