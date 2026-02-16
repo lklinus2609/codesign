@@ -8,16 +8,15 @@ all GPU resources persistent across outer iterations.
 Architecture:
     Single process per GPU, single CUDA context per rank:
     1. Build MimicKit AMPEnv + AMPAgent ONCE (N/num_gpus training worlds per GPU)
-    2. OUTER LOOP:
+    2. Build FDEvaluator ONCE (rank 0 only, SolverMuJoCo, no backward)
+    3. OUTER LOOP:
         a. Update training model joint_X_p in-place from theta
         b. Inner loop: agent._train_iter() until convergence (all GPUs)
         c. Collect actions (frozen policy, rank 0 only)
-        d. Build DiffG1Eval lazily (rank 0 only, requires_grad=True)
-        e. BPTT gradient via DiffG1Eval.compute_gradient() (rank 0 only)
-        f. Free DiffG1Eval (reclaim 2-4 GiB VRAM)
-        g. Broadcast theta to all ranks
-        h. Adam update theta, clip to +/-30 deg
-        i. Check outer convergence (theta stable over last 5 iters)
+        d. FD gradient via FDEvaluator (rank 0 only, 13 forward rollouts)
+        e. Broadcast theta to all ranks
+        f. Adam update theta, clip to +/-30 deg
+        g. Check outer convergence (theta stable over last 5 iters)
 
 Run:
     # Single GPU (unchanged)
@@ -60,8 +59,6 @@ import time
 from collections import deque
 from pathlib import Path
 
-import gc
-
 import numpy as np
 
 # ---------------------------------------------------------------------------
@@ -94,17 +91,14 @@ import learning.agent_builder as agent_builder
 import learning.base_agent as base_agent_mod
 
 # NOTE: MimicKit's newton_engine.py sets wp.config.enable_backward = False.
-# We keep it False during training (matching pure MimicKit behavior) and only
-# set it True right before building DiffG1Eval for BPTT. Warp kernel compilation
-# is lazy (first launch), so training kernels compile WITHOUT adjoint code,
-# and BPTT kernels compile WITH it — each set only compiles once.
+# With FDEvaluator (no BPTT), we never need backward mode enabled.
 
 # Co-design modules
 from g1_mjcf_modifier import (
     G1MJCFModifier, SYMMETRIC_PAIRS, NUM_DESIGN_PARAMS,
     quat_from_x_rotation, quat_multiply, quat_normalize,
 )
-from g1_eval_worker import DiffG1Eval
+from g1_eval_worker import FDEvaluator
 
 try:
     import wandb
@@ -480,7 +474,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     """Unified single-process PGHC co-design for G1 humanoid.
 
     Each GPU rank runs this function. The inner loop (MimicKit training) is
-    distributed across all ranks via torch.distributed collective ops. BPTT
+    distributed across all ranks via torch.distributed collective ops. FD
     gradient computation runs on rank 0 only; theta is broadcast after.
     """
     is_root = (rank == 0)
@@ -641,11 +635,19 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             print(f"  [Viewer] Failed to create viewer: {e}")
             viewer = None
 
-    # DiffG1Eval is built LAZILY in the outer loop (right before BPTT) and
-    # freed immediately after. Only rank 0 builds it.
-    diff_eval = None
+    # FDEvaluator is built ONCE at init (rank 0 only) and reused across
+    # outer iterations. Much smaller VRAM footprint than DiffG1Eval (no
+    # adjoint buffers, only 2 states instead of 1601).
+    fd_eval = None
     if is_root:
-        print("[3/4] DiffG1Eval will be built lazily before each BPTT phase")
+        print("[3/4] Building FDEvaluator (SolverMuJoCo, reused across outer iters)...")
+        fd_eval = FDEvaluator(
+            mjcf_modifier=mjcf_modifier,
+            theta_np=theta.copy(),
+            num_worlds=args.num_eval_worlds,
+            horizon=args.eval_horizon,
+            device=device,
+        )
 
     # =========================================================
     # Outer loop setup
@@ -746,7 +748,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
             inner_ctrl.min_inner_iters = 0
 
-        # ----- BPTT Phase (rank 0 only) -----
+        # ----- FD Gradient Phase (rank 0 only) -----
         # Non-root ranks wait at the theta broadcast below.
         grad_theta = None
         fwd_dist = None
@@ -762,36 +764,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             )
             print(f"    Got {len(actions_list)} steps x {actions_list[0].shape}")
 
-            # Build DiffG1Eval lazily
-            print(f"\n  [BPTT] Building DiffG1Eval lazily...")
-
-            # Enable backward ONLY for BPTT kernel compilation
-            wp.config.enable_backward = True
-
-            diff_eval = DiffG1Eval(
-                mjcf_modifier=mjcf_modifier,
-                theta_np=theta.copy(),
-                num_worlds=args.num_eval_worlds,
-                horizon=args.eval_horizon,
-                dt=1.0 / 30.0,
-                num_substeps=16,
-                device=device,
+            # FD gradient (13 forward rollouts: 1 center + 6 params × 2)
+            print(f"\n  [FD] Computing finite difference gradient...")
+            grad_theta, fwd_dist, cot = fd_eval.compute_fd_gradient(
+                theta.copy(), actions_list
             )
 
-            print(f"  [BPTT] Computing gradient...")
-            grad_theta, fwd_dist, cot = diff_eval.compute_gradient(actions_list)
-
-            # Free DiffG1Eval immediately (reclaim 2-4 GiB VRAM)
-            diff_eval.cleanup()
-            diff_eval = None
-            gc.collect()
-            torch.cuda.empty_cache()
-
-            # Restore enable_backward = False for next inner loop
-            wp.config.enable_backward = False
-            print(f"  [BPTT] DiffG1Eval freed, VRAM reclaimed")
-
-            print(f"    BPTT gradients:")
+            print(f"    FD gradients:")
             for i, name in enumerate(param_names):
                 print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
             print(f"    Forward distance = {fwd_dist:.3f} m")
@@ -819,7 +798,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                           f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
 
         # ----- Broadcast theta to all ranks -----
-        # Non-root ranks block here until root finishes BPTT
+        # Non-root ranks block here until root finishes FD gradient
         theta_tensor = torch.from_numpy(theta).float().to(device)
         if mp_util.enable_mp():
             theta_tensor = mp_util.broadcast(theta_tensor)
@@ -916,8 +895,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"Total inner loop time: {total_time / 3600:.1f} hours")
 
     # Cleanup
-    if diff_eval is not None:
-        diff_eval.cleanup()
+    if fd_eval is not None:
+        fd_eval.cleanup()
     if use_wandb:
         wandb.finish()
 

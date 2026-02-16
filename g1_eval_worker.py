@@ -2,9 +2,12 @@
 """
 G1 Eval Worker — GPU subprocess for PGHC co-design gradient computation.
 
-Runs Phase 1 (action collection via MimicKit) and Phase 2 (BPTT gradient via
-Warp/SolverSemiImplicitStable) in an isolated process so the parent orchestrator
-never touches the GPU.
+Provides two evaluator classes:
+  - DiffG1Eval: Legacy BPTT via SolverSemiImplicitStable + wp.Tape()
+  - FDEvaluator: Central finite differences via SolverMuJoCo (preferred)
+
+FDEvaluator uses the same solver as training (SolverMuJoCo), eliminating
+the solver mismatch and contact instability issues of the BPTT approach.
 
 Called by codesign_g1.py as:
     python g1_eval_worker.py --theta-file theta.npy --checkpoint model.pt \
@@ -1022,6 +1025,446 @@ class DiffG1Eval:
         for attr in ('states', 'model', 'solver', 'control',
                      'pre_actions', 'loss_buf', 'energy_buf', 'fwd_dist_buf',
                      'joint_q_initial', 'theta_wp', 'base_quats_wp',
+                     'joint_local_indices_wp', 'param_for_joint_wp',
+                     'init_qpos_wp'):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
+        gc.collect()
+        wp.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# FDEvaluator — Finite Difference gradient via SolverMuJoCo
+# ---------------------------------------------------------------------------
+
+class FDEvaluator:
+    """Compute design gradients via central finite differences.
+
+    Uses SolverMuJoCo (same solver as training) to eliminate solver mismatch.
+    Only 2 state buffers needed (ping-pong), no adjoint/tape memory.
+    """
+
+    def __init__(
+        self,
+        mjcf_modifier,
+        theta_np,
+        num_worlds=32,
+        horizon=100,
+        device="cuda:0",
+    ):
+        self.mjcf_modifier = mjcf_modifier
+        self.theta_np = theta_np.copy()
+        self.num_worlds = num_worlds
+        self.horizon = horizon
+        self.device = device
+
+        # Sim params matching training (newton_engine.yaml)
+        self.sim_dt = 1.0 / 240.0      # 240 Hz sim
+        self.control_dt = 1.0 / 30.0    # 30 Hz control
+        self.num_substeps = 8           # 240 / 30
+
+        self._build_model()
+        self._build_theta_buffers()
+        self._alloc_buffers()
+
+    def _build_model(self):
+        """Build Newton model with SolverMuJoCo (matching training physics)."""
+        with tempfile.NamedTemporaryFile(
+            mode='w', suffix='.xml', delete=False, dir=str(BASE_MJCF_PATH.parent)
+        ) as f:
+            self.mjcf_modifier.generate(self.theta_np, f.name)
+            mjcf_path = f.name
+
+        try:
+            single_builder = newton.ModelBuilder()
+            newton.solvers.SolverMuJoCo.register_custom_attributes(single_builder)
+
+            # Match MimicKit's newton_engine.py add_mjcf flags exactly,
+            # but with enable_self_collisions=True (SolverMuJoCo handles them)
+            single_builder.add_mjcf(
+                mjcf_path,
+                floating=True,
+                ignore_inertial_definitions=False,
+                collapse_fixed_joints=False,
+                enable_self_collisions=True,
+                convert_3d_hinge_to_ball_joints=True,
+            )
+
+            # Match MimicKit ground friction
+            ground_cfg = single_builder.ShapeConfig(mu=1.0, restitution=0)
+            single_builder.add_ground_plane(cfg=ground_cfg)
+
+            # Replicate for parallel worlds
+            builder = newton.ModelBuilder()
+            builder.replicate(single_builder, self.num_worlds, spacing=(5.0, 5.0, 0.0))
+
+            self.model = builder.finalize(requires_grad=False)
+
+            # SolverMuJoCo matching training exactly
+            self.solver = newton.solvers.SolverMuJoCo(
+                self.model,
+                solver="newton",
+                njmax=450,
+                nconmax=150,
+                impratio=10,
+                iterations=100,
+                ls_iterations=50,
+            )
+            self.control = self.model.control()
+
+            # PD gains: transfer from MuJoCo passive stiffness/damping
+            if hasattr(self.model, 'mujoco'):
+                ke_np = self.model.mujoco.dof_passive_stiffness.numpy().copy()
+                kd_np = self.model.mujoco.dof_passive_damping.numpy().copy()
+                self.model.joint_target_ke.assign(ke_np)
+                self.model.joint_target_kd.assign(kd_np)
+                self.model.mujoco.dof_passive_stiffness.assign(np.zeros_like(ke_np))
+                self.model.mujoco.dof_passive_damping.assign(np.zeros_like(kd_np))
+                nonzero_ke = ke_np[ke_np > 0]
+                nonzero_kd = kd_np[kd_np > 0]
+                print(f"    [FDEval] PD gains set: "
+                      f"ke={nonzero_ke.mean():.1f} (n={len(nonzero_ke)}), "
+                      f"kd={nonzero_kd.mean():.1f} (n={len(nonzero_kd)})")
+            else:
+                print("    [WARN] No mujoco attributes — setting default PD gains")
+                ke_np = self.model.joint_target_ke.numpy()
+                kd_np = self.model.joint_target_kd.numpy()
+                ke_np[:] = 100.0
+                kd_np[:] = 10.0
+                self.model.joint_target_ke.assign(ke_np)
+                self.model.joint_target_kd.assign(kd_np)
+
+            # Joint structure info
+            self.joints_per_world = self.model.joint_count // self.num_worlds
+            self.bodies_per_world = self.model.body_count // self.num_worlds
+            total_joint_q = self.model.joint_q.numpy().shape[0]
+            total_joint_qd = self.model.joint_qd.numpy().shape[0]
+            self.joint_q_size = total_joint_q // self.num_worlds
+            self.joint_qd_size = total_joint_qd // self.num_worlds
+
+            print(f"    [FDEval] Model built: {self.joints_per_world} joints/world, "
+                  f"{self.bodies_per_world} bodies/world, "
+                  f"joint_q_size={self.joint_q_size}, joint_qd_size={self.joint_qd_size}")
+
+        finally:
+            os.unlink(mjcf_path)
+
+    def _build_theta_buffers(self):
+        """Build buffers for theta → joint_X_p mapping (no requires_grad)."""
+        # Build body_name → joint_local_index mapping
+        body_keys = self.model.body_key
+        joint_keys = self.model.joint_key
+        bodies_per_world = self.bodies_per_world
+        joints_per_world = self.joints_per_world
+
+        body_name_to_idx = {}
+        for i in range(bodies_per_world):
+            body_name_to_idx[body_keys[i]] = i
+
+        joint_name_to_idx = {}
+        for i in range(joints_per_world):
+            joint_name_to_idx[joint_keys[i]] = i
+
+        self.param_joint_local_indices = []
+        self.param_for_joint = []
+        self.base_quats = []  # (w, x, y, z) order
+
+        joint_X_p_np = self.model.joint_X_p.numpy()
+
+        for param_idx, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
+            for body_name in (left_body, right_body):
+                if body_name in body_name_to_idx:
+                    joint_local_idx = body_name_to_idx[body_name]
+                elif body_name.replace("_link", "_joint") in joint_name_to_idx:
+                    joint_local_idx = joint_name_to_idx[body_name.replace("_link", "_joint")]
+                else:
+                    print(f"    [WARN] Body/joint not found: {body_name}")
+                    continue
+
+                self.param_joint_local_indices.append(joint_local_idx)
+                self.param_for_joint.append(param_idx)
+                # joint_X_p numpy: [px,py,pz, qx,qy,qz,qw] → reorder to (w,x,y,z)
+                raw = joint_X_p_np[joint_local_idx, 3:7].copy()  # [qx,qy,qz,qw]
+                self.base_quats.append([raw[3], raw[0], raw[1], raw[2]])
+
+        self.num_param_joints = len(self.param_joint_local_indices)
+        expected = NUM_DESIGN_PARAMS * 2
+        print(f"    [FDEval] Found {self.num_param_joints} parameterized joints "
+              f"(expected {expected})")
+
+        # Convert to warp arrays for the kernel
+        self.joint_local_indices_wp = wp.array(
+            np.array(self.param_joint_local_indices, dtype=np.int32),
+            dtype=int, device=self.device,
+        )
+        self.param_for_joint_wp = wp.array(
+            np.array(self.param_for_joint, dtype=np.int32),
+            dtype=int, device=self.device,
+        )
+        self.base_quats_wp = wp.array(
+            np.array(self.base_quats, dtype=np.float64),
+            dtype=float, device=self.device,
+        )
+
+    def _alloc_buffers(self):
+        """Pre-allocate GPU buffers (only 2 states for ping-pong)."""
+        self.state_0 = self.model.state()
+        self.state_1 = self.model.state()
+
+        # DOF structure
+        joint_qd_start = self.model.joint_qd_start.numpy()
+        articulation_start = self.model.articulation_start.numpy()
+
+        body_start = articulation_start[0]
+        body_end = articulation_start[1]
+        self.qd_dof_start = int(joint_qd_start[body_start + 1])
+        qd_dof_end = int(joint_qd_start[body_end])
+        self.num_act_dofs = qd_dof_end - self.qd_dof_start
+        self.total_qd_per_world = self.joint_qd_size
+
+        print(f"    [FDEval] DOF structure: qd_dof_start={self.qd_dof_start}, "
+              f"num_act_dofs={self.num_act_dofs}, total_qd/world={self.total_qd_per_world}")
+
+        # Pre-collected actions buffer
+        self.pre_actions = [
+            wp.zeros((self.num_worlds, self.num_act_dofs), dtype=float, device=self.device)
+            for _ in range(self.horizon)
+        ]
+
+        # Total mass for CoT denominator
+        body_mass_np = self.model.body_mass.numpy()
+        self.total_mass = float(body_mass_np[:self.bodies_per_world].sum())
+        print(f"    [FDEval] Total robot mass = {self.total_mass:.2f} kg")
+
+        # Build init qpos from env config
+        with open(str(BASE_ENV_CONFIG), "r") as f:
+            env_cfg = yaml.safe_load(f)
+        init_pose_list = env_cfg.get("init_pose", [])
+
+        init_state = self.model.state()
+        newton.eval_fk(self.model, init_state.joint_q, init_state.joint_qd, init_state)
+        wp.synchronize()
+        self.init_qpos = init_state.joint_q.numpy().copy()
+
+        # Override root pose: z-height and identity quaternion
+        z_height = float(init_pose_list[2]) if len(init_pose_list) > 2 else 0.8
+        for w in range(self.num_worlds):
+            q_start = w * self.joint_q_size
+            self.init_qpos[q_start + 2] = z_height
+            self.init_qpos[q_start + 3] = 0.0  # qx
+            self.init_qpos[q_start + 4] = 0.0  # qy
+            self.init_qpos[q_start + 5] = 0.0  # qz
+            self.init_qpos[q_start + 6] = 1.0  # qw
+
+        self.init_qpos_wp = wp.array(self.init_qpos, dtype=float, device=self.device)
+
+        del init_state
+
+    def _apply_theta(self, theta_np):
+        """Apply theta → joint_X_p in-place (numpy round-trip, no tape)."""
+        joint_X_p_np = self.model.joint_X_p.numpy()
+
+        for j in range(self.num_param_joints):
+            p_idx = self.param_for_joint[j]
+            angle = float(theta_np[p_idx])
+
+            # Delta quat from X-rotation (w, x, y, z)
+            half = angle * 0.5
+            dw = np.cos(half)
+            dx = np.sin(half)
+
+            # Base quat (w, x, y, z)
+            bw, bx, by, bz = self.base_quats[j]
+
+            # Hamilton product: delta * base
+            nw = dw * bw - dx * bx
+            nx = dw * bx + dx * bw
+            ny = dw * by - dx * bz
+            nz = dw * bz + dx * by
+
+            # Normalize
+            norm = np.sqrt(nw*nw + nx*nx + ny*ny + nz*nz)
+            inv_norm = 1.0 / max(norm, 1e-12)
+            nw *= inv_norm
+            nx *= inv_norm
+            ny *= inv_norm
+            nz *= inv_norm
+
+            local_idx = self.param_joint_local_indices[j]
+            for w in range(self.num_worlds):
+                global_idx = w * self.joints_per_world + local_idx
+                # Write xyzw to joint_X_p numpy layout
+                joint_X_p_np[global_idx, 3] = nx
+                joint_X_p_np[global_idx, 4] = ny
+                joint_X_p_np[global_idx, 5] = nz
+                joint_X_p_np[global_idx, 6] = nw
+
+        self.model.joint_X_p.assign(joint_X_p_np)
+        wp.synchronize()
+
+    def _run_rollout(self, theta_np, actions_list):
+        """Run a forward-only rollout and return (mean_fwd_dist, cot).
+
+        Args:
+            theta_np: (6,) design parameters
+            actions_list: list of (num_worlds, act_dim) numpy arrays
+
+        Returns:
+            (mean_forward_dist, cot_value)
+        """
+        # Apply theta → joint_X_p
+        self._apply_theta(theta_np)
+
+        # Reset state: init qpos, zero qd
+        total_q = self.model.joint_q.numpy().shape[0]
+        total_qd = self.model.joint_qd.numpy().shape[0]
+        launch_dim = max(total_q, total_qd)
+        wp.launch(diff_init_worlds_kernel, dim=launch_dim,
+                  inputs=[self.state_0.joint_q, self.state_0.joint_qd,
+                          self.init_qpos_wp,
+                          total_q, total_qd])
+
+        # FK to populate body transforms from joint state
+        newton.eval_fk(self.model, self.state_0.joint_q, self.state_0.joint_qd, self.state_0)
+        wp.synchronize()
+
+        # Store initial root x positions
+        jq_init = self.state_0.joint_q.numpy().copy()
+
+        # Load actions into warp buffers
+        for step in range(min(self.horizon, len(actions_list))):
+            actions_np = actions_list[step].astype(np.float64)
+            act_dim = actions_np.shape[1] if actions_np.ndim > 1 else actions_np.shape[0]
+
+            if act_dim != self.num_act_dofs:
+                adapted = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
+                copy_dim = min(act_dim, self.num_act_dofs)
+                adapted[:actions_np.shape[0], :copy_dim] = actions_np[:self.num_worlds, :copy_dim]
+                actions_np = adapted
+            else:
+                if actions_np.shape[0] < self.num_worlds:
+                    padded = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
+                    padded[:actions_np.shape[0]] = actions_np
+                    actions_np = padded
+                elif actions_np.shape[0] > self.num_worlds:
+                    actions_np = actions_np[:self.num_worlds]
+
+            self.pre_actions[step].assign(actions_np)
+
+        # Energy buffer on GPU (reuse existing kernel for speed)
+        energy_buf = wp.zeros(1, dtype=float, device=self.device)
+
+        state_0, state_1 = self.state_0, self.state_1
+
+        for step in range(self.horizon):
+            # Set joint targets
+            wp.launch(
+                diff_set_target_pos_kernel,
+                dim=self.num_worlds,
+                inputs=[
+                    self.pre_actions[step],
+                    self.control.joint_target_pos,
+                    self.qd_dof_start,
+                    self.num_act_dofs,
+                    self.total_qd_per_world,
+                ],
+            )
+
+            # Collide once per macro-step (matching training pattern)
+            state_0.clear_forces()
+            contacts = self.model.collide(state_0)
+
+            # Substeps at 240 Hz (ping-pong states)
+            for sub in range(self.num_substeps):
+                state_0.clear_forces()
+                self.solver.step(state_0, state_1, self.control, contacts, self.sim_dt)
+                state_0, state_1 = state_1, state_0
+
+                # Accumulate energy on GPU (same kernel as BPTT version)
+                wp.launch(
+                    accumulate_qd_energy_kernel,
+                    dim=1,
+                    inputs=[
+                        state_0.joint_qd,
+                        energy_buf,
+                        self.qd_dof_start,
+                        self.num_act_dofs,
+                        self.total_qd_per_world,
+                        self.num_worlds,
+                        self.sim_dt,
+                    ],
+                )
+
+        # Read results from GPU
+        wp.synchronize()
+
+        mean_energy = float(energy_buf.numpy()[0])
+
+        # Forward distance
+        jq_final = state_0.joint_q.numpy()
+        total_dist = 0.0
+        for w in range(self.num_worlds):
+            idx = w * self.joint_q_size
+            total_dist += jq_final[idx] - jq_init[idx]
+        mean_dist = total_dist / self.num_worlds
+
+        # CoT = energy / (m * g * d)
+        safe_dist = max(mean_dist, 0.1)
+        cot = mean_energy / (self.total_mass * 9.81 * safe_dist)
+
+        # Restore state references (ping-pong may have swapped them)
+        self.state_0, self.state_1 = state_0, state_1
+
+        return float(mean_dist), float(cot)
+
+    def compute_fd_gradient(self, theta_np, actions_list, eps=1e-4):
+        """Compute gradient via central finite differences.
+
+        Returns:
+            (grad, mean_fwd_dist, cot) where grad points in the ascent
+            direction for reward (= descent direction for CoT).
+        """
+        # Center evaluation for baseline metrics
+        fwd_dist_center, cot_center = self._run_rollout(theta_np, actions_list)
+        print(f"    [FD] Center: fwd_dist={fwd_dist_center:.4f} m, CoT={cot_center:.4f}")
+
+        if np.isnan(cot_center) or np.isinf(cot_center):
+            print(f"    [FD] Center CoT is NaN/Inf — returning zero gradient")
+            return np.zeros(NUM_DESIGN_PARAMS), fwd_dist_center, cot_center
+
+        grad = np.zeros(NUM_DESIGN_PARAMS)
+        for i in range(NUM_DESIGN_PARAMS):
+            theta_plus = theta_np.copy()
+            theta_plus[i] += eps
+            _, cot_plus = self._run_rollout(theta_plus, actions_list)
+
+            theta_minus = theta_np.copy()
+            theta_minus[i] -= eps
+            _, cot_minus = self._run_rollout(theta_minus, actions_list)
+
+            # Negative because we want to MINIMIZE CoT (= maximize reward)
+            if np.isnan(cot_plus) or np.isnan(cot_minus):
+                print(f"    [FD] param {i}: NaN in perturbation, setting grad=0")
+                grad[i] = 0.0
+            else:
+                grad[i] = -(cot_plus - cot_minus) / (2 * eps)
+
+            print(f"    [FD] param {i}: CoT+={cot_plus:.6f}, CoT-={cot_minus:.6f}, "
+                  f"grad={grad[i]:+.6f}")
+
+        # Clip gradients
+        grad = np.clip(grad, -10.0, 10.0)
+        print(f"    [FD] Gradient (clipped): {grad.tolist()}")
+
+        return grad.astype(np.float64), fwd_dist_center, cot_center
+
+    def cleanup(self):
+        """Free GPU resources."""
+        for attr in ('state_0', 'state_1', 'model', 'solver', 'control',
+                     'pre_actions', 'base_quats_wp',
                      'joint_local_indices_wp', 'param_for_joint_wp',
                      'init_qpos_wp'):
             if hasattr(self, attr):
