@@ -162,6 +162,12 @@ class EpisodeCoTTracker:
         self.episode_powers = []
         self.episode_vels = []
 
+    def reset_accumulators(self):
+        """Reset per-env accumulators after env reset to avoid stale data."""
+        self.power_sum.zero_()
+        self.vel_sum.zero_()
+        self.step_count.zero_()
+
     def accumulate(self, engine, char_id):
         """Accumulate instantaneous power and forward velocity."""
         dof_forces = self.get_dof_forces_safe(engine, char_id)
@@ -269,6 +275,26 @@ def _make_post_physics_hook(original_fn, char_id):
         self._cot_tracker.accumulate(self._engine, char_id)
         self._cot_tracker.finalize_episodes(self._done_buf)
     return hooked_post_physics_step
+
+
+def _make_compute_rewards_hook(agent):
+    """Wrap _compute_rewards to also log raw task reward statistics.
+
+    AMP's _compute_rewards reads task_r from the exp buffer, blends it with
+    disc_r, and overwrites the buffer.  We capture task_r before the blend
+    so it can be logged alongside disc_reward_mean/std.
+    """
+    original = agent._compute_rewards
+
+    def hooked():
+        task_r = agent._exp_buffer.get_data_flat("reward")
+        task_reward_std, task_reward_mean = torch.std_mean(task_r)
+        info = original()
+        info["task_reward_mean"] = task_reward_mean
+        info["task_reward_std"] = task_reward_std
+        return info
+
+    return hooked
 
 
 # ---------------------------------------------------------------------------
@@ -481,11 +507,10 @@ class InnerLoopController:
             # reduce_inplace_mean. Actual printing is gated by Logger.is_root().
             agent._logger.print_log()
 
-            # All ranks must call write_log() — it contains a collective
-            # reduce_inplace_mean. Write every iteration for full resolution.
-            agent._logger.write_log()
-
             if output_iter:
+                # Write log at output intervals only — Train_Return accumulator
+                # resets each output_iter, so per-iter writes create sawtooth.
+                agent._logger.write_log()
                 # Convergence check: root decides, broadcast to all ranks.
                 # This MUST happen before root-only I/O (save, wandb, video)
                 # to prevent non-root ranks from reaching the broadcast first
@@ -531,6 +556,10 @@ class InnerLoopController:
                             wlog["inner/forward_velocity"] = fwd_vel
                             wlog["inner/cot_episodes"] = n_eps
 
+                        # Reward weights so we can see actual contributions
+                        wlog["inner/task_reward_weight"] = agent._task_reward_weight
+                        wlog["inner/disc_reward_weight"] = agent._disc_reward_weight
+
                         if wlog:
                             wandb.log(wlog)
 
@@ -563,6 +592,7 @@ class InnerLoopController:
                 # Reset after test (matches MimicKit train_model behavior)
                 agent._train_return_tracker.reset()
                 agent._curr_obs, agent._curr_info = agent._reset_envs()
+                env._cot_tracker.reset_accumulators()
 
             agent._iter += 1
             inner_iters += 1
@@ -896,6 +926,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # During kickoff: blend task + disc equally so style is learned
     agent._task_reward_weight = 0.5
     agent._disc_reward_weight = 0.5
+
+    # Monkey-patch _compute_rewards to also log raw task reward stats
+    agent._compute_rewards = _make_compute_rewards_hook(agent)
 
     if args.resume_checkpoint:
         agent.load(args.resume_checkpoint)
