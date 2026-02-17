@@ -56,6 +56,7 @@ import random
 import shutil
 import sys
 import time
+import types
 from collections import deque
 from pathlib import Path
 
@@ -89,6 +90,8 @@ import util.mp_util as mp_util
 import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import learning.base_agent as base_agent_mod
+import envs.base_env as base_env_mod
+import util.torch_util as torch_util
 
 # NOTE: MimicKit's newton_engine.py sets wp.config.enable_backward = False.
 # With FDEvaluator (no BPTT), we never need backward mode enabled.
@@ -105,6 +108,68 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+
+# ---------------------------------------------------------------------------
+# Instantaneous CoT from training env
+# ---------------------------------------------------------------------------
+
+def compute_training_cot(engine, char_id, total_mass):
+    """Compute mean instantaneous Cost of Transport from the live training env.
+
+    CoT_inst = mean_power / (m * g * |mean_fwd_vel|)
+    where power = sum_d |tau_d * qd_d| per env, averaged over envs.
+
+    Returns (cot, mean_power, mean_fwd_vel).
+    """
+    dof_forces = engine.get_dof_forces(char_id)   # (num_envs, num_dofs)
+    dof_vel = engine.get_dof_vel(char_id)          # (num_envs, num_dofs)
+    root_vel = engine.get_root_vel(char_id)        # (num_envs, 3)
+
+    power_per_env = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
+    mean_power = torch.mean(power_per_env).item()
+    mean_fwd_vel = torch.mean(root_vel[:, 0]).item()
+
+    safe_vel = max(abs(mean_fwd_vel), 0.1)
+    cot = mean_power / (total_mass * 9.81 * safe_vel)
+    return cot, mean_power, mean_fwd_vel
+
+
+# ---------------------------------------------------------------------------
+# Morphology-agnostic task reward (monkey-patched onto AMPEnv)
+# ---------------------------------------------------------------------------
+
+def codesign_task_reward(self):
+    """Morphology-agnostic task reward for co-design inner loop.
+
+    Replaces AMPEnv._update_reward (which is empty by default) so that
+    the agent's reward blending picks up a non-zero task_r:
+        r = task_reward_weight * task_r + disc_reward_weight * disc_r
+    """
+    char_id = self._get_char_id()
+    root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
+    root_rot = self._engine.get_root_rot(char_id)   # (num_envs, 4) xyzw
+
+    # 1. Velocity tracking: exp(-|v_x - 1.0|^2 / 0.25)
+    fwd_vel = root_vel[:, 0]
+    vel_reward = torch.exp(-torch.square(fwd_vel - 1.0) / 0.25)
+
+    # 2. Orientation penalty: -||projected_gravity_xy||^2
+    #    Rotate world gravity (0,0,-1) into body frame via inverse rotation
+    gravity = torch.zeros(3, device=root_rot.device, dtype=root_rot.dtype)
+    gravity[2] = -1.0
+    gravity = gravity.unsqueeze(0).expand(root_rot.shape[0], -1)
+    inv_rot = torch_util.quat_conjugate(root_rot)
+    projected_gravity = torch_util.quat_rotate(inv_rot, gravity)
+    orientation_penalty = -torch.sum(torch.square(projected_gravity[:, :2]), dim=-1)
+
+    # 3. Alive bonus
+    alive = 0.1
+
+    # 4. Termination penalty
+    term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
+
+    self._reward_buf[:] = vel_reward + orientation_penalty + alive + term_penalty
 
 
 # ---------------------------------------------------------------------------
@@ -216,6 +281,7 @@ class InnerLoopController:
                  min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
+                 log_file=None, total_mass=None, char_id=0,
                  is_root=True, device="cuda:0", rank=0):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
@@ -228,6 +294,9 @@ class InnerLoopController:
         self.engine = engine
         self.video_interval = video_interval
         self.save_interval = save_interval
+        self.log_file = log_file
+        self.total_mass = total_mass
+        self.char_id = char_id
         self.is_root = is_root
         self.device = device
         self.rank = rank
@@ -329,8 +398,10 @@ class InnerLoopController:
                         agent.save(numbered_path)
                         if self.use_wandb:
                             wandb.save(numbered_path, base_path=str(out_dir))
+                            if self.log_file:
+                                wandb.save(self.log_file, policy="now")
 
-                    # wandb: forward inner loop metrics
+                    # wandb: forward inner loop metrics + CoT
                     if self.use_wandb:
                         wlog = {}
                         for k, entry in agent._logger.log_current_row.items():
@@ -339,6 +410,19 @@ class InnerLoopController:
                                 wlog[f"inner/{k}"] = float(v)
                             except (TypeError, ValueError):
                                 pass
+
+                        # Instantaneous CoT from training env
+                        if self.total_mass is not None and self.engine is not None:
+                            try:
+                                cot, mech_power, fwd_vel = compute_training_cot(
+                                    self.engine, self.char_id, self.total_mass,
+                                )
+                                wlog["inner/cot"] = cot
+                                wlog["inner/mechanical_power"] = mech_power
+                                wlog["inner/forward_velocity"] = fwd_vel
+                            except Exception as e:
+                                print(f"  [CoT] Compute failed: {e}")
+
                         if wlog:
                             wandb.log(wlog)
 
@@ -685,7 +769,15 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             str(modified_env_config), str(BASE_ENGINE_CONFIG),
             per_rank_envs, device, visualize=False,
         )
+    # Monkey-patch task reward onto env (replaces empty _update_reward)
+    env._update_reward = types.MethodType(codesign_task_reward, env)
+
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
+
+    # Override default reward weights (config has task=0.0, disc=1.0)
+    # During kickoff: blend task + disc equally so style is learned
+    agent._task_reward_weight = 0.5
+    agent._disc_reward_weight = 0.5
 
     if args.resume_checkpoint:
         agent.load(args.resume_checkpoint)
@@ -699,9 +791,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # Extract joint info from training Newton model (per-rank model)
     engine = env._engine
     sim_model = engine._sim_model
+    char_id = env._get_char_id()
+    total_mass = engine.calc_obj_mass(0, char_id)
     base_quats_dict, joint_idx_map = extract_joint_info(
         sim_model, per_rank_envs
     )
+    if is_root:
+        print(f"  Robot mass: {total_mass:.2f} kg")
 
     # Headless viewer for video capture (root only)
     viewer = None
@@ -780,6 +876,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         engine=engine,
         video_interval=args.video_interval,
         save_interval=args.save_interval,
+        log_file=log_file,
+        total_mass=total_mass,
+        char_id=char_id,
         is_root=is_root,
         device=device,
         rank=rank,
@@ -847,11 +946,17 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         history["inner_times"].append(inner_time)
 
         # After kickoff, allow convergence without minimum iter gate
+        # and drop discriminator reward — the policy has learned the style,
+        # continuing with disc reward would fight morphology changes.
         if outer_iter == 0 and inner_ctrl.min_inner_iters > 0:
             if is_root:
                 print(f"  [Kickoff] Disabling min_inner_iters "
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
+                print(f"  [Kickoff] Dropping disc reward: "
+                      f"task_w 0.5 -> 0.5, disc_w 0.5 -> 0.0")
             inner_ctrl.min_inner_iters = 0
+            agent._task_reward_weight = 0.5
+            agent._disc_reward_weight = 0.0
 
         # ----- FD Gradient Phase (ALL ranks) -----
         # All ranks collect actions to keep env state consistent, but we
@@ -1044,7 +1149,7 @@ if __name__ == "__main__":
                         help="Inner convergence: window size (in output intervals)")
     parser.add_argument("--min-plateau-outputs", type=int, default=20,
                         help="Inner convergence: min output intervals before early stop")
-    parser.add_argument("--save-interval", type=int, default=100,
+    parser.add_argument("--save-interval", type=int, default=500,
                         help="Save numbered model checkpoint every N inner iterations")
     parser.add_argument("--kickoff-min-iters", type=int, default=2000,
                         help="Min inner iters before convergence on first outer iter (0=disabled)")
