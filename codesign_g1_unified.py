@@ -145,9 +145,17 @@ class EpisodeCoTTracker:
 
     def accumulate(self, engine, char_id):
         """Accumulate instantaneous power and forward velocity."""
-        dof_forces = engine.get_dof_forces(char_id)[:, :self.LOCOMOTION_DOFS]
-        dof_vel = engine.get_dof_vel(char_id)[:, :self.LOCOMOTION_DOFS]
+        dof_forces = engine.get_dof_forces(char_id)
+        dof_vel = engine.get_dof_vel(char_id)
         root_vel = engine.get_root_vel(char_id)
+        # Newton pos-mode get_dof_forces returns 1D; reshape to (num_envs, num_dofs)
+        num_envs = root_vel.shape[0]
+        if dof_forces.dim() == 1:
+            dof_forces = dof_forces.view(num_envs, -1)
+        if dof_vel.dim() == 1:
+            dof_vel = dof_vel.view(num_envs, -1)
+        dof_forces = dof_forces[:, :self.LOCOMOTION_DOFS]
+        dof_vel = dof_vel[:, :self.LOCOMOTION_DOFS]
         power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
         self.power_sum += power
         self.vel_sum += root_vel[:, 0]
@@ -226,8 +234,16 @@ def codesign_task_reward(self):
     # 5. Mechanical power penalty: aligns inner loop with outer loop CoT objective
     #    power = sum(|tau * dof_vel|) over legs + torso only (DoFs 0-14)
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
-    dof_forces = self._engine.get_dof_forces(char_id)[:, :_LOCO_DOFS]
-    dof_vel = self._engine.get_dof_vel(char_id)[:, :_LOCO_DOFS]
+    num_envs = self._reward_buf.shape[0]
+    dof_forces = self._engine.get_dof_forces(char_id)
+    dof_vel = self._engine.get_dof_vel(char_id)
+    # Newton pos-mode get_dof_forces returns 1D; reshape to (num_envs, num_dofs)
+    if dof_forces.dim() == 1:
+        dof_forces = dof_forces.view(num_envs, -1)
+    if dof_vel.dim() == 1:
+        dof_vel = dof_vel.view(num_envs, -1)
+    dof_forces = dof_forces[:, :_LOCO_DOFS]
+    dof_vel = dof_vel[:, :_LOCO_DOFS]
     mech_power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
     power_penalty = -self._power_penalty_weight * mech_power
 
