@@ -111,28 +111,76 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Instantaneous CoT from training env
+# Episode-averaged CoT tracker
 # ---------------------------------------------------------------------------
 
-def compute_training_cot(engine, char_id, total_mass):
-    """Compute mean instantaneous Cost of Transport from the live training env.
+class EpisodeCoTTracker:
+    """Tracks per-episode Cost of Transport by accumulating every step.
 
-    CoT_inst = mean_power / (m * g * |mean_fwd_vel|)
-    where power = sum_d |tau_d * qd_d| per env, averaged over envs.
+    Accumulates mechanical power and forward velocity per env.  When an
+    episode ends (done_buf > 0), finalises CoT = mean_power / (m*g*|mean_v|)
+    and stores it.  ``get_stats()`` returns the mean over completed episodes
+    since the last call, giving a much smoother signal than an instantaneous
+    snapshot.
 
-    Returns (cot, mean_power, mean_fwd_vel).
+    Must be called via ``accumulate()`` + ``finalize_episodes()`` every env
+    step (hooked into ``_post_physics_step``).
     """
-    dof_forces = engine.get_dof_forces(char_id)   # (num_envs, num_dofs)
-    dof_vel = engine.get_dof_vel(char_id)          # (num_envs, num_dofs)
-    root_vel = engine.get_root_vel(char_id)        # (num_envs, 3)
 
-    power_per_env = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
-    mean_power = torch.mean(power_per_env).item()
-    mean_fwd_vel = torch.mean(root_vel[:, 0]).item()
+    def __init__(self, num_envs, total_mass, device):
+        self.total_mass = total_mass
+        self.g = 9.81
+        self.power_sum = torch.zeros(num_envs, device=device)
+        self.vel_sum = torch.zeros(num_envs, device=device)
+        self.step_count = torch.zeros(num_envs, device=device, dtype=torch.long)
+        self.episode_cots = []
+        self.episode_powers = []
+        self.episode_vels = []
 
-    safe_vel = max(abs(mean_fwd_vel), 0.1)
-    cot = mean_power / (total_mass * 9.81 * safe_vel)
-    return cot, mean_power, mean_fwd_vel
+    def accumulate(self, engine, char_id):
+        """Accumulate instantaneous power and forward velocity."""
+        dof_forces = engine.get_dof_forces(char_id)
+        dof_vel = engine.get_dof_vel(char_id)
+        root_vel = engine.get_root_vel(char_id)
+        power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
+        self.power_sum += power
+        self.vel_sum += root_vel[:, 0]
+        self.step_count += 1
+
+    def finalize_episodes(self, done_buf):
+        """Finalize CoT for episodes that just ended."""
+        done_mask = done_buf > 0
+        if not done_mask.any():
+            return
+        done_idx = done_mask.nonzero(as_tuple=True)[0]
+        steps = self.step_count[done_idx].float()
+        valid = steps > 0
+        if valid.any():
+            vi = done_idx[valid]
+            vs = steps[valid]
+            mp = self.power_sum[vi] / vs
+            mv = self.vel_sum[vi] / vs
+            safe_v = torch.clamp(torch.abs(mv), min=0.1)
+            cots = mp / (self.total_mass * self.g * safe_v)
+            self.episode_cots.extend(cots.tolist())
+            self.episode_powers.extend(mp.tolist())
+            self.episode_vels.extend(mv.tolist())
+        self.power_sum[done_idx] = 0
+        self.vel_sum[done_idx] = 0
+        self.step_count[done_idx] = 0
+
+    def get_stats(self):
+        """Return (mean_cot, mean_power, mean_fwd_vel, n_episodes) and reset."""
+        if not self.episode_cots:
+            return None, None, None, 0
+        n = len(self.episode_cots)
+        cot = sum(self.episode_cots) / n
+        pwr = sum(self.episode_powers) / n
+        vel = sum(self.episode_vels) / n
+        self.episode_cots.clear()
+        self.episode_powers.clear()
+        self.episode_vels.clear()
+        return cot, pwr, vel, n
 
 
 # ---------------------------------------------------------------------------
@@ -170,6 +218,19 @@ def codesign_task_reward(self):
     term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
 
     self._reward_buf[:] = vel_reward + orientation_penalty + alive + term_penalty
+
+
+def _make_post_physics_hook(original_fn, char_id):
+    """Create a _post_physics_step wrapper that drives the CoT tracker.
+
+    Called after the original _post_physics_step (which runs _update_reward
+    then _update_done), so both _reward_buf and _done_buf are current.
+    """
+    def hooked_post_physics_step(self):
+        original_fn(self)
+        self._cot_tracker.accumulate(self._engine, char_id)
+        self._cot_tracker.finalize_episodes(self._done_buf)
+    return hooked_post_physics_step
 
 
 # ---------------------------------------------------------------------------
@@ -281,7 +342,7 @@ class InnerLoopController:
                  min_inner_iters=0,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
-                 log_file=None, total_mass=None, char_id=0,
+                 log_file=None,
                  is_root=True, device="cuda:0", rank=0):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
@@ -295,8 +356,6 @@ class InnerLoopController:
         self.video_interval = video_interval
         self.save_interval = save_interval
         self.log_file = log_file
-        self.total_mass = total_mass
-        self.char_id = char_id
         self.is_root = is_root
         self.device = device
         self.rank = rank
@@ -411,17 +470,14 @@ class InnerLoopController:
                             except (TypeError, ValueError):
                                 pass
 
-                        # Instantaneous CoT from training env
-                        if self.total_mass is not None and self.engine is not None:
-                            try:
-                                cot, mech_power, fwd_vel = compute_training_cot(
-                                    self.engine, self.char_id, self.total_mass,
-                                )
-                                wlog["inner/cot"] = cot
-                                wlog["inner/mechanical_power"] = mech_power
-                                wlog["inner/forward_velocity"] = fwd_vel
-                            except Exception as e:
-                                print(f"  [CoT] Compute failed: {e}")
+                        # Episode-averaged CoT from tracker
+                        cot_tracker = env._cot_tracker
+                        cot, mech_power, fwd_vel, n_eps = cot_tracker.get_stats()
+                        if cot is not None:
+                            wlog["inner/cot"] = cot
+                            wlog["inner/mechanical_power"] = mech_power
+                            wlog["inner/forward_velocity"] = fwd_vel
+                            wlog["inner/cot_episodes"] = n_eps
 
                         if wlog:
                             wandb.log(wlog)
@@ -799,6 +855,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print(f"  Robot mass: {total_mass:.2f} kg")
 
+    # Episode-averaged CoT tracker (hooked into _post_physics_step)
+    env._cot_tracker = EpisodeCoTTracker(per_rank_envs, total_mass, device)
+    _orig_post_physics = type(env)._post_physics_step
+    env._post_physics_step = types.MethodType(
+        _make_post_physics_hook(_orig_post_physics, char_id), env
+    )
+
     # Headless viewer for video capture (root only)
     viewer = None
     if use_wandb:
@@ -877,8 +940,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         video_interval=args.video_interval,
         save_interval=args.save_interval,
         log_file=log_file,
-        total_mass=total_mass,
-        char_id=char_id,
         is_root=is_root,
         device=device,
         rank=rank,
