@@ -133,6 +133,25 @@ class EpisodeCoTTracker:
     # G1 DoF layout: 0-5 left leg, 6-11 right leg, 12-14 torso, 15-28 arms
     LOCOMOTION_DOFS = 15  # first 15 DoFs = legs + torso
 
+    @staticmethod
+    def get_dof_forces_safe(engine, char_id):
+        """Get dof forces as (num_envs, num_dofs).
+
+        Workaround for Newton position-control bug: get_dof_forces(obj_id)
+        does tensor indexing on _dof_forces which is (num_envs, num_dofs, 2),
+        so [obj_id] selects one *env* instead of one *object*, returning
+        (num_dofs, 2) → sum → (num_dofs,) which is wrong.
+        We bypass it by reading _dof_forces directly.
+        """
+        raw = engine._dof_forces
+        if isinstance(raw, torch.Tensor):
+            if raw.dim() == 3:
+                # Position control: (num_envs, num_dofs, 2) → sum P+D
+                return torch.sum(raw, dim=-1)
+            return raw  # Already (num_envs, num_dofs)
+        # List indexed by char_id (none/torque/pd_explicit modes)
+        return raw[char_id]
+
     def __init__(self, num_envs, total_mass, device):
         self.total_mass = total_mass
         self.g = 9.81
@@ -145,15 +164,9 @@ class EpisodeCoTTracker:
 
     def accumulate(self, engine, char_id):
         """Accumulate instantaneous power and forward velocity."""
-        dof_forces = engine.get_dof_forces(char_id)
+        dof_forces = self.get_dof_forces_safe(engine, char_id)
         dof_vel = engine.get_dof_vel(char_id)
         root_vel = engine.get_root_vel(char_id)
-        # Newton pos-mode get_dof_forces returns 1D; reshape to (num_envs, num_dofs)
-        num_envs = root_vel.shape[0]
-        if dof_forces.dim() == 1:
-            dof_forces = dof_forces.view(num_envs, -1)
-        if dof_vel.dim() == 1:
-            dof_vel = dof_vel.view(num_envs, -1)
         dof_forces = dof_forces[:, :self.LOCOMOTION_DOFS]
         dof_vel = dof_vel[:, :self.LOCOMOTION_DOFS]
         power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
@@ -234,14 +247,8 @@ def codesign_task_reward(self):
     # 5. Mechanical power penalty: aligns inner loop with outer loop CoT objective
     #    power = sum(|tau * dof_vel|) over legs + torso only (DoFs 0-14)
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
-    num_envs = self._reward_buf.shape[0]
-    dof_forces = self._engine.get_dof_forces(char_id)
+    dof_forces = EpisodeCoTTracker.get_dof_forces_safe(self._engine, char_id)
     dof_vel = self._engine.get_dof_vel(char_id)
-    # Newton pos-mode get_dof_forces returns 1D; reshape to (num_envs, num_dofs)
-    if dof_forces.dim() == 1:
-        dof_forces = dof_forces.view(num_envs, -1)
-    if dof_vel.dim() == 1:
-        dof_vel = dof_vel.view(num_envs, -1)
     dof_forces = dof_forces[:, :_LOCO_DOFS]
     dof_vel = dof_vel[:, :_LOCO_DOFS]
     mech_power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
