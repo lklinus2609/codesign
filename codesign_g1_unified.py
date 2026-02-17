@@ -123,9 +123,15 @@ class EpisodeCoTTracker:
     since the last call, giving a much smoother signal than an instantaneous
     snapshot.
 
+    Only counts lower-body + torso DoFs (indices 0-14) for power, excluding
+    arm joints whose energy use is not relevant to locomotion co-design.
+
     Must be called via ``accumulate()`` + ``finalize_episodes()`` every env
     step (hooked into ``_post_physics_step``).
     """
+
+    # G1 DoF layout: 0-5 left leg, 6-11 right leg, 12-14 torso, 15-28 arms
+    LOCOMOTION_DOFS = 15  # first 15 DoFs = legs + torso
 
     def __init__(self, num_envs, total_mass, device):
         self.total_mass = total_mass
@@ -139,8 +145,8 @@ class EpisodeCoTTracker:
 
     def accumulate(self, engine, char_id):
         """Accumulate instantaneous power and forward velocity."""
-        dof_forces = engine.get_dof_forces(char_id)
-        dof_vel = engine.get_dof_vel(char_id)
+        dof_forces = engine.get_dof_forces(char_id)[:, :self.LOCOMOTION_DOFS]
+        dof_vel = engine.get_dof_vel(char_id)[:, :self.LOCOMOTION_DOFS]
         root_vel = engine.get_root_vel(char_id)
         power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
         self.power_sum += power
@@ -217,7 +223,16 @@ def codesign_task_reward(self):
     # 4. Termination penalty
     term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
 
-    self._reward_buf[:] = vel_reward + orientation_penalty + alive + term_penalty
+    # 5. Mechanical power penalty: aligns inner loop with outer loop CoT objective
+    #    power = sum(|tau * dof_vel|) over legs + torso only (DoFs 0-14)
+    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
+    dof_forces = self._engine.get_dof_forces(char_id)[:, :_LOCO_DOFS]
+    dof_vel = self._engine.get_dof_vel(char_id)[:, :_LOCO_DOFS]
+    mech_power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
+    power_penalty = -self._power_penalty_weight * mech_power
+
+    self._reward_buf[:] = (vel_reward + orientation_penalty + alive
+                           + term_penalty + power_penalty)
 
 
 def _make_post_physics_hook(original_fn, char_id):
@@ -340,6 +355,7 @@ class InnerLoopController:
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
                  min_plateau_outputs=10, max_samples=200_000_000,
                  min_inner_iters=0,
+                 convergence_signal='task_reward',
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
                  log_file=None,
@@ -350,6 +366,7 @@ class InnerLoopController:
         self.min_plateau_outputs = min_plateau_outputs
         self.max_samples = max_samples
         self.min_inner_iters = min_inner_iters
+        self.convergence_signal = convergence_signal
         self.use_wandb = use_wandb
         self.viewer = viewer
         self.engine = engine
@@ -374,9 +391,10 @@ class InnerLoopController:
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or sample cap.
 
-        Convergence is detected when disc_reward_mean (sampled at output
-        iterations, before env reset) plateaus. AMP's env reward is 0 —
-        the discriminator reward is the real quality signal.
+        Convergence is detected when the configured signal (task_reward or
+        disc_reward) plateaus at output iterations.  Default is task_reward
+        (Train_Return), which plateaus cleanly.  disc_reward can decline
+        indefinitely and produce false plateau triggers.
 
         All ranks participate in training (collective ops in _train_iter,
         _update_sample_count, _log_train_info). Root decides convergence
@@ -397,6 +415,7 @@ class InnerLoopController:
         agent._iter = saved_iter  # restore so wandb x-axis is monotonic
 
         disc_rewards = []
+        convergence_values = []
         converged = False
         start_time = time.time()
         test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
@@ -409,11 +428,21 @@ class InnerLoopController:
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
             if output_iter:
+                # Track disc_reward (always, for diagnostics/return value)
                 disc_r = train_info.get("disc_reward_mean")
                 if disc_r is not None:
                     if torch.is_tensor(disc_r):
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
+
+                # Track convergence signal
+                if self.convergence_signal == 'task_reward':
+                    cv = train_info.get("mean_return")
+                    if cv is not None:
+                        convergence_values.append(float(cv))
+                elif self.convergence_signal == 'disc_reward':
+                    if disc_r is not None:
+                        convergence_values.append(disc_r)
 
                 test_info = {
                     "mean_return": 0.0,
@@ -429,6 +458,10 @@ class InnerLoopController:
             # reduce_inplace_mean. Actual printing is gated by Logger.is_root().
             agent._logger.print_log()
 
+            # All ranks must call write_log() — it contains a collective
+            # reduce_inplace_mean. Write every iteration for full resolution.
+            agent._logger.write_log()
+
             if output_iter:
                 # Convergence check: root decides, broadcast to all ranks.
                 # This MUST happen before root-only I/O (save, wandb, video)
@@ -437,17 +470,13 @@ class InnerLoopController:
                 should_stop = False
                 if self.is_root:
                     should_stop = (inner_iters >= self.min_inner_iters
-                                   and self._check_plateau(disc_rewards))
+                                   and self._check_plateau(convergence_values))
 
                 if mp_util.enable_mp():
                     flag = torch.tensor([int(should_stop)], dtype=torch.int32,
                                         device=self.device)
                     flag = mp_util.broadcast(flag)
                     should_stop = flag.item() == 1
-
-                # All ranks must call write_log() — it contains a collective
-                # reduce_inplace_mean. Actual file I/O is gated by Logger.is_root().
-                agent._logger.write_log()
 
                 # Root-only I/O: save, wandb, video (after broadcast)
                 if self.is_root:
@@ -499,11 +528,11 @@ class InnerLoopController:
 
                 if should_stop:
                     if self.is_root:
-                        recent = disc_rewards[-self.plateau_window:]
+                        recent = convergence_values[-self.plateau_window:]
                         spread = max(recent) - min(recent)
-                        print(f"    [Inner] CONVERGED ({len(disc_rewards)} outputs, "
+                        print(f"    [Inner] CONVERGED ({len(convergence_values)} outputs, "
                               f"{inner_iters} iters, "
-                              f"disc_reward={np.mean(recent):.4f}, "
+                              f"{self.convergence_signal}={np.mean(recent):.4f}, "
                               f"spread={spread:.4f})")
                     converged = True
                     break
@@ -555,7 +584,7 @@ def collect_actions_from_agent(agent, env, num_eval_worlds, horizon):
 
 def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
                                      rank, num_procs, device, param_names,
-                                     eps=0.01):
+                                     eps=0.05):
     """Compute FD gradient with rollouts distributed across all ranks.
 
     Rollout indexing:
@@ -571,10 +600,9 @@ def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
     n_params = len(theta_np)
     total_rollouts = 1 + 2 * n_params  # center + 2 per param
 
-    # Tensor to collect CoT values; each rank fills only its assigned slots
+    # Tensors to collect CoT and fwd_dist; each rank fills its assigned slots
     cot_all = torch.zeros(total_rollouts, dtype=torch.float64, device=device)
-    # Separate tensor for fwd_dist of center rollout
-    fwd_dist_tensor = torch.zeros(1, dtype=torch.float64, device=device)
+    dist_all = torch.zeros(total_rollouts, dtype=torch.float64, device=device)
 
     my_indices = list(range(rank, total_rollouts, num_procs))
 
@@ -587,7 +615,7 @@ def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
             # Center rollout
             fwd_dist, cot = fd_eval._run_rollout(theta_np, actions_list)
             cot_all[0] = cot
-            fwd_dist_tensor[0] = fwd_dist
+            dist_all[0] = fwd_dist
             if rank == 0:
                 print(f"    [FD] Center: fwd_dist={fwd_dist:.4f} m, CoT={cot:.4f}")
         else:
@@ -596,16 +624,17 @@ def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
             is_plus = (idx % 2 == 1)
             theta_pert = theta_np.copy()
             theta_pert[param_i] += eps if is_plus else -eps
-            _, cot_pert = fd_eval._run_rollout(theta_pert, actions_list)
+            fwd_dist_pert, cot_pert = fd_eval._run_rollout(theta_pert, actions_list)
             cot_all[idx] = cot_pert
+            dist_all[idx] = fwd_dist_pert
 
     # Combine results across ranks
     if num_procs > 1:
         torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(fwd_dist_tensor, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(dist_all, op=torch.distributed.ReduceOp.SUM)
 
     cot_center = cot_all[0].item()
-    fwd_dist_center = fwd_dist_tensor[0].item()
+    fwd_dist_center = dist_all[0].item()
 
     # Assemble gradient from reduced CoT vector
     grad = np.zeros(n_params, dtype=np.float64)
@@ -625,8 +654,17 @@ def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
         for i, name in enumerate(param_names):
             cot_plus = cot_all[2 * i + 1].item()
             cot_minus = cot_all[2 * i + 2].item()
+            dist_plus = dist_all[2 * i + 1].item()
+            dist_minus = dist_all[2 * i + 2].item()
+            # Flag if forward distance degrades >30% vs center (policy health check)
+            health = ""
+            if fwd_dist_center > 0:
+                worst = min(dist_plus, dist_minus)
+                if worst < 0.7 * fwd_dist_center:
+                    health = " *** POLICY DEGRADED ***"
             print(f"    [FD] param {i}: CoT+={cot_plus:.6f}, CoT-={cot_minus:.6f}, "
-                  f"grad={grad[i]:+.6f}")
+                  f"grad={grad[i]:+.6f}, dist+={dist_plus:.3f}, dist-={dist_minus:.3f}"
+                  f"{health}")
 
     return grad, fwd_dist_center, cot_center
 
@@ -826,6 +864,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             per_rank_envs, device, visualize=False,
         )
     # Monkey-patch task reward onto env (replaces empty _update_reward)
+    env._power_penalty_weight = args.power_penalty_weight
     env._update_reward = types.MethodType(codesign_task_reward, env)
 
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
@@ -1216,6 +1255,9 @@ if __name__ == "__main__":
                         help="Min inner iters before convergence on first outer iter (0=disabled)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
+    parser.add_argument("--power-penalty-weight", type=float, default=0.0005,
+                        help="Weight for mechanical power penalty in task reward "
+                             "(aligns inner loop with outer loop CoT objective)")
     # Multi-GPU arguments
     parser.add_argument("--devices", nargs="+", default=None,
                         help="CUDA devices (default: auto-detect all GPUs)")

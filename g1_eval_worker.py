@@ -1268,9 +1268,15 @@ class FDEvaluator:
         self.q_dof_start = self.qd_dof_start + 1
         self.total_q_per_world = self.joint_q_size
 
+        # Only count legs + torso (first 15 DoFs) for CoT energy computation.
+        # Arms (DoFs 15-28) are excluded — their energy isn't relevant to
+        # lower-body morphology co-design and adds noise to FD gradients.
+        self.num_loco_dofs = min(15, self.num_act_dofs)
+
         print(f"    [FDEval] DOF structure: qd_dof_start={self.qd_dof_start}, "
               f"q_dof_start={self.q_dof_start}, "
-              f"num_act_dofs={self.num_act_dofs}, total_qd/world={self.total_qd_per_world}")
+              f"num_act_dofs={self.num_act_dofs}, num_loco_dofs={self.num_loco_dofs}, "
+              f"total_qd/world={self.total_qd_per_world}")
 
         # Pre-collected actions buffer
         self.pre_actions = [
@@ -1427,7 +1433,7 @@ class FDEvaluator:
                 self.solver.step(state_0, state_1, self.control, contacts, self.sim_dt)
                 state_0, state_1 = state_1, state_0
 
-                # Accumulate mechanical power: Σ|τ·qd| (sensitive to morphology)
+                # Accumulate mechanical power: Σ|τ·qd| over legs+torso only
                 wp.launch(
                     accumulate_mechanical_power_kernel,
                     dim=1,
@@ -1440,7 +1446,7 @@ class FDEvaluator:
                         energy_buf,
                         self.qd_dof_start,
                         self.q_dof_start,
-                        self.num_act_dofs,
+                        self.num_loco_dofs,
                         self.total_qd_per_world,
                         self.total_q_per_world,
                         self.num_worlds,
