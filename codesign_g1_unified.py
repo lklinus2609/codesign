@@ -405,6 +405,7 @@ class InnerLoopController:
                  min_plateau_outputs=10, max_samples=200_000_000,
                  min_inner_iters=0,
                  convergence_signal='task_reward',
+                 ramp_start_iter=1000, ramp_end_iter=2500,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
                  log_file=None,
@@ -416,6 +417,9 @@ class InnerLoopController:
         self.max_samples = max_samples
         self.min_inner_iters = min_inner_iters
         self.convergence_signal = convergence_signal
+        self.ramp_start_iter = ramp_start_iter
+        self.ramp_end_iter = ramp_end_iter
+        self.ramp_completed = False  # set True after first ramp finishes
         self.use_wandb = use_wandb
         self.viewer = viewer
         self.engine = engine
@@ -474,6 +478,22 @@ class InnerLoopController:
             train_info = agent._train_iter()                      # COLLECTIVE
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
 
+            # Reward weight ramp: disc 1.0→0.0, task 0.0→1.0 over [ramp_start, ramp_end]
+            # Only runs during kickoff; after ramp completes, stays at task=1.0/disc=0.0
+            if not self.ramp_completed:
+                it = inner_iters
+                if it <= self.ramp_start_iter:
+                    agent._task_reward_weight = 0.0
+                    agent._disc_reward_weight = 1.0
+                elif it >= self.ramp_end_iter:
+                    agent._task_reward_weight = 1.0
+                    agent._disc_reward_weight = 0.0
+                    self.ramp_completed = True
+                else:
+                    t = (it - self.ramp_start_iter) / (self.ramp_end_iter - self.ramp_start_iter)
+                    agent._task_reward_weight = t
+                    agent._disc_reward_weight = 1.0 - t
+
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
             if output_iter:
@@ -484,14 +504,16 @@ class InnerLoopController:
                         disc_r = disc_r.item()
                     disc_rewards.append(disc_r)
 
-                # Track convergence signal
-                if self.convergence_signal == 'task_reward':
-                    cv = train_info.get("mean_return")
-                    if cv is not None:
-                        convergence_values.append(float(cv))
-                elif self.convergence_signal == 'disc_reward':
-                    if disc_r is not None:
-                        convergence_values.append(disc_r)
+                # Track convergence signal (only after reward ramp completes,
+                # since the changing reward landscape invalidates plateau detection)
+                if self.ramp_completed:
+                    if self.convergence_signal == 'task_reward':
+                        cv = train_info.get("mean_return")
+                        if cv is not None:
+                            convergence_values.append(float(cv))
+                    elif self.convergence_signal == 'disc_reward':
+                        if disc_r is not None:
+                            convergence_values.append(disc_r)
 
                 test_info = {
                     "mean_return": 0.0,
@@ -637,8 +659,12 @@ def collect_actions_from_agent(agent, env, num_eval_worlds, horizon):
 
 def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
                                      rank, num_procs, device, param_names,
-                                     eps=0.05):
+                                     eps=0.05, vel_reward_weight=0.1):
     """Compute FD gradient with rollouts distributed across all ranks.
+
+    Objective: minimize CoT + reward forward distance.
+      reward(theta) = -CoT(theta) + vel_reward_weight * fwd_dist(theta)
+      grad = d_reward/d_theta via central FD
 
     Rollout indexing:
         0          = center (theta unperturbed)
@@ -689,17 +715,21 @@ def compute_fd_gradient_distributed(fd_eval, theta_np, actions_list,
     cot_center = cot_all[0].item()
     fwd_dist_center = dist_all[0].item()
 
-    # Assemble gradient from reduced CoT vector
+    # Assemble gradient: reward = -CoT + vel_reward_weight * fwd_dist
     grad = np.zeros(n_params, dtype=np.float64)
     for i in range(n_params):
         cot_plus = cot_all[2 * i + 1].item()
         cot_minus = cot_all[2 * i + 2].item()
+        dist_plus = dist_all[2 * i + 1].item()
+        dist_minus = dist_all[2 * i + 2].item()
 
         if np.isnan(cot_plus) or np.isnan(cot_minus):
             grad[i] = 0.0
         else:
-            # Negative: minimize CoT = maximize reward
-            grad[i] = -(cot_plus - cot_minus) / (2 * eps)
+            # reward = -CoT + w * dist → grad = d_reward/d_theta
+            reward_plus = -cot_plus + vel_reward_weight * dist_plus
+            reward_minus = -cot_minus + vel_reward_weight * dist_minus
+            grad[i] = (reward_plus - reward_minus) / (2 * eps)
 
     grad = np.clip(grad, -10.0, 10.0)
 
@@ -922,10 +952,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
 
-    # Override default reward weights (config has task=0.0, disc=1.0)
-    # During kickoff: blend task + disc equally so style is learned
-    agent._task_reward_weight = 0.5
-    agent._disc_reward_weight = 0.5
+    # Initial reward weights: pure style learning (ramp handles transition)
+    agent._task_reward_weight = 0.0
+    agent._disc_reward_weight = 1.0
 
     # Monkey-patch _compute_rewards to also log raw task reward stats
     agent._compute_rewards = _make_compute_rewards_hook(agent)
@@ -1029,6 +1058,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         min_plateau_outputs=args.min_plateau_outputs,
         max_samples=args.max_inner_samples,
         min_inner_iters=args.kickoff_min_iters,  # first outer iter; reset to 0 after
+        ramp_start_iter=args.ramp_start_iter,
+        ramp_end_iter=args.ramp_end_iter,
         use_wandb=use_wandb,
         viewer=viewer,
         engine=engine,
@@ -1062,6 +1093,11 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
         if args.kickoff_min_iters > 0:
             print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
+        print(f"  Reward ramp:       disc 1.0→0.0, task 0.0→1.0 "
+              f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
+        print(f"  FD vel weight:     {args.vel_reward_weight} "
+              f"(reward = -CoT + {args.vel_reward_weight}*dist)")
+        print(f"  Power penalty:     {args.power_penalty_weight}")
 
     # =========================================================
     # Outer loop
@@ -1101,18 +1137,14 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
         history["inner_times"].append(inner_time)
 
-        # After kickoff, allow convergence without minimum iter gate
-        # and drop discriminator reward — the policy has learned the style,
-        # continuing with disc reward would fight morphology changes.
+        # After kickoff, disable min_inner_iters gate for subsequent iters.
+        # Reward weights are now handled by the ramp inside train_until_converged
+        # (disc 1.0→0.0, task 0.0→1.0 over ramp_start..ramp_end iters).
         if outer_iter == 0 and inner_ctrl.min_inner_iters > 0:
             if is_root:
                 print(f"  [Kickoff] Disabling min_inner_iters "
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
-                print(f"  [Kickoff] Dropping disc reward: "
-                      f"task_w 0.5 -> 0.5, disc_w 0.5 -> 0.0")
             inner_ctrl.min_inner_iters = 0
-            agent._task_reward_weight = 0.5
-            agent._disc_reward_weight = 0.0
 
         # ----- FD Gradient Phase (ALL ranks) -----
         # All ranks collect actions to keep env state consistent, but we
@@ -1141,6 +1173,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         grad_theta, fwd_dist, cot = compute_fd_gradient_distributed(
             fd_eval, theta.copy(), actions_list,
             rank, num_procs, device, param_names,
+            vel_reward_weight=args.vel_reward_weight,
         )
 
         if is_root:
@@ -1309,6 +1342,13 @@ if __name__ == "__main__":
                         help="Save numbered model checkpoint every N inner iterations")
     parser.add_argument("--kickoff-min-iters", type=int, default=2000,
                         help="Min inner iters before convergence on first outer iter (0=disabled)")
+    parser.add_argument("--ramp-start-iter", type=int, default=1000,
+                        help="Inner iter to start ramping disc→task reward weights")
+    parser.add_argument("--ramp-end-iter", type=int, default=2500,
+                        help="Inner iter to finish ramping (disc=0, task=1)")
+    parser.add_argument("--vel-reward-weight", type=float, default=0.1,
+                        help="Weight for forward distance in outer loop FD objective "
+                             "(reward = -CoT + w * fwd_dist)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     parser.add_argument("--power-penalty-weight", type=float, default=0.0005,
