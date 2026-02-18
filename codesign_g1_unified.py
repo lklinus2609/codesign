@@ -152,17 +152,15 @@ class EpisodeCoTTracker:
         # List indexed by char_id (none/torque/pd_explicit modes)
         return raw[char_id]
 
-    ROLLING_WINDOW = 500  # episodes to keep for smooth averaging
-
     def __init__(self, num_envs, total_mass, device):
         self.total_mass = total_mass
         self.g = 9.81
         self.power_sum = torch.zeros(num_envs, device=device)
         self.vel_sum = torch.zeros(num_envs, device=device)
         self.step_count = torch.zeros(num_envs, device=device, dtype=torch.long)
-        self.episode_cots = deque(maxlen=self.ROLLING_WINDOW)
-        self.episode_powers = deque(maxlen=self.ROLLING_WINDOW)
-        self.episode_vels = deque(maxlen=self.ROLLING_WINDOW)
+        self.episode_cots = []
+        self.episode_powers = []
+        self.episode_vels = []
 
     def reset_accumulators(self):
         """Reset per-env accumulators after env reset to avoid stale data."""
@@ -205,17 +203,16 @@ class EpisodeCoTTracker:
         self.step_count[done_idx] = 0
 
     def get_stats(self):
-        """Return (mean_cot, mean_power, mean_fwd_vel, n_episodes).
-
-        Uses a rolling window of the last ROLLING_WINDOW episodes for
-        smooth averaging — no clearing, deque auto-evicts old entries.
-        """
+        """Return (mean_cot, mean_power, mean_fwd_vel, n_episodes) and reset."""
         if not self.episode_cots:
             return None, None, None, 0
         n = len(self.episode_cots)
         cot = sum(self.episode_cots) / n
         pwr = sum(self.episode_powers) / n
         vel = sum(self.episode_vels) / n
+        self.episode_cots.clear()
+        self.episode_powers.clear()
+        self.episode_vels.clear()
         return cot, pwr, vel, n
 
 
