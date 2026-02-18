@@ -81,6 +81,17 @@ if str(MIMICKIT_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(MIMICKIT_SRC_DIR))
 
 import warp as wp
+
+# Per-rank Warp cache to prevent NVRTC race conditions on multi-GPU nodes.
+# Without this, all ranks share ~/.cache/warp/ and corrupt PCH files when
+# compiling kernels simultaneously (e.g. during FD evaluation phase).
+if _PGHC_GPU_INDEX is not None:
+    _warp_cache = os.path.join(
+        os.path.expanduser("~"), ".cache", "warp_per_rank", f"rank_{_PGHC_GPU_INDEX}"
+    )
+    os.makedirs(_warp_cache, exist_ok=True)
+    wp.config.kernel_cache_dir = _warp_cache
+
 import newton  # noqa: F401
 from newton.viewer import ViewerGL
 import torch
