@@ -1332,7 +1332,7 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
-    parser.add_argument("--plateau-threshold", type=float, default=0.02,
+    parser.add_argument("--plateau-threshold", type=float, default=0.002,
                         help="Inner convergence: spread/mean threshold")
     parser.add_argument("--plateau-window", type=int, default=10,
                         help="Inner convergence: window size (in output intervals)")
