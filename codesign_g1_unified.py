@@ -1275,7 +1275,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 yaw=90.0,
             )
             print("  [Viewer] Headless viewer created for video capture")
-        except Exception as e:
+        except BaseException as e:
+            # Catch SystemExit too — ViewerGL may call exit() on framebuffer failure
             print(f"  [Viewer] Failed to create viewer: {e}")
             viewer = None
 
