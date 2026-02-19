@@ -1263,9 +1263,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         _make_post_physics_hook(_orig_post_physics, char_id), env
     )
 
-    # Headless viewer for video capture (root only)
+    # Headless viewer for video capture (root only, skip on HPC / --no-video)
     viewer = None
-    if use_wandb:
+    if use_wandb and not args.no_video:
         try:
             viewer = ViewerGL(headless=True, width=640, height=480)
             viewer.set_model(sim_model, max_worlds=1)
@@ -1600,6 +1600,8 @@ if __name__ == "__main__":
     parser.add_argument("--vel-reward-weight", type=float, default=0.1,
                         help="Weight for forward distance in outer loop FD objective "
                              "(reward = -CoT + w * fwd_dist)")
+    parser.add_argument("--no-video", action="store_true",
+                        help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
     parser.add_argument("--power-penalty-weight", type=float, default=0.0005,
