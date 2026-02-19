@@ -577,7 +577,7 @@ class InnerLoopController:
                         if self.use_wandb:
                             wandb.save(numbered_path, base_path=str(out_dir))
                             if self.log_file:
-                                wandb.save(self.log_file, policy="now")
+                                wandb.save(self.log_file, policy="live")
 
                     # wandb: forward inner loop metrics + CoT
                     if self.use_wandb:
@@ -724,7 +724,7 @@ def run_closed_loop_rollout(agent, env, engine, char_id, total_mass,
     return cot, fwd_dist
 
 
-def compute_fd_gradient_distributed(agent, env, engine, char_id, total_mass,
+def _compute_fd_gradient_sequential(agent, env, engine, char_id, total_mass,
                                      theta_np, base_quats_dict, joint_idx_map,
                                      num_worlds, num_eval_worlds, horizon,
                                      rank, num_procs, device, param_names,
@@ -813,6 +813,196 @@ def compute_fd_gradient_distributed(agent, env, engine, char_id, total_mass,
         diffs = (reward_plus - reward_minus) / (2 * eps)  # (num_seeds,)
 
         # Check for NaN in any seed
+        valid = ~np.isnan(diffs)
+        if valid.sum() > 0:
+            grad[i] = np.mean(diffs[valid])
+            if valid.sum() > 1:
+                grad_stderr[i] = np.std(diffs[valid], ddof=1) / np.sqrt(valid.sum())
+        else:
+            grad[i] = 0.0
+
+    grad = np.clip(grad, -10.0, 10.0)
+
+    if rank == 0:
+        print(f"    [FD] Center (mean over {num_seeds} seeds): "
+              f"fwd_dist={fwd_dist_center:.4f} m, CoT={cot_center:.4f}")
+        for i, name in enumerate(param_names):
+            cot_plus_mean = float(np.mean(cot_np[2 * i + 1]))
+            cot_minus_mean = float(np.mean(cot_np[2 * i + 2]))
+            dist_plus_mean = float(np.mean(dist_np[2 * i + 1]))
+            dist_minus_mean = float(np.mean(dist_np[2 * i + 2]))
+            print(f"    [FD] param {i} ({name}): "
+                  f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f}, "
+                  f"CoT+={cot_plus_mean:.6f}, CoT-={cot_minus_mean:.6f}, "
+                  f"dist+={dist_plus_mean:.3f}, dist-={dist_minus_mean:.3f}")
+
+    return grad, fwd_dist_center, cot_center
+
+
+def apply_partitioned_morphologies(model, theta_np, eps, n_params,
+                                   base_quats_dict, joint_idx_map,
+                                   num_worlds, worlds_per_pert):
+    """Apply all 13 perturbed morphologies to world partitions in one GPU round-trip.
+
+    Partition layout (n_pert = 1 + 2*n_params = 13 for 6 params):
+        partition 0:              center (theta)
+        partition 2*i+1:          param i + eps
+        partition 2*i+2:          param i - eps
+
+    Each partition spans worlds [p * wpp, (p+1) * wpp).
+    Worlds beyond n_pert * wpp are left untouched (they won't be read).
+    """
+    n_pert = 1 + 2 * n_params
+    joints_per_world = model.joint_count // num_worlds
+    joint_X_p_np = model.joint_X_p.numpy()
+
+    for p in range(n_pert):
+        # Compute theta for this perturbation
+        if p == 0:
+            theta_pert = theta_np  # center — no copy needed (read-only)
+        else:
+            param_i = (p - 1) // 2
+            is_plus = (p % 2 == 1)
+            theta_pert = theta_np.copy()
+            theta_pert[param_i] += eps if is_plus else -eps
+
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+
+        # Write quaternions for this partition's world range
+        for i, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
+            angle = float(theta_pert[i])
+            delta_q = quat_from_x_rotation(angle)
+            for body_name in (left_body, right_body):
+                if body_name not in joint_idx_map:
+                    continue
+                base_q = base_quats_dict[body_name]
+                new_q = quat_normalize(quat_multiply(delta_q, base_q))  # (w,x,y,z)
+                local_idx = joint_idx_map[body_name]
+                for w in range(w_start, w_end):
+                    global_idx = w * joints_per_world + local_idx
+                    joint_X_p_np[global_idx, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
+
+    model.joint_X_p.assign(joint_X_p_np)
+    wp.synchronize()
+
+
+def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
+                                  theta_np, base_quats_dict, joint_idx_map,
+                                  num_worlds, horizon,
+                                  rank, num_procs, device, param_names,
+                                  num_seeds=10, base_seed=42,
+                                  eps=0.05, vel_reward_weight=0.1):
+    """Compute closed-loop FD gradient with world-partitioned perturbations.
+
+    Instead of running 130 sequential rollouts (13 perturbations x 10 seeds),
+    partitions worlds into 13 groups — each running a different morphology
+    simultaneously. The seed loop (10 iterations) remains sequential.
+    Total: 10 rollouts instead of 130 (13x speedup).
+
+    Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
+    results are averaged via all_reduce(SUM) / num_procs.
+
+    Returns (grad, fwd_dist_center, cot_center) on all ranks.
+    """
+    n_params = len(theta_np)
+    n_pert = 1 + 2 * n_params  # 13 for 6 params
+    wpp = num_worlds // n_pert  # worlds per perturbation
+    assert num_worlds >= n_pert, f"Need >= {n_pert} worlds, got {num_worlds}"
+
+    if rank == 0:
+        print(f"    [FD-parallel] {n_pert} perturbations x {num_seeds} seeds, "
+              f"{wpp} worlds/perturbation ({num_worlds} total), "
+              f"{num_procs} GPU(s)")
+
+    # Result tensors: (n_pert, num_seeds)
+    cot_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    dist_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+
+    sim_model = engine._sim_model
+    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
+
+    # Apply all 13 morphologies to their world partitions (1 GPU<->CPU round-trip)
+    apply_partitioned_morphologies(sim_model, theta_np, eps, n_params,
+                                   base_quats_dict, joint_idx_map,
+                                   num_worlds, wpp)
+
+    agent.eval()
+    agent.set_mode(base_agent_mod.AgentMode.TEST)
+
+    for seed_idx in range(num_seeds):
+        seed = base_seed + seed_idx
+        torch.manual_seed(seed)
+        np.random.seed(seed % (2**32))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+
+        obs, info = env.reset()
+        initial_root_x = engine.get_root_pos(char_id)[:, 0].clone()
+
+        # Per-world accumulators (all worlds, all perturbations simultaneously)
+        power_sum = torch.zeros(num_worlds, device=device)
+        vel_sum = torch.zeros(num_worlds, device=device)
+
+        with torch.no_grad():
+            for _ in range(horizon):
+                action, _ = agent._decide_action(obs, info)
+                obs, reward, done, info = env.step(action)
+
+                dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
+                dof_vel = engine.get_dof_vel(char_id)
+                root_vel = engine.get_root_vel(char_id)
+
+                power = torch.sum(torch.abs(
+                    dof_forces[:num_worlds, :_LOCO_DOFS] *
+                    dof_vel[:num_worlds, :_LOCO_DOFS]), dim=-1)
+                power_sum += power[:num_worlds]
+                vel_sum += root_vel[:num_worlds, 0]
+
+        final_root_x = engine.get_root_pos(char_id)[:, 0].clone()
+
+        # Extract per-partition metrics via slicing
+        for p in range(n_pert):
+            s, e = p * wpp, (p + 1) * wpp
+            fwd_dist = (final_root_x[s:e] - initial_root_x[s:e]).mean().item()
+            mp = power_sum[s:e] / float(horizon)
+            mv = vel_sum[s:e] / float(horizon)
+            safe_v = torch.sqrt(mv ** 2 + 0.01)
+            cot = (mp / (total_mass * 9.81 * safe_v)).mean().item()
+            cot_all[p, seed_idx] = cot
+            dist_all[p, seed_idx] = fwd_dist
+
+    agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+
+    # Multi-GPU: average across ranks
+    if num_procs > 1:
+        torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(dist_all, op=torch.distributed.ReduceOp.SUM)
+        cot_all /= num_procs
+        dist_all /= num_procs
+
+    # Restore original morphology
+    update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
+                               joint_idx_map, num_worlds)
+
+    # Gradient computation (same math as sequential version)
+    cot_np = cot_all.cpu().numpy()
+    dist_np = dist_all.cpu().numpy()
+
+    # Center metrics (mean over seeds)
+    cot_center = float(np.mean(cot_np[0]))
+    fwd_dist_center = float(np.mean(dist_np[0]))
+
+    # reward = -CoT + vel_reward_weight * fwd_dist
+    reward_all = -cot_np + vel_reward_weight * dist_np  # (n_pert, num_seeds)
+
+    grad = np.zeros(n_params, dtype=np.float64)
+    grad_stderr = np.zeros(n_params, dtype=np.float64)
+    for i in range(n_params):
+        reward_plus = reward_all[2 * i + 1]   # (num_seeds,)
+        reward_minus = reward_all[2 * i + 2]  # (num_seeds,)
+        diffs = (reward_plus - reward_minus) / (2 * eps)  # (num_seeds,)
+
         valid = ~np.isnan(diffs)
         if valid.sum() > 0:
             grad[i] = np.mean(diffs[valid])
@@ -1123,6 +1313,17 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         rank=rank,
     )
 
+    # Skip kickoff ramp when resuming from a checkpoint (the resumed policy
+    # was already trained with task reward; re-ramping would destroy it).
+    if args.resume_checkpoint:
+        inner_ctrl.ramp_completed = True
+        inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
+        agent._task_reward_weight = 1.0
+        agent._disc_reward_weight = 0.0
+        if is_root:
+            print(f"  [Resume] Skipping kickoff ramp (ramp_completed=True, "
+                  f"min_inner_iters={inner_ctrl.min_inner_iters})")
+
     history = {
         "theta": [theta.copy()],
         "forward_dist": [],
@@ -1198,7 +1399,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             if is_root:
                 print(f"  [Kickoff] Disabling min_inner_iters "
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
-            inner_ctrl.min_inner_iters = 0
+            inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
 
         # ----- FD Gradient Phase (ALL ranks, closed-loop) -----
         # Clear CoT tracker before FD to prevent cross-contamination
@@ -1211,19 +1412,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
         fd_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, fwd_dist, cot = compute_fd_gradient_distributed(
+        grad_theta, fwd_dist, cot = compute_fd_gradient_parallel(
             agent, env, engine, char_id, total_mass,
             theta.copy(), base_quats_dict, joint_idx_map,
-            per_rank_envs, args.num_eval_worlds, args.eval_horizon,
+            per_rank_envs, args.eval_horizon,
             rank, num_procs, device, param_names,
             num_seeds=args.num_fd_seeds, base_seed=fd_base_seed,
-            vel_reward_weight=args.vel_reward_weight,
-        )
-
-        # Restore morphology after FD (belt-and-suspenders)
-        update_training_joint_X_p(
-            sim_model, theta, base_quats_dict, joint_idx_map,
-            per_rank_envs
+            eps=0.05, vel_reward_weight=args.vel_reward_weight,
         )
 
         # Clear CoT tracker after FD to prevent pollution of inner loop
@@ -1400,6 +1595,8 @@ if __name__ == "__main__":
                         help="Inner iter to start ramping disc→task reward weights")
     parser.add_argument("--ramp-end-iter", type=int, default=2500,
                         help="Inner iter to finish ramping (disc=0, task=1)")
+    parser.add_argument("--post-kickoff-min-iters", type=int, default=100,
+                        help="Min inner iters for convergence after first outer iter")
     parser.add_argument("--vel-reward-weight", type=float, default=0.1,
                         help="Weight for forward distance in outer loop FD objective "
                              "(reward = -CoT + w * fwd_dist)")
