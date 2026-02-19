@@ -21,6 +21,7 @@ os.environ["PYGLET_HEADLESS"] = "1"
 
 import argparse
 import gc
+import math
 import sys
 import tempfile
 from pathlib import Path
@@ -268,8 +269,8 @@ def compute_cot_loss_kernel(
         mean_dist = total_dist / float(num_worlds)
         fwd_dist_buf[0] = mean_dist
 
-        # Clamp distance to avoid div-by-zero
-        safe_dist = wp.max(mean_dist, 0.1)
+        # Soft clamp: sqrt(d^2 + 0.01) — smooth everywhere, no derivative discontinuity
+        safe_dist = wp.sqrt(mean_dist * mean_dist + 0.01)
         loss[0] = energy_buf[0] / (total_mass * 9.81 * safe_dist)
 
 
@@ -729,21 +730,18 @@ class DiffG1Eval:
             actions_np = actions_list[step].astype(np.float64)
             act_dim = actions_np.shape[1] if actions_np.ndim > 1 else actions_np.shape[0]
 
-            # Handle dimension mismatch: MimicKit actions may differ from
-            # ball-joint DOF space. Truncate or pad as needed.
-            if act_dim != self.num_act_dofs:
-                adapted = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
-                copy_dim = min(act_dim, self.num_act_dofs)
-                adapted[:actions_np.shape[0], :copy_dim] = actions_np[:self.num_worlds, :copy_dim]
-                actions_np = adapted
-            else:
-                # Pad/truncate worlds
-                if actions_np.shape[0] < self.num_worlds:
-                    padded = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
-                    padded[:actions_np.shape[0]] = actions_np
-                    actions_np = padded
-                elif actions_np.shape[0] > self.num_worlds:
-                    actions_np = actions_np[:self.num_worlds]
+            assert act_dim == self.num_act_dofs, (
+                f"Action dimension mismatch: policy produces {act_dim} actions but "
+                f"eval model has {self.num_act_dofs} actuated DOFs. "
+                f"Check that training and eval use identical add_mjcf flags."
+            )
+
+            if actions_np.shape[0] < self.num_worlds:
+                padded = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
+                padded[:actions_np.shape[0]] = actions_np
+                actions_np = padded
+            elif actions_np.shape[0] > self.num_worlds:
+                actions_np = actions_np[:self.num_worlds]
 
             self.pre_actions[step].assign(actions_np)
 
@@ -1389,18 +1387,18 @@ class FDEvaluator:
             actions_np = actions_list[step].astype(np.float64)
             act_dim = actions_np.shape[1] if actions_np.ndim > 1 else actions_np.shape[0]
 
-            if act_dim != self.num_act_dofs:
-                adapted = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
-                copy_dim = min(act_dim, self.num_act_dofs)
-                adapted[:actions_np.shape[0], :copy_dim] = actions_np[:self.num_worlds, :copy_dim]
-                actions_np = adapted
-            else:
-                if actions_np.shape[0] < self.num_worlds:
-                    padded = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
-                    padded[:actions_np.shape[0]] = actions_np
-                    actions_np = padded
-                elif actions_np.shape[0] > self.num_worlds:
-                    actions_np = actions_np[:self.num_worlds]
+            assert act_dim == self.num_act_dofs, (
+                f"Action dimension mismatch: policy produces {act_dim} actions but "
+                f"eval model has {self.num_act_dofs} actuated DOFs. "
+                f"Check that training and eval use identical add_mjcf flags."
+            )
+
+            if actions_np.shape[0] < self.num_worlds:
+                padded = np.zeros((self.num_worlds, self.num_act_dofs), dtype=np.float64)
+                padded[:actions_np.shape[0]] = actions_np
+                actions_np = padded
+            elif actions_np.shape[0] > self.num_worlds:
+                actions_np = actions_np[:self.num_worlds]
 
             self.pre_actions[step].assign(actions_np)
 
@@ -1467,8 +1465,8 @@ class FDEvaluator:
             total_dist += jq_final[idx] - jq_init[idx]
         mean_dist = total_dist / self.num_worlds
 
-        # CoT = energy / (m * g * d)
-        safe_dist = max(mean_dist, 0.1)
+        # CoT = energy / (m * g * d), soft clamp for smooth FD gradients
+        safe_dist = math.sqrt(mean_dist ** 2 + 0.01)
         cot = mean_energy / (self.total_mass * 9.81 * safe_dist)
 
         # Restore state references (ping-pong may have swapped them)
