@@ -1229,6 +1229,18 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
 
+    # Ensure disc replay buffer can hold a full rollout batch.
+    # With 16384 envs x 32 steps_per_iter = 524k samples, but default buffer is 200k.
+    import learning.experience_buffer as experience_buffer_mod
+    min_disc_buf = per_rank_envs * agent._config["steps_per_iter"]
+    if agent._disc_buffer._buffer_length < min_disc_buf:
+        new_size = min_disc_buf * 2  # 2x headroom
+        if is_root:
+            print(f"  [Fix] Expanding disc_buffer: {agent._disc_buffer._buffer_length} -> {new_size} "
+                  f"(need >= {min_disc_buf} for {per_rank_envs} envs x {agent._config['steps_per_iter']} steps)")
+        agent._disc_buffer = experience_buffer_mod.ExperienceBuffer(
+            buffer_length=new_size, batch_size=1, device=device)
+
     # Initial reward weights: pure style learning (ramp handles transition)
     agent._task_reward_weight = 0.0
     agent._disc_reward_weight = 1.0
