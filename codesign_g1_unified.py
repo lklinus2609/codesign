@@ -603,7 +603,7 @@ class InnerLoopController:
                         wlog["inner/disc_reward_weight"] = agent._disc_reward_weight
 
                         if wlog:
-                            wandb.log(wlog)
+                            wandb.log(wlog, step=agent._iter)
 
                     # Video capture every video_interval iterations
                     if (self.use_wandb and self.viewer is not None
@@ -616,7 +616,7 @@ class InnerLoopController:
                             if video is not None:
                                 wandb.log({"inner/video": wandb.Video(
                                     video, fps=30, format="mp4",
-                                )})
+                                )}, step=agent._iter)
                         except Exception as e:
                             print(f"  [Inner Loop] Video logging failed: {e}")
 
@@ -1235,6 +1235,12 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                   f"x {num_procs} GPUs)...")
         t0 = time.time()
 
+        if use_wandb:
+            wandb.log({
+                "outer/iteration": outer_iter + 1,
+                "outer/boundary": 1,
+            }, step=agent._iter)
+
         try:
             converged, disc_rewards = inner_ctrl.train_until_converged(
                 iter_dir
@@ -1374,7 +1380,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     log_dict[f"outer/grad_{name}"] = grad_theta[i]
                 if disc_rewards:
                     log_dict["outer/final_disc_reward"] = disc_rewards[-1]
-                wandb.log(log_dict)
+                wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
                 wandb.save(str(iter_dir / "model.pt"), base_path=str(out_dir))
