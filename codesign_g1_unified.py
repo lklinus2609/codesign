@@ -392,6 +392,7 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
     joints_per_world = model.joint_count // num_worlds
     joint_X_p_np = model.joint_X_p.numpy()
 
+    world_indices = np.arange(num_worlds)
     for i, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
         angle = float(theta_np[i])
         delta_q = quat_from_x_rotation(angle)
@@ -401,10 +402,9 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
             base_q = base_quats_dict[body_name]
             new_q = quat_normalize(quat_multiply(delta_q, base_q))  # (w,x,y,z)
             local_idx = joint_idx_map[body_name]
-            for w in range(num_worlds):
-                global_idx = w * joints_per_world + local_idx
-                # Convert wxyz → xyzw for joint_X_p numpy layout
-                joint_X_p_np[global_idx, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
+            global_indices = world_indices * joints_per_world + local_idx
+            # Convert wxyz → xyzw for joint_X_p numpy layout
+            joint_X_p_np[global_indices, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
 
     model.joint_X_p.assign(joint_X_p_np)
     wp.synchronize()
@@ -649,195 +649,8 @@ class InnerLoopController:
 
 
 # ---------------------------------------------------------------------------
-# Closed-loop FD rollout + distributed gradient
+# World-partitioned FD gradient
 # ---------------------------------------------------------------------------
-
-def run_closed_loop_rollout(agent, env, engine, char_id, total_mass,
-                            theta_np, base_quats_dict, joint_idx_map,
-                            num_worlds, num_eval_worlds, horizon, seed):
-    """Run frozen policy closed-loop on a morphology with given seed.
-
-    Applies the morphology, seeds RNG, resets env, then runs the policy
-    for `horizon` steps accumulating its own power/velocity metrics
-    (independent of EpisodeCoTTracker).
-
-    Returns (cot, fwd_dist) computed over first num_eval_worlds envs.
-    """
-    sim_model = engine._sim_model
-
-    # Apply morphology
-    update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
-                              joint_idx_map, num_worlds)
-
-    # Seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed % (2**32))
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-
-    # Reset and record initial state
-    agent.eval()
-    agent.set_mode(base_agent_mod.AgentMode.TEST)
-    obs, info = env.reset()
-
-    initial_root_x = engine.get_root_pos(char_id)[:num_eval_worlds, 0].clone()
-
-    # Accumulators for CoT computation
-    device = initial_root_x.device
-    power_sum = torch.zeros(num_eval_worlds, device=device)
-    vel_sum = torch.zeros(num_eval_worlds, device=device)
-    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
-
-    with torch.no_grad():
-        for _ in range(horizon):
-            action, _ = agent._decide_action(obs, info)
-            obs, reward, done, info = env.step(action)
-
-            # Accumulate power and velocity for first num_eval_worlds envs
-            dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
-            dof_vel = engine.get_dof_vel(char_id)
-            root_vel = engine.get_root_vel(char_id)
-
-            power = torch.sum(
-                torch.abs(dof_forces[:num_eval_worlds, :_LOCO_DOFS]
-                          * dof_vel[:num_eval_worlds, :_LOCO_DOFS]),
-                dim=-1,
-            )
-            power_sum += power
-            vel_sum += root_vel[:num_eval_worlds, 0]
-
-    agent.set_mode(base_agent_mod.AgentMode.TRAIN)
-
-    # Compute metrics
-    final_root_x = engine.get_root_pos(char_id)[:num_eval_worlds, 0].clone()
-    fwd_dist = (final_root_x - initial_root_x).mean().item()
-
-    steps_f = float(horizon)
-    mean_power = power_sum / steps_f
-    mean_vel = vel_sum / steps_f
-    # Soft clamp: sqrt(v^2 + 0.01) ≈ |v| when |v| >> 0.1, ≈ 0.1 when v → 0
-    # Smooth everywhere (no discontinuous derivative at the clamp boundary)
-    safe_vel = torch.sqrt(mean_vel ** 2 + 0.01)
-    cot_per_env = mean_power / (total_mass * 9.81 * safe_vel)
-    cot = cot_per_env.mean().item()
-
-    return cot, fwd_dist
-
-
-def _compute_fd_gradient_sequential(agent, env, engine, char_id, total_mass,
-                                     theta_np, base_quats_dict, joint_idx_map,
-                                     num_worlds, num_eval_worlds, horizon,
-                                     rank, num_procs, device, param_names,
-                                     num_seeds=10, base_seed=42,
-                                     eps=0.05, vel_reward_weight=0.1):
-    """Compute closed-loop FD gradient with paired-seed averaging.
-
-    Runs the frozen policy closed-loop on each perturbed morphology for
-    K seeds, then computes paired-seed central FD:
-        grad[i] = mean_k[ (reward(θ+ε, seed_k) - reward(θ-ε, seed_k)) ] / (2ε)
-
-    Rollout indexing:
-        perturbation_idx: 0 = center, 2*i+1 = param i +eps, 2*i+2 = param i -eps
-        flat_idx = perturbation_idx * num_seeds + seed_idx
-        Total = (1 + 2*n_params) * num_seeds rollouts
-
-    Each rank runs rollouts assigned by round-robin. Results combined via
-    all_reduce(SUM). Original morphology restored after all rollouts.
-
-    Returns (grad, fwd_dist_center, cot_center) on all ranks.
-    """
-    n_params = len(theta_np)
-    n_perturbations = 1 + 2 * n_params  # center + 2 per param
-    total_rollouts = n_perturbations * num_seeds
-
-    # Tensors to collect CoT and fwd_dist; each rank fills its assigned slots
-    cot_all = torch.zeros(total_rollouts, dtype=torch.float64, device=device)
-    dist_all = torch.zeros(total_rollouts, dtype=torch.float64, device=device)
-
-    my_indices = list(range(rank, total_rollouts, num_procs))
-
-    if rank == 0:
-        print(f"    [FD-dist] {total_rollouts} rollouts ({n_perturbations} perturbations "
-              f"x {num_seeds} seeds) across {num_procs} GPUs "
-              f"({len(my_indices)} on rank 0)")
-
-    for flat_idx in my_indices:
-        pert_idx = flat_idx // num_seeds
-        seed_idx = flat_idx % num_seeds
-        seed = base_seed + seed_idx
-
-        if pert_idx == 0:
-            # Center rollout
-            theta_pert = theta_np.copy()
-        else:
-            param_i = (pert_idx - 1) // 2
-            is_plus = (pert_idx % 2 == 1)
-            theta_pert = theta_np.copy()
-            theta_pert[param_i] += eps if is_plus else -eps
-
-        cot, fwd_dist = run_closed_loop_rollout(
-            agent, env, engine, char_id, total_mass,
-            theta_pert, base_quats_dict, joint_idx_map,
-            num_worlds, num_eval_worlds, horizon, seed,
-        )
-        cot_all[flat_idx] = cot
-        dist_all[flat_idx] = fwd_dist
-
-    # Combine results across ranks
-    if num_procs > 1:
-        torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(dist_all, op=torch.distributed.ReduceOp.SUM)
-
-    # Restore original morphology
-    sim_model = engine._sim_model
-    update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
-                              joint_idx_map, num_worlds)
-
-    # Reshape to (n_perturbations, num_seeds)
-    cot_np = cot_all.cpu().numpy().reshape(n_perturbations, num_seeds)
-    dist_np = dist_all.cpu().numpy().reshape(n_perturbations, num_seeds)
-
-    # Center metrics (mean over seeds)
-    cot_center = float(np.mean(cot_np[0]))
-    fwd_dist_center = float(np.mean(dist_np[0]))
-
-    # Compute paired-seed FD gradient
-    # reward = -CoT + vel_reward_weight * fwd_dist
-    reward_all = -cot_np + vel_reward_weight * dist_np  # (n_perturbations, num_seeds)
-
-    grad = np.zeros(n_params, dtype=np.float64)
-    grad_stderr = np.zeros(n_params, dtype=np.float64)
-    for i in range(n_params):
-        reward_plus = reward_all[2 * i + 1]   # (num_seeds,)
-        reward_minus = reward_all[2 * i + 2]  # (num_seeds,)
-        diffs = (reward_plus - reward_minus) / (2 * eps)  # (num_seeds,)
-
-        # Check for NaN in any seed
-        valid = ~np.isnan(diffs)
-        if valid.sum() > 0:
-            grad[i] = np.mean(diffs[valid])
-            if valid.sum() > 1:
-                grad_stderr[i] = np.std(diffs[valid], ddof=1) / np.sqrt(valid.sum())
-        else:
-            grad[i] = 0.0
-
-    grad = np.clip(grad, -10.0, 10.0)
-
-    if rank == 0:
-        print(f"    [FD] Center (mean over {num_seeds} seeds): "
-              f"fwd_dist={fwd_dist_center:.4f} m, CoT={cot_center:.4f}")
-        for i, name in enumerate(param_names):
-            cot_plus_mean = float(np.mean(cot_np[2 * i + 1]))
-            cot_minus_mean = float(np.mean(cot_np[2 * i + 2]))
-            dist_plus_mean = float(np.mean(dist_np[2 * i + 1]))
-            dist_minus_mean = float(np.mean(dist_np[2 * i + 2]))
-            print(f"    [FD] param {i} ({name}): "
-                  f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f}, "
-                  f"CoT+={cot_plus_mean:.6f}, CoT-={cot_minus_mean:.6f}, "
-                  f"dist+={dist_plus_mean:.3f}, dist-={dist_minus_mean:.3f}")
-
-    return grad, fwd_dist_center, cot_center
-
 
 def apply_partitioned_morphologies(model, theta_np, eps, n_params,
                                    base_quats_dict, joint_idx_map,
@@ -870,6 +683,7 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
         w_end = (p + 1) * worlds_per_pert
 
         # Write quaternions for this partition's world range
+        world_indices = np.arange(w_start, w_end)
         for i, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
             angle = float(theta_pert[i])
             delta_q = quat_from_x_rotation(angle)
@@ -879,9 +693,9 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
                 base_q = base_quats_dict[body_name]
                 new_q = quat_normalize(quat_multiply(delta_q, base_q))  # (w,x,y,z)
                 local_idx = joint_idx_map[body_name]
-                for w in range(w_start, w_end):
-                    global_idx = w * joints_per_world + local_idx
-                    joint_X_p_np[global_idx, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
+                global_indices = world_indices * joints_per_world + local_idx
+                # Convert wxyz → xyzw for joint_X_p numpy layout
+                joint_X_p_np[global_indices, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
 
     model.joint_X_p.assign(joint_X_p_np)
     wp.synchronize()
@@ -940,9 +754,17 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
         obs, info = env.reset()
         initial_root_x = engine.get_root_pos(char_id)[:, 0].clone()
 
-        # Per-world accumulators (all worlds, all perturbations simultaneously)
+        # Per-world episode-aware accumulators.
+        # On done, we finalize the current episode's CoT and distance,
+        # then reset accumulators so the next episode starts clean.
+        dt_ctrl = 1.0 / 30.0  # control timestep
         power_sum = torch.zeros(num_worlds, device=device)
         vel_sum = torch.zeros(num_worlds, device=device)
+        step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        ep_cot_sum = torch.zeros(num_worlds, device=device)
+        ep_dist_sum = torch.zeros(num_worlds, device=device)
+        ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        seg_start_x = initial_root_x.clone()
 
         with torch.no_grad():
             for _ in range(horizon):
@@ -956,19 +778,51 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                 power = torch.sum(torch.abs(
                     dof_forces[:num_worlds, :_LOCO_DOFS] *
                     dof_vel[:num_worlds, :_LOCO_DOFS]), dim=-1)
-                power_sum += power[:num_worlds]
+                power_sum += power
                 vel_sum += root_vel[:num_worlds, 0]
+                step_count += 1
 
-        final_root_x = engine.get_root_pos(char_id)[:, 0].clone()
+                # Finalize episodes that just ended (env already auto-reset)
+                done_mask = (done[:num_worlds] > 0)
+                if done_mask.any():
+                    di = done_mask.nonzero(as_tuple=True)[0]
+                    vs = step_count[di].float()
+                    valid = vs > 0
+                    if valid.any():
+                        vi = di[valid]
+                        vsc = step_count[vi].float()
+                        mp = power_sum[vi] / vsc
+                        mv = vel_sum[vi] / vsc
+                        safe_v = torch.sqrt(mv ** 2 + 0.01)
+                        ep_cot_sum[vi] += mp / (total_mass * 9.81 * safe_v)
+                        # Can't read pre-reset root_pos (env already reset),
+                        # so integrate velocity: dist = sum(v_i) * dt_ctrl
+                        ep_dist_sum[vi] += vel_sum[vi] * dt_ctrl
+                        ep_count[vi] += 1
+                    power_sum[di] = 0
+                    vel_sum[di] = 0
+                    step_count[di] = 0
+                    seg_start_x[di] = engine.get_root_pos(char_id)[di, 0]
 
-        # Extract per-partition metrics via slicing
+        # Finalize trailing partial episodes (worlds still alive at horizon)
+        alive = step_count > 0
+        if alive.any():
+            ai = alive.nonzero(as_tuple=True)[0]
+            vsc = step_count[ai].float()
+            mp = power_sum[ai] / vsc
+            mv = vel_sum[ai] / vsc
+            safe_v = torch.sqrt(mv ** 2 + 0.01)
+            ep_cot_sum[ai] += mp / (total_mass * 9.81 * safe_v)
+            final_root_x = engine.get_root_pos(char_id)[:, 0]
+            ep_dist_sum[ai] += final_root_x[ai] - seg_start_x[ai]
+            ep_count[ai] += 1
+
+        # Extract per-partition metrics
         for p in range(n_pert):
             s, e = p * wpp, (p + 1) * wpp
-            fwd_dist = (final_root_x[s:e] - initial_root_x[s:e]).mean().item()
-            mp = power_sum[s:e] / float(horizon)
-            mv = vel_sum[s:e] / float(horizon)
-            safe_v = torch.sqrt(mv ** 2 + 0.01)
-            cot = (mp / (total_mass * 9.81 * safe_v)).mean().item()
+            counts = ep_count[s:e].float().clamp(min=1)
+            cot = (ep_cot_sum[s:e] / counts).mean().item()
+            fwd_dist = (ep_dist_sum[s:e] / counts).mean().item()
             cot_all[p, seed_idx] = cot
             dist_all[p, seed_idx] = fwd_dist
 
@@ -1093,14 +947,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     """
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
-
-    # Clamp eval worlds to per-GPU training envs (action collection slices
-    # the first num_eval_worlds actions from the training env).
-    if args.num_eval_worlds > per_rank_envs:
-        if is_root:
-            print(f"  [WARN] --num-eval-worlds ({args.num_eval_worlds}) > "
-                  f"per-GPU envs ({per_rank_envs}), clamping to {per_rank_envs}")
-        args.num_eval_worlds = per_rank_envs
 
     # Explicitly set the CUDA device before any GPU operations.
     # With CUDA_VISIBLE_DEVICES isolation, each process sees one GPU as cuda:0.
@@ -1350,7 +1196,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"Configuration:")
         print(f"  Training envs:     {args.num_train_envs} total "
               f"({per_rank_envs}/GPU x {num_procs} GPUs)")
-        print(f"  Eval worlds:       {args.num_eval_worlds}")
         print(f"  Eval horizon:      {args.eval_horizon} steps "
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner samples: {args.max_inner_samples:,}")
@@ -1362,6 +1207,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  Reward ramp:       disc 1.0→0.0, task 0.0→1.0 "
               f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
         print(f"  FD seeds:          {args.num_fd_seeds} (paired-seed averaging)")
+        print(f"  FD epsilon:        {args.fd_epsilon} rad "
+              f"({np.degrees(args.fd_epsilon):.1f} deg)")
         print(f"  FD vel weight:     {args.vel_reward_weight} "
               f"(reward = -CoT + {args.vel_reward_weight}*dist)")
         print(f"  FD mode:           closed-loop (policy reacts to observations)")
@@ -1431,7 +1278,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             per_rank_envs, args.eval_horizon,
             rank, num_procs, device, param_names,
             num_seeds=args.num_fd_seeds, base_seed=fd_base_seed,
-            eps=0.05, vel_reward_weight=args.vel_reward_weight,
+            eps=args.fd_epsilon, vel_reward_weight=args.vel_reward_weight,
         )
 
         # Clear CoT tracker after FD to prevent pollution of inner loop
@@ -1584,12 +1431,12 @@ if __name__ == "__main__":
     parser.add_argument("--design-lr", type=float, default=0.005)
     parser.add_argument("--num-train-envs", type=int, default=4096,
                         help="Total training envs (divided across GPUs)")
-    parser.add_argument("--num-eval-worlds", type=int, default=1024,
-                        help="Eval worlds for FD rollouts (clamped to per-GPU train envs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
                         help="Eval rollout length in control steps (300 = 10s full episode)")
     parser.add_argument("--num-fd-seeds", type=int, default=10,
                         help="Number of paired seeds per FD perturbation (K)")
+    parser.add_argument("--fd-epsilon", type=float, default=0.05,
+                        help="FD perturbation size in radians (default: 0.05 ~ 2.9 deg)")
     parser.add_argument("--max-inner-samples", type=int, default=2_000_000_000)
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
