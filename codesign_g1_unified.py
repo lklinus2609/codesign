@@ -577,7 +577,7 @@ class InnerLoopController:
                         if self.use_wandb:
                             wandb.save(numbered_path, base_path=str(out_dir))
                             if self.log_file:
-                                wandb.save(self.log_file, policy="live")
+                                wandb.save(self.log_file, base_path=str(out_dir), policy="live")
 
                     # wandb: forward inner loop metrics + CoT
                     if self.use_wandb:
