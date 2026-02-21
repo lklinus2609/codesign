@@ -228,14 +228,14 @@ class EpisodeCoTTracker:
 # ---------------------------------------------------------------------------
 
 def codesign_task_reward(self):
-    """Task reward aligned with outer loop objective: -CoT + w * v_x.
+    """Task reward aligned with outer loop objective: -CoT + w * vel_tracking.
 
     Replaces AMPEnv._update_reward (which is empty by default) so that
     the agent's reward blending picks up a non-zero task_r:
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
 
-    Mirrors the outer loop FD objective (-CoT + vel_reward_weight * fwd_dist)
-    at the per-step level, where fwd_dist ≈ integrated v_x.
+    Uses the same cost function as the outer loop FD objective:
+        reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
@@ -249,8 +249,9 @@ def codesign_task_reward(self):
     safe_v = torch.sqrt(fwd_vel ** 2 + 0.01)
     cot = mech_power / (self._total_mass * 9.81 * safe_v)
 
-    # 2. Forward velocity (matches outer loop's fwd_dist, which is integrated v_x)
-    vel_reward = self._vel_reward_weight * fwd_vel
+    # 2. Velocity tracking: exp(-|v_x - v_cmd|^2 / sigma)
+    vel_tracking = torch.exp(-torch.square(fwd_vel - self._vel_cmd) / self._vel_tracking_sigma)
+    vel_reward = self._vel_reward_weight * vel_tracking
 
     # 3. Termination penalty
     term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
@@ -704,7 +705,8 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   num_worlds, horizon,
                                   rank, num_procs, device, param_names,
                                   num_seeds=10, base_seed=42,
-                                  eps=0.05, vel_reward_weight=0.1):
+                                  eps=0.05, vel_reward_weight=0.1,
+                                  vel_cmd=1.0, vel_tracking_sigma=0.25):
     """Compute closed-loop FD gradient with world-partitioned perturbations.
 
     Instead of running 130 sequential rollouts (13 perturbations x 10 seeds),
@@ -712,10 +714,13 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
     simultaneously. The seed loop (10 iterations) remains sequential.
     Total: 10 rollouts instead of 130 (13x speedup).
 
+    Cost function matches inner loop task reward:
+        reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
 
-    Returns (grad, fwd_dist_center, cot_center) on all ranks.
+    Returns (grad, vel_tracking_center, cot_center) on all ranks.
     """
     n_params = len(theta_np)
     n_pert = 1 + 2 * n_params  # 13 for 6 params
@@ -729,7 +734,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
 
     # Result tensors: (n_pert, num_seeds)
     cot_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
-    dist_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    vel_track_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
@@ -750,19 +755,17 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             torch.cuda.manual_seed(seed)
 
         obs, info = env.reset()
-        initial_root_x = engine.get_root_pos(char_id)[:, 0].clone()
 
         # Per-world episode-aware accumulators.
-        # On done, we finalize the current episode's CoT and distance,
+        # On done, we finalize the current episode's CoT and vel tracking,
         # then reset accumulators so the next episode starts clean.
-        dt_ctrl = 1.0 / 30.0  # control timestep
         power_sum = torch.zeros(num_worlds, device=device)
         vel_sum = torch.zeros(num_worlds, device=device)
+        vel_track_sum = torch.zeros(num_worlds, device=device)
         step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
         ep_cot_sum = torch.zeros(num_worlds, device=device)
-        ep_dist_sum = torch.zeros(num_worlds, device=device)
+        ep_vel_track_sum = torch.zeros(num_worlds, device=device)
         ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
-        seg_start_x = initial_root_x.clone()
 
         with torch.no_grad():
             for _ in range(horizon):
@@ -776,8 +779,10 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                 power = torch.sum(torch.abs(
                     dof_forces[:num_worlds, :_LOCO_DOFS] *
                     dof_vel[:num_worlds, :_LOCO_DOFS]), dim=-1)
+                fwd_vel = root_vel[:num_worlds, 0]
                 power_sum += power
-                vel_sum += root_vel[:num_worlds, 0]
+                vel_sum += fwd_vel
+                vel_track_sum += torch.exp(-torch.square(fwd_vel - vel_cmd) / vel_tracking_sigma)
                 step_count += 1
 
                 # Finalize episodes that just ended (env already auto-reset)
@@ -793,14 +798,12 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                         mv = vel_sum[vi] / vsc
                         safe_v = torch.sqrt(mv ** 2 + 0.01)
                         ep_cot_sum[vi] += mp / (total_mass * 9.81 * safe_v)
-                        # Can't read pre-reset root_pos (env already reset),
-                        # so integrate velocity: dist = sum(v_i) * dt_ctrl
-                        ep_dist_sum[vi] += vel_sum[vi] * dt_ctrl
+                        ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
                         ep_count[vi] += 1
                     power_sum[di] = 0
                     vel_sum[di] = 0
+                    vel_track_sum[di] = 0
                     step_count[di] = 0
-                    seg_start_x[di] = engine.get_root_pos(char_id)[di, 0]
 
         # Finalize trailing partial episodes (worlds still alive at horizon)
         alive = step_count > 0
@@ -811,8 +814,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             mv = vel_sum[ai] / vsc
             safe_v = torch.sqrt(mv ** 2 + 0.01)
             ep_cot_sum[ai] += mp / (total_mass * 9.81 * safe_v)
-            final_root_x = engine.get_root_pos(char_id)[:, 0]
-            ep_dist_sum[ai] += final_root_x[ai] - seg_start_x[ai]
+            ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
             ep_count[ai] += 1
 
         # Extract per-partition metrics
@@ -820,18 +822,18 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             s, e = p * wpp, (p + 1) * wpp
             counts = ep_count[s:e].float().clamp(min=1)
             cot = (ep_cot_sum[s:e] / counts).mean().item()
-            fwd_dist = (ep_dist_sum[s:e] / counts).mean().item()
+            vt = (ep_vel_track_sum[s:e] / counts).mean().item()
             cot_all[p, seed_idx] = cot
-            dist_all[p, seed_idx] = fwd_dist
+            vel_track_all[p, seed_idx] = vt
 
     agent.set_mode(base_agent_mod.AgentMode.TRAIN)
 
     # Multi-GPU: average across ranks
     if num_procs > 1:
         torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(dist_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
         cot_all /= num_procs
-        dist_all /= num_procs
+        vel_track_all /= num_procs
 
     # Restore original morphology
     update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
@@ -839,14 +841,14 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
 
     # Gradient computation (same math as sequential version)
     cot_np = cot_all.cpu().numpy()
-    dist_np = dist_all.cpu().numpy()
+    vt_np = vel_track_all.cpu().numpy()
 
     # Center metrics (mean over seeds)
     cot_center = float(np.mean(cot_np[0]))
-    fwd_dist_center = float(np.mean(dist_np[0]))
+    vel_track_center = float(np.mean(vt_np[0]))
 
-    # reward = -CoT + vel_reward_weight * fwd_dist
-    reward_all = -cot_np + vel_reward_weight * dist_np  # (n_pert, num_seeds)
+    # reward = -CoT + vel_reward_weight * vel_tracking
+    reward_all = -cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
 
     grad = np.zeros(n_params, dtype=np.float64)
     grad_stderr = np.zeros(n_params, dtype=np.float64)
@@ -867,18 +869,18 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
 
     if rank == 0:
         print(f"    [FD] Center (mean over {num_seeds} seeds): "
-              f"fwd_dist={fwd_dist_center:.4f} m, CoT={cot_center:.4f}")
+              f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}")
         for i, name in enumerate(param_names):
             cot_plus_mean = float(np.mean(cot_np[2 * i + 1]))
             cot_minus_mean = float(np.mean(cot_np[2 * i + 2]))
-            dist_plus_mean = float(np.mean(dist_np[2 * i + 1]))
-            dist_minus_mean = float(np.mean(dist_np[2 * i + 2]))
+            vt_plus_mean = float(np.mean(vt_np[2 * i + 1]))
+            vt_minus_mean = float(np.mean(vt_np[2 * i + 2]))
             print(f"    [FD] param {i} ({name}): "
                   f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f}, "
                   f"CoT+={cot_plus_mean:.6f}, CoT-={cot_minus_mean:.6f}, "
-                  f"dist+={dist_plus_mean:.3f}, dist-={dist_minus_mean:.3f}")
+                  f"vt+={vt_plus_mean:.4f}, vt-={vt_minus_mean:.4f}")
 
-    return grad, fwd_dist_center, cot_center
+    return grad, vel_track_center, cot_center
 
 
 # ---------------------------------------------------------------------------
@@ -1114,6 +1116,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # Set task reward attributes (used by codesign_task_reward, bound earlier)
     env._total_mass = total_mass
     env._vel_reward_weight = args.vel_reward_weight
+    env._vel_cmd = args.vel_cmd
+    env._vel_tracking_sigma = args.vel_tracking_sigma
 
     # Episode-averaged CoT tracker (hooked into _post_physics_step)
     env._cot_tracker = EpisodeCoTTracker(per_rank_envs, total_mass, device)
@@ -1186,7 +1190,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
     history = {
         "theta": [theta.copy()],
-        "forward_dist": [],
+        "vel_tracking": [],
         "cot": [],
         "gradients": [],
         "inner_times": [],
@@ -1210,8 +1214,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  FD seeds:          {args.num_fd_seeds} (paired-seed averaging)")
         print(f"  FD epsilon:        {args.fd_epsilon} rad "
               f"({np.degrees(args.fd_epsilon):.1f} deg)")
-        print(f"  FD vel weight:     {args.vel_reward_weight} "
-              f"(reward = -CoT + {args.vel_reward_weight}*dist)")
+        print(f"  Vel reward weight: {args.vel_reward_weight} "
+              f"(reward = -CoT + {args.vel_reward_weight}*exp(-|v-{args.vel_cmd}|^2/{args.vel_tracking_sigma}))")
         print(f"  FD mode:           closed-loop (policy reacts to observations)")
 
     # =========================================================
@@ -1278,13 +1282,14 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
         fd_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, fwd_dist, cot = compute_fd_gradient_parallel(
+        grad_theta, vel_track, cot = compute_fd_gradient_parallel(
             agent, env, engine, char_id, total_mass,
             theta.copy(), base_quats_dict, joint_idx_map,
             per_rank_envs, args.eval_horizon,
             rank, num_procs, device, param_names,
             num_seeds=args.num_fd_seeds, base_seed=fd_base_seed,
             eps=args.fd_epsilon, vel_reward_weight=args.vel_reward_weight,
+            vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
         )
 
         # Clear CoT tracker after FD to prevent pollution of inner loop
@@ -1295,10 +1300,10 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             print(f"    FD gradients:")
             for i, name in enumerate(param_names):
                 print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
-            print(f"    Forward distance = {fwd_dist:.3f} m")
+            print(f"    Vel tracking = {vel_track:.4f}")
             print(f"    Cost of Transport = {cot:.4f}")
 
-            history["forward_dist"].append(fwd_dist)
+            history["vel_tracking"].append(vel_track)
             history["cot"].append(cot)
             history["gradients"].append(grad_theta.copy())
 
@@ -1369,7 +1374,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             if use_wandb:
                 log_dict = {
                     "outer/iteration": outer_iter + 1,
-                    "outer/eval_forward_distance": fwd_dist,
+                    "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
@@ -1406,9 +1411,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                   f"({np.degrees(initial[i]):+.2f} -> "
                   f"{np.degrees(final[i]):+.2f} deg)")
 
-        if history["forward_dist"]:
-            print(f"\nForward distance: {history['forward_dist'][0]:.3f} -> "
-                  f"{history['forward_dist'][-1]:.3f} m")
+        if history["vel_tracking"]:
+            print(f"\nVel tracking: {history['vel_tracking'][0]:.4f} -> "
+                  f"{history['vel_tracking'][-1]:.4f}")
         if history["cot"]:
             print(f"Cost of Transport: {history['cot'][0]:.4f} -> "
                   f"{history['cot'][-1]:.4f}")
@@ -1465,8 +1470,12 @@ if __name__ == "__main__":
     parser.add_argument("--post-kickoff-min-iters", type=int, default=100,
                         help="Min inner iters for convergence after first outer iter")
     parser.add_argument("--vel-reward-weight", type=float, default=0.1,
-                        help="Weight for forward distance in outer loop FD objective "
-                             "(reward = -CoT + w * fwd_dist)")
+                        help="Weight for velocity tracking in cost function "
+                             "(reward = -CoT + w * exp(-|v-v_cmd|^2/sigma))")
+    parser.add_argument("--vel-cmd", type=float, default=1.0,
+                        help="Target forward velocity for velocity tracking (m/s)")
+    parser.add_argument("--vel-tracking-sigma", type=float, default=0.25,
+                        help="Sigma for Gaussian velocity tracking reward")
     parser.add_argument("--no-video", action="store_true",
                         help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
