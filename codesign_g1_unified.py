@@ -627,6 +627,11 @@ class InnerLoopController:
                         except Exception as e:
                             print(f"  [Inner Loop] Video logging failed: {e}")
 
+                # Barrier: resync all ranks after root-only I/O (wandb, video,
+                # checkpoint) to prevent NCCL collective timeout from drift.
+                if mp_util.enable_mp():
+                    torch.distributed.barrier()
+
                 if should_stop:
                     if self.is_root:
                         recent = convergence_values[-self.plateau_window:]
