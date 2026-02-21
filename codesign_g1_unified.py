@@ -101,7 +101,6 @@ import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import learning.base_agent as base_agent_mod
 import envs.base_env as base_env_mod
-import util.torch_util as torch_util
 
 # NOTE: MimicKit's newton_engine.py sets wp.config.enable_backward = False.
 # With closed-loop FD (no BPTT), we never need backward mode enabled.
@@ -229,47 +228,34 @@ class EpisodeCoTTracker:
 # ---------------------------------------------------------------------------
 
 def codesign_task_reward(self):
-    """Morphology-agnostic task reward for co-design inner loop.
+    """Task reward aligned with outer loop objective: -CoT + w * v_x.
 
     Replaces AMPEnv._update_reward (which is empty by default) so that
     the agent's reward blending picks up a non-zero task_r:
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
+
+    Mirrors the outer loop FD objective (-CoT + vel_reward_weight * fwd_dist)
+    at the per-step level, where fwd_dist ≈ integrated v_x.
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
-    root_rot = self._engine.get_root_rot(char_id)   # (num_envs, 4) xyzw
-
-    # 1. Velocity tracking: exp(-|v_x - 1.0|^2 / 0.25)
     fwd_vel = root_vel[:, 0]
-    vel_reward = torch.exp(-torch.square(fwd_vel - 1.0) / 0.25)
 
-    # 2. Orientation penalty: -||projected_gravity_xy||^2
-    #    Rotate world gravity (0,0,-1) into body frame via inverse rotation
-    gravity = torch.zeros(3, device=root_rot.device, dtype=root_rot.dtype)
-    gravity[2] = -1.0
-    gravity = gravity.unsqueeze(0).expand(root_rot.shape[0], -1)
-    inv_rot = torch_util.quat_conjugate(root_rot)
-    projected_gravity = torch_util.quat_rotate(inv_rot, gravity)
-    orientation_penalty = -torch.sum(torch.square(projected_gravity[:, :2]), dim=-1)
-
-    # 3. Alive bonus
-    alive = 0.1
-
-    # 4. Termination penalty
-    term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
-
-    # 5. Mechanical power penalty: aligns inner loop with outer loop CoT objective
-    #    power = sum(|tau * dof_vel|) over legs + torso only (DoFs 0-14)
+    # 1. Per-step CoT: power / (m * g * safe_v)
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
     dof_forces = EpisodeCoTTracker.get_dof_forces_safe(self._engine, char_id)
     dof_vel = self._engine.get_dof_vel(char_id)
-    dof_forces = dof_forces[:, :_LOCO_DOFS]
-    dof_vel = dof_vel[:, :_LOCO_DOFS]
-    mech_power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
-    power_penalty = -self._power_penalty_weight * mech_power
+    mech_power = torch.sum(torch.abs(dof_forces[:, :_LOCO_DOFS] * dof_vel[:, :_LOCO_DOFS]), dim=-1)
+    safe_v = torch.sqrt(fwd_vel ** 2 + 0.01)
+    cot = mech_power / (self._total_mass * 9.81 * safe_v)
 
-    self._reward_buf[:] = (vel_reward + orientation_penalty + alive
-                           + term_penalty + power_penalty)
+    # 2. Forward velocity (matches outer loop's fwd_dist, which is integrated v_x)
+    vel_reward = self._vel_reward_weight * fwd_vel
+
+    # 3. Termination penalty
+    term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
+
+    self._reward_buf[:] = -cot + vel_reward + term_penalty
 
 
 def _make_post_physics_hook(original_fn, char_id):
@@ -535,7 +521,7 @@ class InnerLoopController:
                 # since the changing reward landscape invalidates plateau detection)
                 if self.ramp_completed:
                     if self.convergence_signal == 'task_reward':
-                        cv = train_info.get("mean_return")
+                        cv = train_info.get("task_reward_mean")
                         if cv is not None:
                             convergence_values.append(float(cv))
                     elif self.convergence_signal == 'disc_reward':
@@ -1082,7 +1068,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             per_rank_envs, device, visualize=False,
         )
     # Monkey-patch task reward onto env (replaces empty _update_reward)
-    env._power_penalty_weight = args.power_penalty_weight
     env._update_reward = types.MethodType(codesign_task_reward, env)
 
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
@@ -1125,6 +1110,10 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     )
     if is_root:
         print(f"  Robot mass: {total_mass:.2f} kg")
+
+    # Set task reward attributes (used by codesign_task_reward, bound earlier)
+    env._total_mass = total_mass
+    env._vel_reward_weight = args.vel_reward_weight
 
     # Episode-averaged CoT tracker (hooked into _post_physics_step)
     env._cot_tracker = EpisodeCoTTracker(per_rank_envs, total_mass, device)
@@ -1224,7 +1213,6 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  FD vel weight:     {args.vel_reward_weight} "
               f"(reward = -CoT + {args.vel_reward_weight}*dist)")
         print(f"  FD mode:           closed-loop (policy reacts to observations)")
-        print(f"  Power penalty:     {args.power_penalty_weight}")
 
     # =========================================================
     # Outer loop
@@ -1483,9 +1471,6 @@ if __name__ == "__main__":
                         help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
                         help="Log video to wandb every N inner iterations")
-    parser.add_argument("--power-penalty-weight", type=float, default=0.0005,
-                        help="Weight for mechanical power penalty in task reward "
-                             "(aligns inner loop with outer loop CoT objective)")
     # Multi-GPU arguments
     parser.add_argument("--devices", nargs="+", default=None,
                         help="CUDA devices (default: auto-detect all GPUs)")
