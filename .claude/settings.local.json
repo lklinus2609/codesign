@@ -18,7 +18,17 @@
       "WebSearch",
       "Bash(ls -la \"C:\\\\Users\\\\linus\\\\Desktop\\\\codesign\\\\codesign\\\\config\"\" 2>/dev/null || ls -la \"C:UserslinusDesktopcodesigncodesignconfig* \")",
       "WebFetch(domain:nvidia.github.io)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(findstr:*)",
+      "Bash(pip show:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(stat:*)",
+      "Bash(ls:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(git status:*)"
     ]
   }
 }

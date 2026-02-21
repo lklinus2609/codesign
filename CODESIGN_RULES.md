@@ -25,16 +25,17 @@ This document is the **single source of truth** for coding decisions, style conv
 
 **Project Name**: PGHC (Performance-Gated Hybrid Co-Design)
 
-**Purpose**: Morphology and control co-optimization for humanoid robots using differentiable physics.
+**Purpose**: Morphology and control co-optimization for humanoid robots.
 
 **Core Algorithm**: Algorithm 1 from the thesis - a two-loop optimization:
 - **Inner Loop**: PPO + AMP for policy learning (MimicKit)
-- **Outer Loop**: Gradient-based morphology optimization via BPTT (Newton)
+- **Outer Loop**: Gradient-based morphology optimization via closed-loop finite differences
+  (BPTT was abandoned due to technical limitations — see Decision Log)
 
 **Key Dependencies**:
 | Dependency | Purpose | Location |
 |------------|---------|----------|
-| Newton | Differentiable physics (Warp-based) | `../newton/` |
+| Newton | Physics simulation (Warp-based) | `../newton/` |
 | MimicKit | AMP implementation + training infra | `../MimicKit/` |
 | PyTorch | Neural networks, autograd | pip |
 | Warp | GPU-accelerated simulation | pip (via Newton) |
@@ -67,9 +68,9 @@ codesign/                          # Repository root
 │   ├── codesign_cartpole_newton_vec.py  # Level 1.5: Vectorized Newton PGHC
 │   ├── codesign_ant.py                  # Level 2: PGHC for Ant morphology
 │   ├── codesign_walker2d.py             # Level 2.1: Walker2D with FD gradients
-│   ├── codesign_walker2d_diff.py        # Level 2.2: Walker2D with BPTT gradients
-│   ├── codesign_g1_unified.py           # Level 3u: G1 unified single-process
-│   ├── g1_eval_worker.py               # Level 3u: DiffG1Eval BPTT worker
+│   ├── codesign_walker2d_diff.py        # Level 2.2: Walker2D with BPTT gradients (legacy)
+│   ├── codesign_g1_unified.py           # Level 3u: G1 unified single-process (FD outer loop)
+│   ├── g1_eval_worker.py               # Level 3u: DiffG1Eval worker (legacy BPTT, unused)
 │   ├── g1_mjcf_modifier.py             # Level 3u: MJCF body-quat modifier
 │   │
 │   ├── # === TESTING ===
@@ -169,14 +170,14 @@ codesign/                          # Repository root
 def compute_gradient(
     model: ParametricModel,
     trajectory: Trajectory,
-    horizon: int = 3,
+    horizon: int = 300,
 ) -> torch.Tensor:
-    """Compute morphology gradient via BPTT.
+    """Compute morphology gradient via closed-loop finite differences.
 
     Args:
         model: Parametric model with design parameters.
         trajectory: Rollout trajectory for gradient computation.
-        horizon: Number of timesteps for BPTT.
+        horizon: Number of timesteps for FD eval rollouts.
 
     Returns:
         Gradient tensor with shape (num_design_params,).
@@ -223,7 +224,7 @@ Map thesis notation to code variables consistently:
 | phi | `policy_params` | Policy network weights |
 | beta | `design_lr` | Design learning rate |
 | xi | `trust_region_threshold` | Trust region threshold |
-| H | `diff_horizon` | BPTT horizon |
+| H | `eval_horizon` | FD eval rollout horizon |
 | W | `stability_window` | Moving average window |
 | J(theta) | `objective` / `loss` | Outer loop objective |
 | D | `improvement` | Performance change |
@@ -402,16 +403,16 @@ Level 2.1: Walker2D (Newton/Warp, FD)                [CREATED]
     └── Finite-difference gradients
     Code: envs/walker2d/, codesign_walker2d.py
 
-Level 2.2: Walker2D (Newton/Warp, BPTT)              [CREATED]
-    ├── BPTT gradients via wp.Tape()
+Level 2.2: Walker2D (Newton/Warp, BPTT)              [CREATED - legacy]
+    ├── BPTT gradients via wp.Tape() (abandoned due to contact instability)
     └── GPU-resident (zero CPU-GPU transfers)
     Code: envs/walker2d/, codesign_walker2d_diff.py
 
-Level 3u: G1 Humanoid (unified single-process)       [GPU VALIDATION]
-    ├── Full system with BPTT outer loop
+Level 3u: G1 Humanoid (unified single-process)       [ACTIVE]
+    ├── Closed-loop FD outer loop (adopted due to BPTT limitations)
     ├── MimicKit AMP inner loop (library import)
-    └── body_q→joint_q migration for dtype safety
-    Code: codesign_g1_unified.py, g1_eval_worker.py
+    └── Paired-seed averaging, distributed across GPUs
+    Code: codesign_g1_unified.py
 ```
 
 ### Gate Criteria
@@ -424,7 +425,7 @@ Level 3u: G1 Humanoid (unified single-process)       [GPU VALIDATION]
 | 1 | Finds pole length within 20% of analytical optimum | PASS |
 | 1.5 | Newton cart-pole trains and converges with PGHC | PASS |
 | 2 | Ant achieves stable locomotion with measurable morphology change | PENDING |
-| 3 | G1 humanoid runs with differentiable outer loop | BLOCKED |
+| 3 | G1 humanoid runs with FD outer loop | ACTIVE |
 
 See `VERIFICATION_PLAN.md` for detailed test procedures.
 
@@ -567,23 +568,28 @@ Record significant technical decisions here with date and rationale.
 
 ---
 
-### 2026-02-04: Separate Inner/Outer Loop Models
+### 2026-02-04: Separate Inner/Outer Loop Models — SUPERSEDED
 
 **Decision**: Use two separate physics models - MuJoCo for inner loop, SemiImplicit for outer loop.
 
 **Rationale**: Inner loop needs stable, fast simulation. Outer loop needs differentiability. Sync `joint_X_p` between them after each outer loop update.
 
-**Code**: `hybrid_agent.py: _sync_design_to_inner_model()`
+**Superseded by**: 2026-02-19 — BPTT abandoned; single MuJoCo model used for both inner loop
+training and FD eval rollouts in `codesign_g1_unified.py`.
+
+**Code**: `hybrid_agent.py: _sync_design_to_inner_model()` (legacy)
 
 ---
 
-### 2026-02-01: Short Differentiable Horizon (H=3)
+### 2026-02-01: Short Differentiable Horizon (H=3) — SUPERSEDED
 
 **Decision**: Limit BPTT horizon to 3 timesteps.
 
 **Rationale**: SolverSemiImplicit has numerical instability with ground contact forces. Robot makes contact around step 3-4, causing NaN gradients.
 
-**Code**: `config/hybrid_g1_agent.yaml: diff_horizon: 3`
+**Superseded by**: 2026-02-19 decision to abandon BPTT entirely in favor of FD.
+
+**Code**: `config/hybrid_g1_agent.yaml: diff_horizon: 3` (no longer used)
 
 ---
 
@@ -647,6 +653,26 @@ Record significant technical decisions here with date and rationale.
 
 ---
 
+### 2026-02-19: Adopt Finite Differences Over BPTT for Outer Loop
+
+**Decision**: Replace BPTT with closed-loop finite differences for outer loop morphology gradients.
+
+**Rationale**: BPTT through physics is blocked by multiple technical limitations:
+1. Newton/Warp `SolverSemiImplicit` contact forces explode after ~3 simulation steps (NaN gradients on ground contact), making full-episode BPTT impossible
+2. Newton/Warp `SolverMuJoCo` (used by MimicKit inner loop) is not differentiable at all
+3. MJX `mjx.step` does not propagate gradients through model parameters (constraint solver/contact Jacobian not differentiable w.r.t. body_quat)
+
+Closed-loop FD avoids all these issues: the frozen policy is evaluated on perturbed morphologies using the same non-differentiable solver, with paired-seed central differences for variance reduction.
+
+**Alternatives Considered**:
+- BPTT with short horizon (≤3 steps) — only captures pre-contact dynamics, not useful for locomotion
+- Implicit differentiation through contact — research-level, not available in Newton/MJX
+- Randomized smoothing — adds noise, unclear benefit
+
+**Code**: `codesign_g1_unified.py: compute_fd_gradient_distributed()`
+
+---
+
 ### Template for New Decisions
 
 ```markdown
@@ -692,7 +718,7 @@ python train_hybrid.py --resume output/hybrid_g1/model.pt
 | `design_lr` | 0.005 (Adam) | Level 2 (Ant) |
 | `num_eval_worlds` | 512 | Level 2 (Ant) |
 | `desired_kl` | 0.005 | Level 1.5 (Newton) |
-| `diff_horizon` | 3 | Level 3 (G1 Humanoid) |
+| `eval_horizon` | 300 | Level 3 (G1 Humanoid, FD rollouts) |
 
 ### TensorBoard Metrics to Watch
 

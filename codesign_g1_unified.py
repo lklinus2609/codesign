@@ -422,7 +422,7 @@ class InnerLoopController:
     """
 
     def __init__(self, agent, plateau_threshold=0.02, plateau_window=5,
-                 min_plateau_outputs=10, max_samples=200_000_000,
+                 min_plateau_outputs=10, max_inner_iters=10000,
                  min_inner_iters=0,
                  convergence_signal='task_reward',
                  ramp_start_iter=1000, ramp_end_iter=2500,
@@ -434,7 +434,7 @@ class InnerLoopController:
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
         self.min_plateau_outputs = min_plateau_outputs
-        self.max_samples = max_samples
+        self.max_inner_iters = max_inner_iters
         self.min_inner_iters = min_inner_iters
         self.convergence_signal = convergence_signal
         self.ramp_start_iter = ramp_start_iter
@@ -462,7 +462,7 @@ class InnerLoopController:
         return (spread / abs(mean_val)) < self.plateau_threshold
 
     def train_until_converged(self, out_dir):
-        """Run inner training loop until convergence or sample cap.
+        """Run inner training loop until convergence or iteration cap.
 
         Convergence is detected when the configured signal (task_reward or
         disc_reward) plateaus at output iterations.  Default is task_reward
@@ -487,6 +487,13 @@ class InnerLoopController:
         agent._init_train()
         agent._iter = saved_iter  # restore so wandb x-axis is monotonic
 
+        # Restore reward weights after _init_train() which may reset them.
+        # When the ramp has completed, we must stay at pure task reward;
+        # otherwise the ramp logic below will set them on the first iteration.
+        if self.ramp_completed:
+            agent._task_reward_weight = 1.0
+            agent._disc_reward_weight = 0.0
+
         disc_rewards = []
         convergence_values = []
         converged = False
@@ -494,7 +501,7 @@ class InnerLoopController:
         test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
         inner_iters = 0
 
-        while agent._sample_count < self.max_samples:
+        while inner_iters < self.max_inner_iters:
             train_info = agent._train_iter()                      # COLLECTIVE
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
 
@@ -643,7 +650,7 @@ class InnerLoopController:
         if self.is_root:
             agent.save(checkpoint_path)
             if not converged:
-                print(f"    [Inner] Sample cap reached ({agent._sample_count:,})")
+                print(f"    [Inner] Iteration cap reached ({inner_iters} iters)")
 
         return converged, disc_rewards
 
@@ -1157,7 +1164,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         plateau_threshold=args.plateau_threshold,
         plateau_window=args.plateau_window,
         min_plateau_outputs=args.min_plateau_outputs,
-        max_samples=args.max_inner_samples,
+        max_inner_iters=args.max_inner_iters,
         min_inner_iters=args.kickoff_min_iters,  # first outer iter; reset to 0 after
         ramp_start_iter=args.ramp_start_iter,
         ramp_end_iter=args.ramp_end_iter,
@@ -1198,7 +1205,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
               f"({per_rank_envs}/GPU x {num_procs} GPUs)")
         print(f"  Eval horizon:      {args.eval_horizon} steps "
               f"({args.eval_horizon / 30:.1f}s)")
-        print(f"  Max inner samples: {args.max_inner_samples:,}")
+        print(f"  Max inner iters:   {args.max_inner_iters}")
         print(f"  Design optimizer:  Adam (lr={args.design_lr})")
         print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
         print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
@@ -1443,7 +1450,8 @@ if __name__ == "__main__":
                         help="Number of paired seeds per FD perturbation (K)")
     parser.add_argument("--fd-epsilon", type=float, default=0.05,
                         help="FD perturbation size in radians (default: 0.05 ~ 2.9 deg)")
-    parser.add_argument("--max-inner-samples", type=int, default=2_000_000_000)
+    parser.add_argument("--max-inner-iters", type=int, default=10000,
+                        help="Max inner iterations per outer loop (env-count-invariant safety cap)")
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
@@ -1451,7 +1459,7 @@ if __name__ == "__main__":
                         help="Inner convergence: spread/mean threshold")
     parser.add_argument("--plateau-window", type=int, default=10,
                         help="Inner convergence: window size (in output intervals)")
-    parser.add_argument("--min-plateau-outputs", type=int, default=20,
+    parser.add_argument("--min-plateau-outputs", type=int, default=10,
                         help="Inner convergence: min output intervals before early stop")
     parser.add_argument("--save-interval", type=int, default=500,
                         help="Save numbered model checkpoint every N inner iterations")

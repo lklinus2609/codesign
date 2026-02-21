@@ -6,10 +6,10 @@ Morphology and control co-optimization for legged robots using differentiable ph
 
 This project implements **Performance-Gated Hybrid Co-Design (PGHC)**, a bi-level optimization algorithm that jointly optimizes robot morphology and control policy:
 
-- **Inner Loop**: Policy optimization (PPO) at fixed morphology
-- **Outer Loop**: Morphology gradient descent using the envelope theorem
+- **Inner Loop**: Policy optimization (PPO + AMP) at fixed morphology
+- **Outer Loop**: Morphology gradient ascent via closed-loop finite differences
 
-The key insight is that when the policy is optimized for a given morphology, we can compute `dReturn/dMorphology` by treating the policy as frozen (envelope theorem).
+The key insight is that when the policy is optimized for a given morphology, we can estimate `dReturn/dMorphology` by evaluating the frozen policy on perturbed morphologies (finite differences). BPTT was originally planned but abandoned due to technical limitations (contact force instability in differentiable solvers, MJX gradient limitations).
 
 ## Verification Ladder
 
@@ -21,7 +21,7 @@ We validate PGHC through a systematic progression of increasingly complex enviro
 | 1 | Cart-Pole | PyTorch (hand-coded) | DONE |
 | 1.5 | Cart-Pole | Newton/Warp (vectorized) | DONE |
 | 2 | Ant | Newton/Warp | CREATED |
-| 3 | G1 Humanoid | Newton/Warp | BLOCKED (gradient chain) |
+| 3 | G1 Humanoid | Newton/Warp (FD) | ACTIVE |
 
 ## Quick Start
 
@@ -135,9 +135,10 @@ for outer_iteration in range(N):
         Collect rollouts with pi in environment(theta)
         Update pi using PPO
 
-    # OUTER LOOP: Optimize morphology
-    Compute gradient: g = dReturn/d_theta (with pi FROZEN, vectorized FD eval)
-    Adam step on theta using -g (gradient ascent via negated gradient)
+    # OUTER LOOP: Optimize morphology (closed-loop FD)
+    For each param i, run frozen policy on theta+eps and theta-eps
+    Compute gradient: g[i] = mean_seeds[(reward(θ+ε) - reward(θ-ε))] / (2ε)
+    Adam step on theta using g (gradient ascent)
     Clamp theta to physical bounds
 ```
 
@@ -188,14 +189,18 @@ r = 1.0*(alive) - 2.0*(terminated) - theta^2 - 0.1*x^2 - 0.01*action^2
 ## Key Implementation Notes
 
 ### Envelope Theorem
-When computing `dReturn/d_theta`, the policy pi must be FROZEN at its optimized state. The gradient flows through the physics dynamics, not the policy.
+When computing `dReturn/d_theta`, the policy pi must be FROZEN at its optimized state. The gradient is estimated by evaluating the frozen policy on perturbed morphologies (finite differences), not by backpropagating through physics.
 
-### Finite Difference Gradients
-For Newton-based environments, morphology changes require model rebuilding. We use vectorized finite difference evaluation (512 parallel worlds per perturbation):
+### Closed-Loop Finite Difference Gradients
+BPTT was abandoned due to technical limitations (Newton `SolverSemiImplicit` contact
+instability after ~3 steps, MJX gradient limitations). Instead, the outer loop uses
+closed-loop central FD with paired-seed averaging:
 ```
-dReturn/d_theta = (Return(theta+eps) - Return(theta-eps)) / (2*eps)
+grad[i] = mean_k[(reward(θ+ε, seed_k) - reward(θ-ε, seed_k))] / (2ε)
 ```
-Gradients are fed to an Adam optimizer (not clipped SGD), which normalizes magnitude automatically and uses momentum to smooth noisy estimates.
+where `reward = -CoT + vel_weight * fwd_dist`. The frozen policy runs closed-loop
+(reacting to observations) on each perturbed morphology. Gradients are fed to an
+Adam optimizer which normalizes magnitude and smooths noisy estimates via momentum.
 
 ### RSL-RL Style Episode Tracking
 Episode stats are tracked from training rollouts using per-world accumulators. No separate evaluation environment is needed.
@@ -210,10 +215,9 @@ python codesign_cartpole_newton_vec.py --wandb --num-worlds 2048
 
 ## Known Limitations
 
-1. **Newton contact instability**: Differentiable simulation has contact issues. Workaround: short horizon before ground contact.
-2. **Model rebuild cost**: Changing morphology in Newton requires full model rebuild. Training env is freed before FD eval and rebuilt after to avoid GPU OOM.
-3. **G1 gradient chain broken**: numpy in parametric_g1.py breaks warp's autograd. Needs Warp kernels for quaternion math.
-4. **Local optima**: PGHC finds local optima. Results depend on initialization.
+1. **BPTT not viable**: Newton `SolverSemiImplicit` has contact force instability (NaN after ~3 steps); MJX `mjx.step` doesn't differentiate through model params. Outer loop uses FD instead.
+2. **FD gradient signal**: Frozen-policy FD captures only direct mechanical effect (∂reward/∂θ|_π), missing policy adaptation. Gradient magnitude can be small.
+3. **Local optima**: PGHC finds local optima. Results depend on initialization.
 
 ## References
 
