@@ -1469,7 +1469,7 @@ if __name__ == "__main__":
                         help="Inner iter to finish ramping (disc=0, task=1)")
     parser.add_argument("--post-kickoff-min-iters", type=int, default=100,
                         help="Min inner iters for convergence after first outer iter")
-    parser.add_argument("--vel-reward-weight", type=float, default=0.1,
+    parser.add_argument("--vel-reward-weight", type=float, default=5.0,
                         help="Weight for velocity tracking in cost function "
                              "(reward = -CoT + w * exp(-|v-v_cmd|^2/sigma))")
     parser.add_argument("--vel-cmd", type=float, default=1.0,
