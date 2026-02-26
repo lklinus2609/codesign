@@ -296,31 +296,85 @@ def _make_compute_rewards_hook(agent):
 # Design parameter optimizer
 # ---------------------------------------------------------------------------
 
-class AdamOptimizer:
-    """Adam optimizer for numpy arrays (gradient ascent).
+class CautiousBFGS:
+    """Cautious BFGS for morphology optimization (gradient ascent).
 
-    Normalizes each parameter independently so effective step size is ~lr
-    regardless of raw gradient scale. First-moment averaging (beta1=0.9)
-    filters out sign flips from noisy per-iteration FD estimates.
+    Maintains an explicit n x n inverse Hessian approximation H_k, updated
+    each iteration via the BFGS formula.  At 6-20 params this is trivial
+    (6x6 = 288 bytes).  Full BFGS uses the entire history of accepted pairs,
+    giving a better Hessian estimate than limited-memory L-BFGS.
+
+    Cautious: skips the Hessian update when s^T y <= 0 (negative or zero
+    curvature from stochastic FD noise).  H_k stays at its previous value
+    rather than being corrupted by a bad update.
+
+    API is split into compute_direction / update so that bounds clipping
+    (and future trust region) can intervene between proposing and recording
+    the actual step.
     """
 
-    def __init__(self, n_params, lr=0.005, beta1=0.9, beta2=0.999, eps=1e-8):
-        self.lr = lr
-        self.beta1 = beta1
-        self.beta2 = beta2
-        self.eps = eps
-        self.m = np.zeros(n_params, dtype=np.float64)
-        self.v = np.zeros(n_params, dtype=np.float64)
-        self.t = 0
+    COND_RESET_THRESHOLD = 1e6
 
-    def step(self, params, grad):
-        """Gradient ascent: params += lr * adam_normalized(grad)."""
-        self.t += 1
-        self.m = self.beta1 * self.m + (1 - self.beta1) * grad
-        self.v = self.beta2 * self.v + (1 - self.beta2) * grad ** 2
-        m_hat = self.m / (1 - self.beta1 ** self.t)
-        v_hat = self.v / (1 - self.beta2 ** self.t)
-        return params + self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+    def __init__(self, n_params):
+        self.n = n_params
+        self.H = np.eye(n_params, dtype=np.float64)
+        self.prev_grad = None
+        self.initialized = False  # first scaling not yet applied
+        self.num_updates = 0
+        self.num_skipped = 0
+
+    def compute_direction(self, grad):
+        """Return H_k @ grad (inverse-Hessian-scaled ascent direction)."""
+        return self.H @ grad
+
+    def update(self, actual_s, grad_new):
+        """Update inverse Hessian with the actual step taken (post-clip).
+
+        Since we do gradient ascent (maximizing reward f), the equivalent
+        minimization problem is h = -f with gradient -g.  The BFGS y vector
+        for minimization is: y = (-g_new) - (-g_old) = g_old - g_new.
+        This ensures s^T y > 0 when approaching a maximum (gradient shrinks).
+
+        Applies cautious filter: only updates H when s^T y > 0.
+        Resets H to identity if condition number exceeds threshold.
+
+        Must be called every outer iteration (even on the first, to store
+        prev_grad for the next iteration's y computation).
+        """
+        if self.prev_grad is not None:
+            y = self.prev_grad - grad_new  # negated for ascent→minimization
+            sTy = actual_s @ y
+
+            if sTy > 1e-10:
+                # One-time initial scaling (Shanno-Phua): H_0 <- gamma * I
+                # before the very first BFGS update, so the Hessian scale
+                # matches local curvature rather than being identity.
+                if not self.initialized:
+                    yTy = y @ y
+                    if yTy > 1e-20:
+                        gamma = sTy / yTy
+                        self.H = gamma * np.eye(self.n, dtype=np.float64)
+                    self.initialized = True
+
+                # Standard BFGS inverse Hessian update (rank-2)
+                rho = 1.0 / sTy
+                I_n = np.eye(self.n, dtype=np.float64)
+                V = I_n - rho * np.outer(actual_s, y)
+                W = I_n - rho * np.outer(y, actual_s)
+                self.H = V @ self.H @ W + rho * np.outer(actual_s, actual_s)
+                self.num_updates += 1
+
+                # Safety: reset if H becomes poorly conditioned
+                cond = np.linalg.cond(self.H)
+                if cond > self.COND_RESET_THRESHOLD:
+                    print(f"    [BFGS] Condition number {cond:.1e} exceeds "
+                          f"threshold — resetting H to identity")
+                    self.H = np.eye(self.n, dtype=np.float64)
+                    self.initialized = False
+            else:
+                self.num_skipped += 1
+
+        self.prev_grad = grad_new.copy()
 
 
 # ---------------------------------------------------------------------------
@@ -334,12 +388,9 @@ def extract_joint_info(model, num_worlds):
         base_quats_dict: {body_name: (w,x,y,z)} for parameterized bodies
         joint_idx_map:   {body_name: local_joint_index}
     """
-    body_keys = model.body_key
     joint_keys = model.joint_key
-    bodies_per_world = model.body_count // num_worlds
     joints_per_world = model.joint_count // num_worlds
 
-    body_name_to_idx = {body_keys[i]: i for i in range(bodies_per_world)}
     joint_name_to_idx = {joint_keys[i]: i for i in range(joints_per_world)}
 
     joint_X_p_np = model.joint_X_p.numpy()
@@ -348,15 +399,12 @@ def extract_joint_info(model, num_worlds):
 
     for left_body, right_body in SYMMETRIC_PAIRS:
         for body_name in (left_body, right_body):
-            if body_name in body_name_to_idx:
-                idx = body_name_to_idx[body_name]
+            joint_name = body_name.replace("_link", "_joint")
+            if joint_name in joint_name_to_idx:
+                idx = joint_name_to_idx[joint_name]
             else:
-                joint_name = body_name.replace("_link", "_joint")
-                if joint_name in joint_name_to_idx:
-                    idx = joint_name_to_idx[joint_name]
-                else:
-                    print(f"  [WARN] Body/joint not found: {body_name}")
-                    continue
+                print(f"  [WARN] Joint not found: {joint_name} (body: {body_name})")
+                continue
             # joint_X_p numpy layout: [px,py,pz, qx,qy,qz,qw] (xyzw)
             # Reorder to (qw,qx,qy,qz) for g1_mjcf_modifier's wxyz convention
             raw = joint_X_p_np[idx, 3:7].tolist()  # [qx,qy,qz,qw]
@@ -443,9 +491,10 @@ class InnerLoopController:
             return False
         recent = values[-self.plateau_window:]
         mean_val = np.mean(recent)
-        if abs(mean_val) < 1e-8:
-            return False
         spread = max(recent) - min(recent)
+        if abs(mean_val) < 1.0:
+            # Near zero: use absolute spread threshold
+            return spread < self.plateau_threshold
         return (spread / abs(mean_val)) < self.plateau_threshold
 
     def train_until_converged(self, out_dir):
@@ -827,6 +876,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             vel_track_all[p, seed_idx] = vt
 
     agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+    agent.train()
 
     # Multi-GPU: average across ranks
     if num_procs > 1:
@@ -918,6 +968,7 @@ def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
                     frames.append(frame_wp.numpy().copy())
 
         agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+        agent.train()
 
         if not frames:
             return None
@@ -930,6 +981,7 @@ def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
     except Exception as e:
         print(f"    [Video] Capture failed: {e}")
         agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+        agent.train()
         return None
 
 
@@ -1072,6 +1124,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # Monkey-patch task reward onto env (replaces empty _update_reward)
     env._update_reward = types.MethodType(codesign_task_reward, env)
 
+    # Set task reward attributes now (before build_agent which may trigger env steps).
+    # _total_mass is a placeholder here; overwritten with real value after extract_joint_info.
+    env._total_mass = 1.0
+    env._vel_reward_weight = args.vel_reward_weight
+    env._vel_cmd = args.vel_cmd
+    env._vel_tracking_sigma = args.vel_tracking_sigma
+
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
 
     # Ensure disc replay buffer can hold a full rollout batch.
@@ -1080,11 +1139,12 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     min_disc_buf = per_rank_envs * agent._config["steps_per_iter"]
     if agent._disc_buffer._buffer_length < min_disc_buf:
         new_size = min_disc_buf * 2  # 2x headroom
+        orig_batch_size = agent._disc_buffer._batch_size
         if is_root:
             print(f"  [Fix] Expanding disc_buffer: {agent._disc_buffer._buffer_length} -> {new_size} "
                   f"(need >= {min_disc_buf} for {per_rank_envs} envs x {agent._config['steps_per_iter']} steps)")
         agent._disc_buffer = experience_buffer_mod.ExperienceBuffer(
-            buffer_length=new_size, batch_size=1, device=device)
+            buffer_length=new_size, batch_size=orig_batch_size, device=device)
 
     # Initial reward weights: pure style learning (ramp handles transition)
     agent._task_reward_weight = 0.0
@@ -1149,7 +1209,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print("[3/3] Starting PGHC outer loop...\n")
 
-    design_optimizer = AdamOptimizer(NUM_DESIGN_PARAMS, lr=args.design_lr)
+    bfgs = CautiousBFGS(NUM_DESIGN_PARAMS)
     theta_bounds = (-0.5236, 0.5236)  # +/-30 deg
 
     param_names = [
@@ -1204,7 +1264,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         print(f"  Eval horizon:      {args.eval_horizon} steps "
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner iters:   {args.max_inner_iters}")
-        print(f"  Design optimizer:  Adam (lr={args.design_lr})")
+        print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
         print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
         print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
         if args.kickoff_min_iters > 0:
@@ -1245,20 +1305,12 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 "outer/boundary": 1,
             }, step=agent._iter)
 
-        try:
-            converged, disc_rewards = inner_ctrl.train_until_converged(
-                iter_dir
-            )
-            inner_time = time.time() - t0
-            if is_root:
-                print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min")
-        except Exception as e:
-            if is_root:
-                print(f"  [Inner Loop] FAILED: {e}")
-                import traceback
-                traceback.print_exc()
-            history["inner_times"].append(time.time() - t0)
-            continue
+        converged, disc_rewards = inner_ctrl.train_until_converged(
+            iter_dir
+        )
+        inner_time = time.time() - t0
+        if is_root:
+            print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min")
 
         history["inner_times"].append(inner_time)
 
@@ -1315,10 +1367,16 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 theta[:] = np.nan
             else:
                 old_theta = theta.copy()
-                theta = design_optimizer.step(theta, grad_theta)
+                direction = bfgs.compute_direction(grad_theta)
+                theta = old_theta + args.design_lr * direction
                 theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
 
-                print(f"\n  Design update:")
+                # Record actual step (post-clip) for Hessian update
+                actual_s = theta - old_theta
+                bfgs.update(actual_s, grad_theta)
+
+                print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
+                      f"{bfgs.num_skipped} skipped):")
                 for i, name in enumerate(param_names):
                     delta = theta[i] - old_theta[i]
                     print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
@@ -1378,6 +1436,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     "outer/cot": cot,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
+                    "outer/bfgs_updates": bfgs.num_updates,
+                    "outer/bfgs_skipped": bfgs.num_skipped,
+                    "outer/bfgs_cond": float(np.linalg.cond(bfgs.H)),
                 }
                 for i, name in enumerate(param_names):
                     log_dict[f"outer/{name}_rad"] = theta[i]
@@ -1439,7 +1500,8 @@ if __name__ == "__main__":
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=20)
-    parser.add_argument("--design-lr", type=float, default=0.005)
+    parser.add_argument("--design-lr", type=float, default=1.0,
+                        help="Step size scaling on BFGS direction (default: 1.0, BFGS self-scales)")
     parser.add_argument("--num-train-envs", type=int, default=4096,
                         help="Total training envs (divided across GPUs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
