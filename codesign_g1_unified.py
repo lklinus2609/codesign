@@ -1540,7 +1540,7 @@ if __name__ == "__main__":
                         help="Total training envs (divided across GPUs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
                         help="Eval rollout length in control steps (300 = 10s full episode)")
-    parser.add_argument("--num-fd-seeds", type=int, default=10,
+    parser.add_argument("--num-fd-seeds", type=int, default=30,
                         help="Number of paired seeds per FD perturbation (K)")
     parser.add_argument("--fd-epsilon", type=float, default=0.05,
                         help="FD perturbation size in radians (default: 0.05 ~ 2.9 deg)")
