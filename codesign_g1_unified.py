@@ -536,6 +536,7 @@ class InnerLoopController:
         start_time = time.time()
         test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
         inner_iters = 0
+        last_actor_loss = None
 
         while inner_iters < self.max_inner_iters:
             train_info = agent._train_iter()                      # COLLECTIVE
@@ -577,6 +578,13 @@ class InnerLoopController:
                     elif self.convergence_signal == 'disc_reward':
                         if disc_r is not None:
                             convergence_values.append(disc_r)
+
+                # Track actor loss as envelope theorem quality proxy
+                al = train_info.get("actor_loss")
+                if al is not None:
+                    if torch.is_tensor(al):
+                        al = al.item()
+                    last_actor_loss = al
 
                 test_info = {
                     "mean_return": 0.0,
@@ -672,10 +680,12 @@ class InnerLoopController:
                     if self.is_root:
                         recent = convergence_values[-self.plateau_window:]
                         spread = max(recent) - min(recent)
+                        actor_loss_str = (f", actor_loss={last_actor_loss:.6f}"
+                                          if last_actor_loss is not None else "")
                         print(f"    [Inner] CONVERGED ({len(convergence_values)} outputs, "
                               f"{inner_iters} iters, "
                               f"{self.convergence_signal}={np.mean(recent):.4f}, "
-                              f"spread={spread:.4f})")
+                              f"spread={spread:.4f}{actor_loss_str})")
                     converged = True
                     break
 
@@ -693,7 +703,7 @@ class InnerLoopController:
             if not converged:
                 print(f"    [Inner] Iteration cap reached ({inner_iters} iters)")
 
-        return converged, disc_rewards
+        return converged, disc_rewards, last_actor_loss
 
 
 # ---------------------------------------------------------------------------
@@ -917,6 +927,14 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
 
     grad = np.clip(grad, -10.0, 10.0)
 
+    # Per-parameter SNR: |gradient| / standard_error
+    snr = np.zeros(n_params, dtype=np.float64)
+    for i in range(n_params):
+        if grad_stderr[i] > 0:
+            snr[i] = abs(grad[i]) / grad_stderr[i]
+        else:
+            snr[i] = float('inf') if grad[i] != 0 else 0.0
+
     if rank == 0:
         print(f"    [FD] Center (mean over {num_seeds} seeds): "
               f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}")
@@ -926,11 +944,17 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             vt_plus_mean = float(np.mean(vt_np[2 * i + 1]))
             vt_minus_mean = float(np.mean(vt_np[2 * i + 2]))
             print(f"    [FD] param {i} ({name}): "
-                  f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f}, "
+                  f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f} "
+                  f"(SNR={snr[i]:.2f}), "
                   f"CoT+={cot_plus_mean:.6f}, CoT-={cot_minus_mean:.6f}, "
                   f"vt+={vt_plus_mean:.4f}, vt-={vt_minus_mean:.4f}")
+        finite_snr = snr[np.isfinite(snr)]
+        if len(finite_snr) > 0:
+            print(f"    [FD] Gradient SNR: min={np.min(finite_snr):.2f}, "
+                  f"mean={np.mean(finite_snr):.2f}, "
+                  f"max={np.max(finite_snr):.2f}")
 
-    return grad, vel_track_center, cot_center
+    return grad, grad_stderr, snr, vel_track_center, cot_center
 
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1277,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         "vel_tracking": [],
         "cot": [],
         "gradients": [],
+        "grad_snr": [],
         "inner_times": [],
     }
     theta_history = deque(maxlen=5)
@@ -1305,12 +1330,14 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 "outer/boundary": 1,
             }, step=agent._iter)
 
-        converged, disc_rewards = inner_ctrl.train_until_converged(
+        converged, disc_rewards, final_actor_loss = inner_ctrl.train_until_converged(
             iter_dir
         )
         inner_time = time.time() - t0
         if is_root:
-            print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min")
+            actor_loss_str = (f", actor_loss={final_actor_loss:.6f}"
+                              if final_actor_loss is not None else "")
+            print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min{actor_loss_str}")
 
         history["inner_times"].append(inner_time)
 
@@ -1334,7 +1361,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
         fd_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, vel_track, cot = compute_fd_gradient_parallel(
+        grad_theta, grad_stderr, grad_snr, vel_track, cot = compute_fd_gradient_parallel(
             agent, env, engine, char_id, total_mass,
             theta.copy(), base_quats_dict, joint_idx_map,
             per_rank_envs, args.eval_horizon,
@@ -1358,6 +1385,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             history["vel_tracking"].append(vel_track)
             history["cot"].append(cot)
             history["gradients"].append(grad_theta.copy())
+            history["grad_snr"].append(grad_snr.copy())
 
             # ----- Design Update (rank 0 only) -----
             if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
@@ -1430,12 +1458,15 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             np.save(str(iter_dir / "grad.npy"), grad_theta)
 
             if use_wandb:
+                finite_snr = grad_snr[np.isfinite(grad_snr)]
                 log_dict = {
                     "outer/iteration": outer_iter + 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
+                    "outer/grad_snr_min": float(np.min(finite_snr)) if len(finite_snr) > 0 else 0.0,
+                    "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
                     "outer/bfgs_updates": bfgs.num_updates,
                     "outer/bfgs_skipped": bfgs.num_skipped,
                     "outer/bfgs_cond": float(np.linalg.cond(bfgs.H)),
@@ -1444,8 +1475,11 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     log_dict[f"outer/{name}_rad"] = theta[i]
                     log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
                     log_dict[f"outer/grad_{name}"] = grad_theta[i]
+                    log_dict[f"outer/snr_{name}"] = grad_snr[i] if np.isfinite(grad_snr[i]) else 0.0
                 if disc_rewards:
                     log_dict["outer/final_disc_reward"] = disc_rewards[-1]
+                if final_actor_loss is not None:
+                    log_dict["outer/converged_actor_loss"] = final_actor_loss
                 wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
@@ -1523,8 +1557,9 @@ if __name__ == "__main__":
                         help="Inner convergence: min output intervals before early stop")
     parser.add_argument("--save-interval", type=int, default=500,
                         help="Save numbered model checkpoint every N inner iterations")
-    parser.add_argument("--kickoff-min-iters", type=int, default=2000,
-                        help="Min inner iters before convergence on first outer iter (0=disabled)")
+    parser.add_argument("--kickoff-min-iters", type=int, default=2500,
+                        help="Min inner iters before convergence on first outer iter "
+                             "(must be >= ramp-end-iter so outer loop starts with pure task reward)")
     parser.add_argument("--ramp-start-iter", type=int, default=1000,
                         help="Inner iter to start ramping disc→task reward weights")
     parser.add_argument("--ramp-end-iter", type=int, default=2500,
@@ -1557,6 +1592,14 @@ if __name__ == "__main__":
     if args.devices is None:
         n_gpus = torch.cuda.device_count()
         args.devices = [f"cuda:{i}" for i in range(n_gpus)] if n_gpus > 0 else ["cuda:0"]
+
+    # Validate: outer loop must not fire before reward ramp completes
+    if args.kickoff_min_iters < args.ramp_end_iter:
+        parser.error(
+            f"--kickoff-min-iters ({args.kickoff_min_iters}) must be >= "
+            f"--ramp-end-iter ({args.ramp_end_iter}) so the outer loop "
+            f"only starts after the reward ramp completes"
+        )
 
     # Flip --no-wandb to args.wandb for downstream use
     args.wandb = not args.no_wandb
