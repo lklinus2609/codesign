@@ -28,7 +28,10 @@
       "Bash(ls:*)",
       "Bash(head:*)",
       "Bash(tail:*)",
-      "Bash(git status:*)"
+      "Bash(git status:*)",
+      "Bash(git hash-object:*)",
+      "Bash(git ls-tree:*)",
+      "Bash(cd:*)"
     ]
   }
 }
