@@ -11,9 +11,9 @@ Architecture:
     2. OUTER LOOP:
         a. Update training model joint_X_p in-place from theta
         b. Inner loop: agent._train_iter() until convergence (all GPUs)
-        c. Closed-loop FD gradient: run frozen policy on perturbed morphologies
-           with K paired seeds, distributed round-robin across GPUs, all_reduce
-        d. SGD update theta on rank 0, clip to +/-30 deg
+        c. Orthogonal SPSA gradient: run frozen policy on S*N direction-perturbed
+           morphologies with K paired seeds, reconstruct via lstsq, all_reduce
+        d. BFGS update theta on rank 0, clip to +/-30 deg
         e. Broadcast theta to all ranks
         f. Check outer convergence (theta stable over last 5 iters)
 
@@ -712,18 +712,25 @@ class InnerLoopController:
 
 def apply_partitioned_morphologies(model, theta_np, eps, n_params,
                                    base_quats_dict, joint_idx_map,
-                                   num_worlds, worlds_per_pert):
-    """Apply all 13 perturbed morphologies to world partitions in one GPU round-trip.
+                                   num_worlds, worlds_per_pert,
+                                   directions=None):
+    """Apply perturbed morphologies to world partitions in one GPU round-trip.
 
-    Partition layout (n_pert = 1 + 2*n_params = 13 for 6 params):
+    Partition layout (n_pert = 1 + 2*M, where M = number of directions):
         partition 0:              center (theta)
-        partition 2*i+1:          param i + eps
-        partition 2*i+2:          param i - eps
+        partition 2*m+1:          theta + eps * directions[m]
+        partition 2*m+2:          theta - eps * directions[m]
+
+    When directions is None, falls back to coordinate-wise FD (axis-aligned
+    perturbations, M=n_params).
 
     Each partition spans worlds [p * wpp, (p+1) * wpp).
     Worlds beyond n_pert * wpp are left untouched (they won't be read).
     """
-    n_pert = 1 + 2 * n_params
+    if directions is None:
+        directions = np.eye(n_params)
+    M = directions.shape[0]
+    n_pert = 1 + 2 * M
     joints_per_world = model.joint_count // num_worlds
     joint_X_p_np = model.joint_X_p.numpy()
 
@@ -732,10 +739,10 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
         if p == 0:
             theta_pert = theta_np  # center — no copy needed (read-only)
         else:
-            param_i = (p - 1) // 2
+            m = (p - 1) // 2       # direction index
             is_plus = (p % 2 == 1)
-            theta_pert = theta_np.copy()
-            theta_pert[param_i] += eps if is_plus else -eps
+            sign = 1.0 if is_plus else -1.0
+            theta_pert = theta_np + sign * eps * directions[m]
 
         w_start = p * worlds_per_pert
         w_end = (p + 1) * worlds_per_pert
@@ -759,19 +766,45 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
     wp.synchronize()
 
 
+def generate_orthogonal_directions(n_params, num_sets, seed):
+    """Generate S orthogonal bases as perturbation directions.
+
+    Returns an (S*N, N) matrix where each block of N rows is a
+    Haar-random orthogonal matrix (via QR of Gaussian).  Rows are
+    unit vectors, so eps scaling gives consistent perturbation magnitude.
+
+    Args:
+        n_params: N, number of design parameters (6)
+        num_sets: S, number of orthogonal basis sets
+        seed: RNG seed (should vary per outer iteration)
+
+    Returns:
+        directions: (S*N, N) numpy array of perturbation directions
+    """
+    rng = np.random.RandomState(seed)
+    blocks = []
+    for _ in range(num_sets):
+        A = rng.standard_normal((n_params, n_params))
+        Q, R = np.linalg.qr(A)
+        Q *= np.sign(np.diag(R))  # Haar-uniform over O(N)
+        blocks.append(Q)
+    return np.vstack(blocks)  # (S*N, N)
+
+
 def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   theta_np, base_quats_dict, joint_idx_map,
                                   num_worlds, horizon,
                                   rank, num_procs, device, param_names,
                                   num_seeds=10, base_seed=42,
                                   eps=0.05, vel_reward_weight=0.1,
-                                  vel_cmd=1.0, vel_tracking_sigma=0.25):
-    """Compute closed-loop FD gradient with world-partitioned perturbations.
+                                  vel_cmd=1.0, vel_tracking_sigma=0.25,
+                                  num_spsa_sets=3):
+    """Compute closed-loop gradient with orthogonal SPSA world-partitioned perturbations.
 
-    Instead of running 130 sequential rollouts (13 perturbations x 10 seeds),
-    partitions worlds into 13 groups — each running a different morphology
-    simultaneously. The seed loop (10 iterations) remains sequential.
-    Total: 10 rollouts instead of 130 (13x speedup).
+    Generates S random orthogonal bases (S*N directions total), partitions
+    worlds into 1+2*S*N groups — each running a different morphology
+    simultaneously. The seed loop (K iterations) remains sequential.
+    Gradient reconstructed via least-squares solve per seed.
 
     Cost function matches inner loop task reward:
         reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
@@ -779,17 +812,26 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
 
-    Returns (grad, vel_tracking_center, cot_center) on all ranks.
+    Returns (grad, grad_stderr, snr, vel_tracking_center, cot_center) on all ranks.
     """
     n_params = len(theta_np)
-    n_pert = 1 + 2 * n_params  # 13 for 6 params
+    assert num_spsa_sets >= 1, f"num_spsa_sets must be >= 1, got {num_spsa_sets}"
+
+    # Generate orthogonal perturbation directions (deterministic across ranks)
+    directions = generate_orthogonal_directions(n_params, num_spsa_sets,
+                                                 seed=base_seed + 9999)
+    M = directions.shape[0]  # S*N total directions
+    n_pert = 1 + 2 * M
     wpp = num_worlds // n_pert  # worlds per perturbation
-    assert num_worlds >= n_pert, f"Need >= {n_pert} worlds, got {num_worlds}"
+    assert num_worlds >= n_pert, (
+        f"Need >= {n_pert} worlds for S={num_spsa_sets} orthogonal sets "
+        f"(M={M} directions), got {num_worlds}")
 
     if rank == 0:
-        print(f"    [FD-parallel] {n_pert} perturbations x {num_seeds} seeds, "
+        print(f"    [SPSA] {num_spsa_sets} orthogonal sets x {n_params} params "
+              f"= {M} directions, n_pert={n_pert}, "
               f"{wpp} worlds/perturbation ({num_worlds} total), "
-              f"{num_procs} GPU(s)")
+              f"{num_procs} GPU(s), {num_seeds} seeds")
 
     # Result tensors: (n_pert, num_seeds)
     cot_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
@@ -798,10 +840,11 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
     sim_model = engine._sim_model
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
 
-    # Apply all 13 morphologies to their world partitions (1 GPU<->CPU round-trip)
+    # Apply all perturbed morphologies to their world partitions (1 GPU<->CPU round-trip)
     apply_partitioned_morphologies(sim_model, theta_np, eps, n_params,
                                    base_quats_dict, joint_idx_map,
-                                   num_worlds, wpp)
+                                   num_worlds, wpp,
+                                   directions=directions)
 
     agent.eval()
     agent.set_mode(base_agent_mod.AgentMode.TEST)
@@ -899,7 +942,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
     update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
                                joint_idx_map, num_worlds)
 
-    # Gradient computation (same math as sequential version)
+    # Gradient computation via least-squares on orthogonal directions
     cot_np = cot_all.cpu().numpy()
     vt_np = vel_track_all.cpu().numpy()
 
@@ -910,47 +953,54 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
     # reward = -CoT + vel_reward_weight * vel_tracking
     reward_all = -cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
 
-    grad = np.zeros(n_params, dtype=np.float64)
-    grad_stderr = np.zeros(n_params, dtype=np.float64)
-    for i in range(n_params):
-        reward_plus = reward_all[2 * i + 1]   # (num_seeds,)
-        reward_minus = reward_all[2 * i + 2]  # (num_seeds,)
-        diffs = (reward_plus - reward_minus) / (2 * eps)  # (num_seeds,)
+    # Per-seed: compute directional finite differences, then solve for gradient
+    grad_per_seed = []
+    for k in range(num_seeds):
+        dJ = np.array([
+            (reward_all[2 * m + 1, k] - reward_all[2 * m + 2, k]) / (2 * eps)
+            for m in range(M)
+        ])  # (M,) directional derivatives along each direction
 
-        valid = ~np.isnan(diffs)
-        if valid.sum() > 0:
-            grad[i] = np.mean(diffs[valid])
-            if valid.sum() > 1:
-                grad_stderr[i] = np.std(diffs[valid], ddof=1) / np.sqrt(valid.sum())
+        # Skip seeds where any dJ is NaN
+        if np.any(np.isnan(dJ)):
+            continue
+
+        # Solve: directions @ grad_k = dJ  (M equations, N unknowns, M >= N)
+        grad_k, _, _, _ = np.linalg.lstsq(directions, dJ, rcond=None)
+        grad_per_seed.append(grad_k)
+
+    if len(grad_per_seed) == 0:
+        # All seeds produced NaN — degenerate
+        grad = np.zeros(n_params, dtype=np.float64)
+        grad_stderr = np.full(n_params, float('inf'), dtype=np.float64)
+    else:
+        grad_samples = np.stack(grad_per_seed)  # (K_valid, N)
+        grad = grad_samples.mean(axis=0)
+        if len(grad_per_seed) > 1:
+            grad_stderr = grad_samples.std(axis=0, ddof=1) / np.sqrt(len(grad_per_seed))
         else:
-            grad[i] = 0.0
+            grad_stderr = np.full(n_params, float('inf'), dtype=np.float64)
 
-    grad = np.clip(grad, -10.0, 10.0)
-
-    # Per-parameter SNR: |gradient| / standard_error
+    # Per-parameter SNR: |gradient| / standard_error (computed before clipping)
     snr = np.zeros(n_params, dtype=np.float64)
     for i in range(n_params):
-        if grad_stderr[i] > 0:
+        if grad_stderr[i] > 0 and np.isfinite(grad_stderr[i]):
             snr[i] = abs(grad[i]) / grad_stderr[i]
         else:
             snr[i] = float('inf') if grad[i] != 0 else 0.0
 
+    grad = np.clip(grad, -10.0, 10.0)
+
     if rank == 0:
-        print(f"    [FD] Center (mean over {num_seeds} seeds): "
+        print(f"    [SPSA] Center (mean over {num_seeds} seeds): "
               f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}")
+        print(f"    [SPSA] Gradient ({len(grad_per_seed)}/{num_seeds} valid seeds):")
         for i, name in enumerate(param_names):
-            cot_plus_mean = float(np.mean(cot_np[2 * i + 1]))
-            cot_minus_mean = float(np.mean(cot_np[2 * i + 2]))
-            vt_plus_mean = float(np.mean(vt_np[2 * i + 1]))
-            vt_minus_mean = float(np.mean(vt_np[2 * i + 2]))
-            print(f"    [FD] param {i} ({name}): "
-                  f"grad={grad[i]:+.6f} +/- {grad_stderr[i]:.6f} "
-                  f"(SNR={snr[i]:.2f}), "
-                  f"CoT+={cot_plus_mean:.6f}, CoT-={cot_minus_mean:.6f}, "
-                  f"vt+={vt_plus_mean:.4f}, vt-={vt_minus_mean:.4f}")
+            print(f"      d_reward/d_{name} = {grad[i]:+.6f} "
+                  f"+/- {grad_stderr[i]:.6f} (SNR={snr[i]:.2f})")
         finite_snr = snr[np.isfinite(snr)]
         if len(finite_snr) > 0:
-            print(f"    [FD] Gradient SNR: min={np.min(finite_snr):.2f}, "
+            print(f"    [SPSA] Gradient SNR: min={np.min(finite_snr):.2f}, "
                   f"mean={np.mean(finite_snr):.2f}, "
                   f"max={np.max(finite_snr):.2f}")
 
@@ -1296,12 +1346,19 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
         print(f"  Reward ramp:       disc 1.0→0.0, task 0.0→1.0 "
               f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
+        _M = args.spsa_sets * NUM_DESIGN_PARAMS
+        _n_pert = 1 + 2 * _M
+        _wpp = per_rank_envs // _n_pert
+        print(f"  SPSA sets:         {args.spsa_sets} ({_M} directions, "
+              f"{_n_pert} perturbations, {_wpp} worlds/pert/GPU)")
         print(f"  FD seeds:          {args.num_fd_seeds} (paired-seed averaging)")
         print(f"  FD epsilon:        {args.fd_epsilon} rad "
               f"({np.degrees(args.fd_epsilon):.1f} deg)")
+        if args.snr_threshold > 0:
+            print(f"  SNR threshold:     {args.snr_threshold}")
         print(f"  Vel reward weight: {args.vel_reward_weight} "
               f"(reward = -CoT + {args.vel_reward_weight}*exp(-|v-{args.vel_cmd}|^2/{args.vel_tracking_sigma}))")
-        print(f"  FD mode:           closed-loop (policy reacts to observations)")
+        print(f"  Gradient mode:     orthogonal SPSA (closed-loop, lstsq reconstruction)")
 
     # =========================================================
     # Outer loop
@@ -1356,8 +1413,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         env._cot_tracker.reset_accumulators()
 
         if is_root:
-            print(f"\n  [FD] Computing closed-loop FD gradient "
-                  f"({args.num_fd_seeds} seeds, {args.eval_horizon} steps)...")
+            print(f"\n  [SPSA] Computing orthogonal SPSA gradient "
+                  f"(S={args.spsa_sets}, {args.num_fd_seeds} seeds, "
+                  f"{args.eval_horizon} steps)...")
 
         fd_base_seed = 42 + outer_iter * 1000
 
@@ -1369,6 +1427,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             num_seeds=args.num_fd_seeds, base_seed=fd_base_seed,
             eps=args.fd_epsilon, vel_reward_weight=args.vel_reward_weight,
             vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+            num_spsa_sets=args.spsa_sets,
         )
 
         # Clear CoT tracker after FD to prevent pollution of inner loop
@@ -1376,7 +1435,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         env._cot_tracker.reset_accumulators()
 
         if is_root:
-            print(f"    FD gradients:")
+            print(f"    SPSA gradients:")
             for i, name in enumerate(param_names):
                 print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
             print(f"    Vel tracking = {vel_track:.4f}")
@@ -1394,6 +1453,19 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                 # Signal via NaN theta — all ranks will detect and break
                 theta[:] = np.nan
             else:
+                # SNR gating: zero out gradient components with low confidence
+                # (inf SNR = high confidence from single seed, kept through)
+                if args.snr_threshold > 0:
+                    snr_mask = (grad_snr > args.snr_threshold) | ~np.isfinite(grad_snr)
+                    n_masked = NUM_DESIGN_PARAMS - snr_mask.sum()
+                    if n_masked == NUM_DESIGN_PARAMS:
+                        print(f"    [SNR gate] WARNING: All {NUM_DESIGN_PARAMS} params "
+                              f"masked (SNR < {args.snr_threshold}), skipping update")
+                    elif n_masked > 0:
+                        print(f"    [SNR gate] Masking {n_masked}/{NUM_DESIGN_PARAMS} params "
+                              f"with SNR < {args.snr_threshold}")
+                    grad_theta = grad_theta * snr_mask.astype(float)
+
                 old_theta = theta.copy()
                 direction = bfgs.compute_direction(grad_theta)
                 theta = old_theta + args.design_lr * direction
@@ -1470,12 +1542,16 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     "outer/bfgs_updates": bfgs.num_updates,
                     "outer/bfgs_skipped": bfgs.num_skipped,
                     "outer/bfgs_cond": float(np.linalg.cond(bfgs.H)),
+                    "outer/spsa_sets": args.spsa_sets,
+                    "outer/spsa_directions": args.spsa_sets * NUM_DESIGN_PARAMS,
+                    "outer/worlds_per_pert": per_rank_envs // (1 + 2 * args.spsa_sets * NUM_DESIGN_PARAMS),
                 }
                 for i, name in enumerate(param_names):
                     log_dict[f"outer/{name}_rad"] = theta[i]
                     log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
                     log_dict[f"outer/grad_{name}"] = grad_theta[i]
                     log_dict[f"outer/snr_{name}"] = grad_snr[i] if np.isfinite(grad_snr[i]) else 0.0
+                    log_dict[f"outer/stderr_{name}"] = grad_stderr[i] if np.isfinite(grad_stderr[i]) else 0.0
                 if disc_rewards:
                     log_dict["outer/final_disc_reward"] = disc_rewards[-1]
                 if final_actor_loss is not None:
@@ -1544,6 +1620,12 @@ if __name__ == "__main__":
                         help="Number of paired seeds per FD perturbation (K)")
     parser.add_argument("--fd-epsilon", type=float, default=0.05,
                         help="FD perturbation size in radians (default: 0.05 ~ 2.9 deg)")
+    parser.add_argument("--spsa-sets", type=int, default=3,
+                        help="Number of orthogonal basis sets S for SPSA gradient "
+                             "(M=S*N directions, n_pert=1+2*S*N). Default: 3")
+    parser.add_argument("--snr-threshold", type=float, default=0.0,
+                        help="SNR gating threshold (0=disabled). Mask gradient components "
+                             "where SNR < threshold before BFGS update. Recommended: 2.0")
     parser.add_argument("--max-inner-iters", type=int, default=10000,
                         help="Max inner iterations per outer loop (env-count-invariant safety cap)")
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
