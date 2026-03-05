@@ -1340,6 +1340,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner iters:   {args.max_inner_iters}")
         print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
+        print(f"  Max step size:     {args.max_step_deg} deg/iter ({np.radians(args.max_step_deg):.4f} rad)")
         print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
         print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
         if args.kickoff_min_iters > 0:
@@ -1447,6 +1448,9 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             history["grad_snr"].append(grad_snr.copy())
 
             # ----- Design Update (rank 0 only) -----
+            n_clamped = 0
+            raw_step = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+
             if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
                 print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
                       f"signaling all ranks to stop.")
@@ -1468,7 +1472,18 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
                 old_theta = theta.copy()
                 direction = bfgs.compute_direction(grad_theta)
-                theta = old_theta + args.design_lr * direction
+                step = args.design_lr * direction
+
+                # Trust-region clamp: limit per-parameter step magnitude
+                max_step_rad = np.radians(args.max_step_deg)
+                raw_step = step.copy()
+                step = np.clip(step, -max_step_rad, max_step_rad)
+                n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
+                if n_clamped > 0:
+                    print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
+                          f"params to +/-{args.max_step_deg} deg")
+
+                theta = old_theta + step
                 theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
 
                 # Record actual step (post-clip) for Hessian update
@@ -1542,6 +1557,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     "outer/bfgs_updates": bfgs.num_updates,
                     "outer/bfgs_skipped": bfgs.num_skipped,
                     "outer/bfgs_cond": float(np.linalg.cond(bfgs.H)),
+                    "outer/step_clamped": int(n_clamped),
+                    "outer/max_raw_step_deg": float(np.degrees(np.max(np.abs(raw_step)))),
                     "outer/spsa_sets": args.spsa_sets,
                     "outer/spsa_directions": args.spsa_sets * NUM_DESIGN_PARAMS,
                     "outer/worlds_per_pert": per_rank_envs // (1 + 2 * args.spsa_sets * NUM_DESIGN_PARAMS),
@@ -1626,6 +1643,9 @@ if __name__ == "__main__":
     parser.add_argument("--snr-threshold", type=float, default=0.0,
                         help="SNR gating threshold (0=disabled). Mask gradient components "
                              "where SNR < threshold before BFGS update. Recommended: 2.0")
+    parser.add_argument("--max-step-deg", type=float, default=0.5,
+                        help="Max per-parameter step size in degrees per outer iteration. "
+                             "Ensures policy stability across morphology updates. Default: 0.5")
     parser.add_argument("--max-inner-iters", type=int, default=10000,
                         help="Max inner iterations per outer loop (env-count-invariant safety cap)")
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
