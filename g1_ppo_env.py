@@ -2,19 +2,23 @@
 """
 G1 Walking Environment Wrapper for Newton Physics Engine.
 
-Wraps MimicKit's initialized Newton engine with unitree_rl_gym-style
-locomotion rewards, observations, and termination logic.
+Wraps MimicKit's initialized Newton engine with IsaacLab-style
+locomotion rewards, observations, termination, and domain randomization.
 
 Observation (11 + 3*N_dof):
     [ang_vel(3), projected_gravity(3), commands(3),
      dof_pos_relative(N_dof), dof_vel(N_dof), prev_actions(N_dof),
      sin_phase(1), cos_phase(1)]
 
-Rewards (15 terms from G1RoughCfg):
+Rewards (18 terms, IsaacLab G1 flat terrain):
     tracking_lin_vel, tracking_ang_vel, lin_vel_z, ang_vel_xy,
     orientation, base_height, dof_acc, dof_vel, action_rate,
     dof_pos_limits, alive, hip_pos, contact_no_vel,
-    feet_swing_height, contact (phase-aware)
+    feet_swing_height, contact, dof_torques,
+    joint_deviation_arms, joint_deviation_torso
+
+Domain randomization:
+    obs noise, random pushes, motor strength scaling
 
 Termination: pelvis ground contact OR episode timeout (20s)
 """
@@ -47,7 +51,7 @@ def quat_rotate_inverse(q, v):
 
 
 # ---------------------------------------------------------------------------
-# Configuration (matches unitree_rl_gym G1RoughCfg)
+# Configuration (IsaacLab G1 flat terrain + unitree_rl_gym G1RoughCfg)
 # ---------------------------------------------------------------------------
 
 class G1WalkingConfig:
@@ -66,22 +70,25 @@ class G1WalkingConfig:
     # --- Control ---
     action_scale = 0.25
 
-    # --- Reward scales (from G1RoughCfg.rewards.scales) ---
+    # --- Reward scales (IsaacLab G1 flat terrain merged with G1RoughCfg) ---
     reward_tracking_lin_vel = 1.0
-    reward_tracking_ang_vel = 0.5
-    reward_lin_vel_z = -2.0
+    reward_tracking_ang_vel = 1.0       # IsaacLab flat: 1.0
+    reward_lin_vel_z = -0.2             # IsaacLab flat: -0.2
     reward_ang_vel_xy = -0.05
     reward_orientation = -1.0
     reward_base_height = -10.0
-    reward_dof_acc = -2.5e-7
+    reward_dof_acc = -1e-7              # IsaacLab flat: -1e-7
     reward_dof_vel = -1e-3
-    reward_action_rate = -0.01
-    reward_dof_pos_limits = -5.0
+    reward_action_rate = -0.005         # IsaacLab flat: -0.005
+    reward_dof_pos_limits = -1.0        # IsaacLab: -1.0
     reward_alive = 0.15
-    reward_hip_pos = -1.0
-    reward_contact_no_vel = -0.2
+    reward_hip_pos = -0.1              # IsaacLab: -0.1
+    reward_contact_no_vel = -0.1       # IsaacLab feet_slide: -0.1
     reward_feet_swing_height = -20.0
-    reward_contact = 0.18
+    reward_contact = 0.75              # IsaacLab feet_air_time: 0.75
+    reward_dof_torques = -2e-6         # IsaacLab flat: -2e-6
+    reward_joint_deviation_arms = -0.1  # IsaacLab: -0.1
+    reward_joint_deviation_torso = -0.1 # IsaacLab: -0.1
 
     # --- Reward parameters ---
     tracking_sigma = 0.25
@@ -91,10 +98,66 @@ class G1WalkingConfig:
 
     # --- Termination ---
     max_episode_length_s = 20.0
+    termination_penalty = -10.0  # Known Issue #9: -100 backfires, use -10
 
     # --- Phase ---
     phase_period = 0.8
     phase_offset = 0.5
+
+    # --- Domain randomization ---
+    enable_dr = True
+    dr_motor_strength_range = 0.1  # +/-10%
+    dr_push_interval = 100         # steps between pushes (~3.3s at 30Hz)
+    dr_push_vel_range = 0.5        # m/s
+    dr_obs_noise_std = 0.02
+
+
+# ---------------------------------------------------------------------------
+# Domain Randomization
+# ---------------------------------------------------------------------------
+
+class DomainRandomization:
+    """Per-env randomization of physics parameters.
+
+    Randomized at episode reset per env. Applied during step().
+    """
+
+    def __init__(self, num_envs, device, cfg):
+        self.num_envs = num_envs
+        self.device = device
+        self.cfg = cfg
+
+        self.motor_strength_scale = torch.ones(num_envs, 1, device=device)
+        self.push_interval = cfg.dr_push_interval
+        self.push_vel_range = cfg.dr_push_vel_range
+        self.obs_noise_std = cfg.dr_obs_noise_std
+
+    def randomize_envs(self, env_ids):
+        """Resample randomization for given envs."""
+        n = len(env_ids)
+        r = self.cfg.dr_motor_strength_range
+        self.motor_strength_scale[env_ids] = 1.0 + (
+            torch.rand(n, 1, device=self.device) - 0.5) * 2 * r
+
+    def apply_push(self, engine, char_id, episode_length_buf):
+        """Apply random velocity pushes at periodic intervals."""
+        push_mask = ((episode_length_buf % self.push_interval == 0)
+                     & (episode_length_buf > 0))
+        if not push_mask.any():
+            return
+        push_ids = push_mask.nonzero(as_tuple=False).flatten()
+        n = len(push_ids)
+        vel_noise = torch.empty(n, 3, device=self.device).uniform_(
+            -self.push_vel_range, self.push_vel_range)
+        vel_noise[:, 2] = 0  # no vertical push
+        current_vel = engine.get_root_vel(char_id)[push_ids]
+        engine.set_root_vel(push_ids, char_id, current_vel + vel_noise)
+
+    def add_obs_noise(self, obs):
+        """Add Gaussian noise to observations."""
+        if self.obs_noise_std > 0:
+            return obs + torch.randn_like(obs) * self.obs_noise_std
+        return obs
 
 
 # ---------------------------------------------------------------------------
@@ -128,8 +191,8 @@ class G1WalkingEnvWrapper:
         # DOF limits
         self._setup_dof_limits()
 
-        # Hip DOF indices for hip_pos reward
-        self._find_hip_dof_indices()
+        # DOF group indices for rewards
+        self._find_dof_group_indices()
 
         # Save initial state for resets
         wp.synchronize()
@@ -155,7 +218,12 @@ class G1WalkingEnvWrapper:
         # Allocate buffers
         self._alloc_buffers()
 
-        # Reward function list (name → method)
+        # Domain randomization
+        self.dr = None
+        if self.cfg.enable_dr:
+            self.dr = DomainRandomization(self.num_envs, self.device, self.cfg)
+
+        # Reward function list (name -> method)
         self._reward_fns = {
             "tracking_lin_vel": self._reward_tracking_lin_vel,
             "tracking_ang_vel": self._reward_tracking_ang_vel,
@@ -172,6 +240,9 @@ class G1WalkingEnvWrapper:
             "contact_no_vel": self._reward_contact_no_vel,
             "feet_swing_height": self._reward_feet_swing_height,
             "contact": self._reward_contact,
+            "dof_torques": self._reward_dof_torques,
+            "joint_deviation_arms": self._reward_joint_deviation_arms,
+            "joint_deviation_torso": self._reward_joint_deviation_torso,
         }
         self._reward_scales = {}
         for name in self._reward_fns:
@@ -182,7 +253,7 @@ class G1WalkingEnvWrapper:
               f"num_bodies={self.num_bodies}")
         print(f"  [G1WalkingEnv] obs_dim={self.obs_dim}, act_dim={self.act_dim}, "
               f"dt={self.dt:.4f}s, max_ep={self.max_episode_length}")
-        print(f"  [G1WalkingEnv] default_dof_pos: {self.default_dof_pos.cpu().numpy()}")
+        print(f"  [G1WalkingEnv] DR={'ON' if self.dr else 'OFF'}")
 
     # ------------------------------------------------------------------
     # Initialization helpers
@@ -199,7 +270,6 @@ class G1WalkingEnvWrapper:
                 self.feet_names.append(name)
                 self.feet_body_ids.append(i)
         self.feet_num = len(self.feet_body_ids)
-        print(f"  [G1WalkingEnv] Feet: {list(zip(self.feet_names, self.feet_body_ids))}")
 
         # Pelvis (termination)
         self.pelvis_body_id = None
@@ -207,7 +277,6 @@ class G1WalkingEnvWrapper:
             if "pelvis" in name:
                 self.pelvis_body_id = i
                 break
-        print(f"  [G1WalkingEnv] Pelvis body id: {self.pelvis_body_id}")
 
         # Penalised contacts (hip, knee)
         self.penalized_body_ids = []
@@ -226,8 +295,8 @@ class G1WalkingEnvWrapper:
         self.soft_dof_pos_lower = mid - soft * half_range
         self.soft_dof_pos_upper = mid + soft * half_range
 
-    def _find_hip_dof_indices(self):
-        """Find DOF indices for hip roll/yaw joints (for hip_pos reward)."""
+    def _find_dof_group_indices(self):
+        """Find DOF indices for hip, arm, and torso joints."""
         model = self._engine._sim_model
         joint_keys = model.joint_key
         joint_qd_start = model.joint_qd_start.numpy()
@@ -237,22 +306,33 @@ class G1WalkingEnvWrapper:
         qd_offset = int(joint_qd_start[body_start + 1])  # root DOF offset
 
         self.hip_dof_indices = []
-        for j in range(1, joints_per_world):
-            name = joint_keys[body_start + j] if (body_start + j) < len(joint_keys) else ""
-            if "hip" in name and "pitch" not in name:
-                ds = int(joint_qd_start[body_start + j]) - qd_offset
-                de = int(joint_qd_start[body_start + j + 1]) - qd_offset
-                for d in range(ds, min(de, self.num_dofs)):
-                    self.hip_dof_indices.append(d)
+        self.arm_dof_indices = []
+        self.torso_dof_indices = []
 
-        # Fallback: if no hip DOFs found, use empty (skip reward)
-        if self.hip_dof_indices:
-            self.hip_dof_indices_t = torch.tensor(
-                self.hip_dof_indices, dtype=torch.long, device=self.device,
-            )
-        else:
-            self.hip_dof_indices_t = torch.zeros(0, dtype=torch.long, device=self.device)
-        print(f"  [G1WalkingEnv] Hip DOF indices: {self.hip_dof_indices}")
+        for j in range(1, joints_per_world):
+            idx = body_start + j
+            name = joint_keys[idx] if idx < len(joint_keys) else ""
+            ds = int(joint_qd_start[idx]) - qd_offset
+            de = int(joint_qd_start[idx + 1]) - qd_offset if (idx + 1) < len(joint_qd_start) else ds
+
+            for d in range(ds, min(de, self.num_dofs)):
+                if "hip" in name and "pitch" not in name:
+                    self.hip_dof_indices.append(d)
+                elif any(kw in name for kw in ["shoulder", "elbow", "wrist", "hand"]):
+                    self.arm_dof_indices.append(d)
+                elif "waist" in name or "torso" in name:
+                    self.torso_dof_indices.append(d)
+
+        self.hip_dof_indices_t = torch.tensor(
+            self.hip_dof_indices, dtype=torch.long, device=self.device) if self.hip_dof_indices else torch.zeros(0, dtype=torch.long, device=self.device)
+        self.arm_dof_indices_t = torch.tensor(
+            self.arm_dof_indices, dtype=torch.long, device=self.device) if self.arm_dof_indices else torch.zeros(0, dtype=torch.long, device=self.device)
+        self.torso_dof_indices_t = torch.tensor(
+            self.torso_dof_indices, dtype=torch.long, device=self.device) if self.torso_dof_indices else torch.zeros(0, dtype=torch.long, device=self.device)
+
+        print(f"  [G1WalkingEnv] Hip DOFs: {len(self.hip_dof_indices)}, "
+              f"Arm DOFs: {len(self.arm_dof_indices)}, "
+              f"Torso DOFs: {len(self.torso_dof_indices)}")
 
     def _alloc_buffers(self):
         N, D = self.num_envs, self.num_dofs
@@ -273,6 +353,7 @@ class G1WalkingEnvWrapper:
         self.projected_gravity = torch.zeros(N, 3, device=dev)
         self.dof_pos = torch.zeros(N, D, device=dev)
         self.dof_vel = torch.zeros(N, D, device=dev)
+        self.dof_forces = torch.zeros(N, D, device=dev)
         self.last_dof_vel = torch.zeros(N, D, device=dev)
         self.root_height = torch.zeros(N, device=dev)
 
@@ -302,10 +383,10 @@ class G1WalkingEnvWrapper:
     def _update_state(self):
         """Read engine state into local buffers."""
         cid = self._char_id
-        root_rot = self._engine.get_root_rot(cid)       # (N, 4)  xyzw
-        root_vel = self._engine.get_root_vel(cid)        # (N, 3)  world
-        root_ang = self._engine.get_root_ang_vel(cid)    # (N, 3)  world
-        root_pos = self._engine.get_root_pos(cid)        # (N, 3)
+        root_rot = self._engine.get_root_rot(cid)
+        root_vel = self._engine.get_root_vel(cid)
+        root_ang = self._engine.get_root_ang_vel(cid)
+        root_pos = self._engine.get_root_pos(cid)
 
         self.base_lin_vel[:] = quat_rotate_inverse(root_rot, root_vel)
         self.base_ang_vel[:] = quat_rotate_inverse(root_rot, root_ang)
@@ -315,10 +396,20 @@ class G1WalkingEnvWrapper:
         self.dof_pos[:] = self._engine.get_dof_pos(cid)
         self.dof_vel[:] = self._engine.get_dof_vel(cid)
 
+        # DOF forces (for torque penalty)
+        raw = self._engine._dof_forces
+        if isinstance(raw, torch.Tensor):
+            if raw.dim() == 3:
+                self.dof_forces[:] = torch.sum(raw, dim=-1)
+            else:
+                self.dof_forces[:] = raw
+        else:
+            self.dof_forces[:] = raw[cid]
+
         # Feet state
-        body_pos = self._engine.get_body_pos(cid)        # (N, B, 3)
-        body_vel = self._engine.get_body_vel(cid)        # (N, B, 3)
-        gc_forces = self._engine.get_ground_contact_forces(cid)  # (N, B, 3)
+        body_pos = self._engine.get_body_pos(cid)
+        body_vel = self._engine.get_body_vel(cid)
+        gc_forces = self._engine.get_ground_contact_forces(cid)
         self.ground_contact_forces = gc_forces
 
         for i, bid in enumerate(self.feet_body_ids):
@@ -374,8 +465,10 @@ class G1WalkingEnvWrapper:
         self.last_actions[:] = self.actions
         self.actions[:] = action
 
-        # Scale to target positions and send to engine
+        # Scale to target positions, apply motor strength DR
         target = action * self.cfg.action_scale + self.default_dof_pos.unsqueeze(0)
+        if self.dr is not None:
+            target = target * self.dr.motor_strength_scale
         self._engine.set_cmd(self._char_id, target)
 
         # Physics step
@@ -393,6 +486,10 @@ class G1WalkingEnvWrapper:
 
         # Update phase
         self._update_phase()
+
+        # Apply random pushes (DR)
+        if self.dr is not None:
+            self.dr.apply_push(self._engine, self._char_id, self.episode_length_buf)
 
         # Check termination
         self._check_termination()
@@ -422,6 +519,11 @@ class G1WalkingEnvWrapper:
 
         # Compute observations (post-reset for terminated envs)
         self._compute_observations()
+
+        # Apply observation noise (DR)
+        if self.dr is not None:
+            self.obs_buf = self.dr.add_obs_noise(self.obs_buf)
+
         self.last_obs = self.obs_buf.clone()
 
         return self.obs_buf.clone(), self.rew_buf.clone(), done, {}
@@ -443,7 +545,7 @@ class G1WalkingEnvWrapper:
         self._engine.set_dof_vel(
             env_ids, cid, torch.zeros(n, self.num_dofs, device=self.device))
 
-        # Sync joint_q from dof_pos (ball-joint exp-map → quaternion) and FK
+        # Sync joint_q from dof_pos (ball-joint exp-map -> quaternion) and FK
         self._engine._sim_state.pre_step_update()
         self._engine._sim_state.eval_fk()
         wp.synchronize()
@@ -458,6 +560,10 @@ class G1WalkingEnvWrapper:
         self.ep_length_accum[env_ids] = 0
 
         self._resample_commands(env_ids)
+
+        # Randomize DR params for reset envs
+        if self.dr is not None:
+            self.dr.randomize_envs(env_ids)
 
     def _record_completed(self, env_ids):
         for idx in env_ids:
@@ -522,6 +628,12 @@ class G1WalkingEnvWrapper:
             rew = fn() * scale
             self.rew_buf += rew
 
+        # Termination penalty (only for failures, not timeouts)
+        if self.pelvis_body_id is not None and self.ground_contact_forces is not None:
+            pelvis_force = self.ground_contact_forces[:, self.pelvis_body_id, :]
+            fell = torch.norm(pelvis_force, dim=-1) > 1.0
+            self.rew_buf += self.cfg.termination_penalty * fell.float()
+
     # --- Individual reward functions ---
 
     def _reward_tracking_lin_vel(self):
@@ -571,18 +683,18 @@ class G1WalkingEnvWrapper:
             torch.square(self.dof_pos[:, self.hip_dof_indices_t]), dim=1)
 
     def _reward_contact_no_vel(self):
-        contact = torch.norm(self.feet_contact_forces, dim=2) > 1.0  # (N, F)
-        contact_vel = self.feet_vel * contact.unsqueeze(-1)            # (N, F, 3)
+        contact = torch.norm(self.feet_contact_forces, dim=2) > 1.0
+        contact_vel = self.feet_vel * contact.unsqueeze(-1)
         return torch.sum(torch.square(contact_vel), dim=(1, 2))
 
     def _reward_feet_swing_height(self):
-        contact = torch.norm(self.feet_contact_forces, dim=2) > 1.0   # (N, F)
+        contact = torch.norm(self.feet_contact_forces, dim=2) > 1.0
         target_h = self.cfg.feet_swing_height_target
         pos_error = torch.square(self.feet_pos[:, :, 2] - target_h) * (~contact)
         return torch.sum(pos_error, dim=1)
 
     def _reward_contact(self):
-        """Phase-aware contact reward: feet should be in stance/swing at the right time."""
+        """Phase-aware contact reward."""
         res = torch.zeros(self.num_envs, device=self.device)
         for i in range(self.feet_num):
             is_stance = self.leg_phase[:, i] < 0.55
@@ -590,3 +702,23 @@ class G1WalkingEnvWrapper:
                 self.feet_contact_forces[:, i, :], dim=-1) > 1.0
             res += (~(has_contact ^ is_stance)).float()
         return res
+
+    def _reward_dof_torques(self):
+        """Joint torque penalty (IsaacLab dof_torques_l2)."""
+        return torch.sum(torch.square(self.dof_forces), dim=-1)
+
+    def _reward_joint_deviation_arms(self):
+        """Arm joint deviation from default (IsaacLab joint_deviation_arms)."""
+        if len(self.arm_dof_indices_t) == 0:
+            return torch.zeros(self.num_envs, device=self.device)
+        default = self.default_dof_pos[self.arm_dof_indices_t].unsqueeze(0)
+        return torch.sum(
+            torch.abs(self.dof_pos[:, self.arm_dof_indices_t] - default), dim=1)
+
+    def _reward_joint_deviation_torso(self):
+        """Torso joint deviation from default (IsaacLab joint_deviation_torso)."""
+        if len(self.torso_dof_indices_t) == 0:
+            return torch.zeros(self.num_envs, device=self.device)
+        default = self.default_dof_pos[self.torso_dof_indices_t].unsqueeze(0)
+        return torch.sum(
+            torch.abs(self.dof_pos[:, self.torso_dof_indices_t] - default), dim=1)
