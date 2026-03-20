@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Level 3: Unified Single-Process PGHC Co-Design for G1 Humanoid
+Unified Single-Process GBC (Gradient-Based Co-Design) for G1 Humanoid
 
 Eliminates subprocess overhead by importing MimicKit as a library and keeping
 all GPU resources persistent across outer iterations.
@@ -32,22 +32,22 @@ os.environ["PYGLET_HEADLESS"] = "1"
 # ---------------------------------------------------------------------------
 # Multi-GPU device isolation (must run BEFORE any GPU library imports)
 #
-# Spawned worker processes inherit _PGHC_GPU_INDEX from the parent.  We read
-# it here — at module import time — and restrict CUDA_VISIBLE_DEVICES to that
+# Spawned worker processes inherit _GBC_GPU_INDEX from the parent.  We read it
+# here — at module import time — and restrict CUDA_VISIBLE_DEVICES to that
 # single physical GPU.  This ensures warp/torch/newton only see one device,
 # avoiding cross-device allocation failures on HPC nodes.
 # ---------------------------------------------------------------------------
-_PGHC_GPU_INDEX = os.environ.pop("_PGHC_GPU_INDEX", None)
-if _PGHC_GPU_INDEX is not None:
+_GBC_GPU_INDEX = os.environ.pop("_GBC_GPU_INDEX", None)
+if _GBC_GPU_INDEX is not None:
     _orig_cvd = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     if _orig_cvd:
         _gpu_list = [g.strip() for g in _orig_cvd.split(",")]
-        _idx = int(_PGHC_GPU_INDEX)
+        _idx = int(_GBC_GPU_INDEX)
         os.environ["CUDA_VISIBLE_DEVICES"] = (
-            _gpu_list[_idx] if _idx < len(_gpu_list) else _PGHC_GPU_INDEX
+            _gpu_list[_idx] if _idx < len(_gpu_list) else _GBC_GPU_INDEX
         )
     else:
-        os.environ["CUDA_VISIBLE_DEVICES"] = _PGHC_GPU_INDEX
+        os.environ["CUDA_VISIBLE_DEVICES"] = _GBC_GPU_INDEX
 
 import argparse
 import platform
@@ -83,10 +83,10 @@ import warp as wp
 
 # Per-rank Warp cache to prevent NVRTC race conditions on multi-GPU nodes.
 # Without this, all ranks share ~/.cache/warp/ and corrupt PCH files when
-# compiling kernels simultaneously (e.g. during FD evaluation phase).
-if _PGHC_GPU_INDEX is not None:
+# compiling kernels simultaneously (e.g. during SPSA evaluation phase).
+if _GBC_GPU_INDEX is not None:
     _warp_cache = os.path.join(
-        os.path.expanduser("~"), ".cache", "warp_per_rank", f"rank_{_PGHC_GPU_INDEX}"
+        os.path.expanduser("~"), ".cache", "warp_per_rank", f"rank_{_GBC_GPU_INDEX}"
     )
     os.makedirs(_warp_cache, exist_ok=True)
     wp.config.kernel_cache_dir = _warp_cache
@@ -103,7 +103,7 @@ import learning.base_agent as base_agent_mod
 import envs.base_env as base_env_mod
 
 # NOTE: MimicKit's newton_engine.py sets wp.config.enable_backward = False.
-# With closed-loop FD (no BPTT), we never need backward mode enabled.
+# With closed-loop SPSA (no BPTT), we never need backward mode enabled.
 
 # Co-design modules
 from g1_mjcf_modifier import (
@@ -115,6 +115,22 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Physics constants
+# ---------------------------------------------------------------------------
+GRAVITY = 9.81
+VELOCITY_EPSILON = 0.01  # smoothing for safe_v = sqrt(v^2 + eps)
+TERM_PENALTY = -10.0
+THETA_BOUNDS = (-np.radians(30), np.radians(30))  # +/-30 deg
+
+_EMPTY_TEST_INFO = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
+
+
+def compute_cot(mean_power, mean_fwd_vel, total_mass):
+    """Cost of Transport: power / (m * g * |v|), with velocity smoothing."""
+    safe_v = torch.sqrt(mean_fwd_vel ** 2 + VELOCITY_EPSILON)
+    return mean_power / (total_mass * GRAVITY * safe_v)
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +177,6 @@ class EpisodeCoTTracker:
 
     def __init__(self, num_envs, total_mass, device):
         self.total_mass = total_mass
-        self.g = 9.81
         self.power_sum = torch.zeros(num_envs, device=device)
         self.vel_sum = torch.zeros(num_envs, device=device)
         self.step_count = torch.zeros(num_envs, device=device, dtype=torch.long)
@@ -200,8 +215,7 @@ class EpisodeCoTTracker:
             vs = steps[valid]
             mp = self.power_sum[vi] / vs
             mv = self.vel_sum[vi] / vs
-            safe_v = torch.sqrt(mv ** 2 + 0.01)
-            cots = mp / (self.total_mass * self.g * safe_v)
+            cots = compute_cot(mp, mv, self.total_mass)
             self.episode_cots.extend(cots.tolist())
             self.episode_powers.extend(mp.tolist())
             self.episode_vels.extend(mv.tolist())
@@ -234,7 +248,7 @@ def codesign_task_reward(self):
     the agent's reward blending picks up a non-zero task_r:
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
 
-    Uses the same cost function as the outer loop FD objective:
+    Uses the same cost function as the outer loop SPSA objective:
         reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
     """
     char_id = self._get_char_id()
@@ -246,15 +260,14 @@ def codesign_task_reward(self):
     dof_forces = EpisodeCoTTracker.get_dof_forces_safe(self._engine, char_id)
     dof_vel = self._engine.get_dof_vel(char_id)
     mech_power = torch.sum(torch.abs(dof_forces[:, :_LOCO_DOFS] * dof_vel[:, :_LOCO_DOFS]), dim=-1)
-    safe_v = torch.sqrt(fwd_vel ** 2 + 0.01)
-    cot = mech_power / (self._total_mass * 9.81 * safe_v)
+    cot = compute_cot(mech_power, fwd_vel, self._total_mass)
 
     # 2. Velocity tracking: exp(-|v_x - v_cmd|^2 / sigma)
     vel_tracking = torch.exp(-torch.square(fwd_vel - self._vel_cmd) / self._vel_tracking_sigma)
     vel_reward = self._vel_reward_weight * vel_tracking
 
     # 3. Termination penalty
-    term_penalty = -10.0 * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
+    term_penalty = TERM_PENALTY * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
 
     self._reward_buf[:] = -cot + vel_reward + term_penalty
 
@@ -305,7 +318,7 @@ class CautiousBFGS:
     giving a better Hessian estimate than limited-memory L-BFGS.
 
     Cautious: skips the Hessian update when s^T y <= 0 (negative or zero
-    curvature from stochastic FD noise).  H_k stays at its previous value
+    curvature from stochastic SPSA noise).  H_k stays at its previous value
     rather than being corrupted by a bad update.
 
     API is split into compute_direction / update so that bounds clipping
@@ -485,6 +498,29 @@ class InnerLoopController:
         self.device = device
         self.rank = rank
 
+    def _log_wandb_inner(self):
+        """Forward inner loop metrics + episode CoT to wandb."""
+        agent = self.agent
+        env = agent._env
+        wlog = {}
+        for k, entry in agent._logger.log_current_row.items():
+            v = entry.val
+            try:
+                wlog[f"inner/{k}"] = float(v)
+            except (TypeError, ValueError):
+                pass
+        cot_tracker = env._cot_tracker
+        cot, mech_power, fwd_vel, n_eps = cot_tracker.get_stats()
+        if cot is not None:
+            wlog["inner/cot"] = cot
+            wlog["inner/mechanical_power"] = mech_power
+            wlog["inner/forward_velocity"] = fwd_vel
+            wlog["inner/cot_episodes"] = n_eps
+        wlog["inner/task_reward_weight"] = agent._task_reward_weight
+        wlog["inner/disc_reward_weight"] = agent._disc_reward_weight
+        if wlog:
+            wandb.log(wlog, step=agent._iter)
+
     def _check_plateau(self, values):
         n_required = max(self.plateau_window, self.min_plateau_outputs)
         if len(values) < n_required:
@@ -524,17 +560,17 @@ class InnerLoopController:
         agent._iter = saved_iter  # restore so wandb x-axis is monotonic
 
         # Restore reward weights after _init_train() which may reset them.
-        # When the ramp has completed, we must stay at pure task reward;
+        # When the ramp has completed, we must stay at the final blend;
         # otherwise the ramp logic below will set them on the first iteration.
         if self.ramp_completed:
-            agent._task_reward_weight = 1.0
-            agent._disc_reward_weight = 0.0
+            agent._task_reward_weight = 0.9
+            agent._disc_reward_weight = 0.1
 
         disc_rewards = []
         convergence_values = []
         converged = False
         start_time = time.time()
-        test_info = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
+        test_info = _EMPTY_TEST_INFO
         inner_iters = 0
         last_actor_loss = None
 
@@ -542,21 +578,21 @@ class InnerLoopController:
             train_info = agent._train_iter()                      # COLLECTIVE
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
 
-            # Reward weight ramp: disc 1.0→0.0, task 0.0→1.0 over [ramp_start, ramp_end]
-            # Only runs during kickoff; after ramp completes, stays at task=1.0/disc=0.0
+            # Reward weight ramp: disc 1.0→0.1, task 0.0→0.9 over [ramp_start, ramp_end]
+            # Only runs during kickoff; after ramp completes, stays at task=0.9/disc=0.1
             if not self.ramp_completed:
                 it = inner_iters
                 if it <= self.ramp_start_iter:
                     agent._task_reward_weight = 0.0
                     agent._disc_reward_weight = 1.0
                 elif it >= self.ramp_end_iter:
-                    agent._task_reward_weight = 1.0
-                    agent._disc_reward_weight = 0.0
+                    agent._task_reward_weight = 0.9
+                    agent._disc_reward_weight = 0.1
                     self.ramp_completed = True
                 else:
                     t = (it - self.ramp_start_iter) / (self.ramp_end_iter - self.ramp_start_iter)
-                    agent._task_reward_weight = t
-                    agent._disc_reward_weight = 1.0 - t
+                    agent._task_reward_weight = 0.9 * t
+                    agent._disc_reward_weight = 1.0 - 0.9 * t
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
@@ -586,11 +622,7 @@ class InnerLoopController:
                         al = al.item()
                     last_actor_loss = al
 
-                test_info = {
-                    "mean_return": 0.0,
-                    "mean_ep_len": 0.0,
-                    "num_eps": 0,
-                }
+                test_info = _EMPTY_TEST_INFO
 
             env_diag_info = env.get_diagnostics()
             agent._log_train_info(train_info, test_info, env_diag_info,
@@ -630,31 +662,8 @@ class InnerLoopController:
                             if self.log_file:
                                 wandb.save(self.log_file, base_path=str(Path(self.log_file).parent), policy="live")
 
-                    # wandb: forward inner loop metrics + CoT
                     if self.use_wandb:
-                        wlog = {}
-                        for k, entry in agent._logger.log_current_row.items():
-                            v = entry.val
-                            try:
-                                wlog[f"inner/{k}"] = float(v)
-                            except (TypeError, ValueError):
-                                pass
-
-                        # Episode-averaged CoT from tracker
-                        cot_tracker = env._cot_tracker
-                        cot, mech_power, fwd_vel, n_eps = cot_tracker.get_stats()
-                        if cot is not None:
-                            wlog["inner/cot"] = cot
-                            wlog["inner/mechanical_power"] = mech_power
-                            wlog["inner/forward_velocity"] = fwd_vel
-                            wlog["inner/cot_episodes"] = n_eps
-
-                        # Reward weights so we can see actual contributions
-                        wlog["inner/task_reward_weight"] = agent._task_reward_weight
-                        wlog["inner/disc_reward_weight"] = agent._disc_reward_weight
-
-                        if wlog:
-                            wandb.log(wlog, step=agent._iter)
+                        self._log_wandb_inner()
 
                     # Video capture every video_interval iterations
                     if (self.use_wandb and self.viewer is not None
@@ -707,7 +716,7 @@ class InnerLoopController:
 
 
 # ---------------------------------------------------------------------------
-# World-partitioned FD gradient
+# World-partitioned SPSA gradient
 # ---------------------------------------------------------------------------
 
 def apply_partitioned_morphologies(model, theta_np, eps, n_params,
@@ -721,8 +730,8 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
         partition 2*m+1:          theta + eps * directions[m]
         partition 2*m+2:          theta - eps * directions[m]
 
-    When directions is None, falls back to coordinate-wise FD (axis-aligned
-    perturbations, M=n_params).
+    When directions is None, falls back to axis-aligned perturbations
+    (M=n_params).
 
     Each partition spans worlds [p * wpp, (p+1) * wpp).
     Worlds beyond n_pert * wpp are left untouched (they won't be read).
@@ -791,7 +800,7 @@ def generate_orthogonal_directions(n_params, num_sets, seed):
     return np.vstack(blocks)  # (S*N, N)
 
 
-def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
+def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   theta_np, base_quats_dict, joint_idx_map,
                                   num_worlds, horizon,
                                   rank, num_procs, device, param_names,
@@ -898,8 +907,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
                         vsc = step_count[vi].float()
                         mp = power_sum[vi] / vsc
                         mv = vel_sum[vi] / vsc
-                        safe_v = torch.sqrt(mv ** 2 + 0.01)
-                        ep_cot_sum[vi] += mp / (total_mass * 9.81 * safe_v)
+                        ep_cot_sum[vi] += compute_cot(mp, mv, total_mass)
                         ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
                         ep_count[vi] += 1
                     power_sum[di] = 0
@@ -914,8 +922,7 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
             vsc = step_count[ai].float()
             mp = power_sum[ai] / vsc
             mv = vel_sum[ai] / vsc
-            safe_v = torch.sqrt(mv ** 2 + 0.01)
-            ep_cot_sum[ai] += mp / (total_mass * 9.81 * safe_v)
+            ep_cot_sum[ai] += compute_cot(mp, mv, total_mass)
             ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
             ep_count[ai] += 1
 
@@ -1008,6 +1015,97 @@ def compute_fd_gradient_parallel(agent, env, engine, char_id, total_mass,
 
 
 # ---------------------------------------------------------------------------
+# Envelope Theorem validation: policy gradient norm at convergence
+# ---------------------------------------------------------------------------
+
+def compute_envelope_gradient_norm(agent, env, device, num_steps=None):
+    """Measure ||grad_theta J_task|| at policy convergence.
+
+    Collects a fresh rollout with the converged policy, computes Monte Carlo
+    returns from task rewards, then backprops the REINFORCE objective through
+    the actor network to get the un-clipped policy gradient norm.
+
+    A small value (relative to mid-training) empirically validates the
+    Envelope Theorem precondition: grad_theta J ≈ 0 at the converged policy.
+
+    Single-rank diagnostic — no collective ops. Call on root only.
+    """
+    if num_steps is None:
+        num_steps = agent._steps_per_iter
+
+    # 1. Collect rollout (no grad) — task reward is in _reward_buf via
+    #    codesign_task_reward monkey-patch
+    agent.eval()
+    agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+    obs, info = env.reset()
+
+    all_obs, all_norm_actions, all_rewards, all_dones = [], [], [], []
+    with torch.no_grad():
+        for _ in range(num_steps):
+            action, action_info = agent._decide_action(obs, info)
+            next_obs, reward, done, info = env.step(action)
+            all_obs.append(obs)
+            all_norm_actions.append(agent._a_norm.normalize(action))
+            all_rewards.append(reward)
+            all_dones.append(done)
+            obs = next_obs
+
+    obs_t = torch.stack(all_obs)           # [T, N, obs_dim]
+    act_t = torch.stack(all_norm_actions)   # [T, N, act_dim]
+    rew_t = torch.stack(all_rewards)        # [T, N]
+    done_t = torch.stack(all_dones)         # [T, N]
+    T, N = rew_t.shape
+
+    # 2. Monte Carlo returns
+    returns = torch.zeros_like(rew_t)
+    G = torch.zeros(N, device=device)
+    gamma = agent._discount
+    for t in reversed(range(T)):
+        alive = (done_t[t] == 0).float()
+        G = rew_t[t] + gamma * G * alive
+        returns[t] = G
+
+    flat_ret = returns.reshape(-1)
+    ret_mean = flat_ret.mean()
+    ret_std = flat_ret.std().clamp(min=1e-5)
+    norm_ret = ((returns - ret_mean) / ret_std).reshape(-1).detach()
+
+    # 3. Forward pass WITH gradient — REINFORCE loss
+    agent.train()
+    for p in agent._model.get_actor_params():
+        if p.grad is not None:
+            p.grad.zero_()
+
+    flat_obs = obs_t.reshape(T * N, -1)
+    flat_act = act_t.reshape(T * N, -1)
+
+    norm_obs = agent._obs_norm.normalize(flat_obs)
+    a_dist = agent._model.eval_actor(norm_obs)
+    logp = a_dist.log_prob(flat_act)
+
+    loss = -torch.mean(logp * norm_ret)
+    loss.backward()
+
+    # 4. Read actor gradient L2 norm
+    total_norm_sq = 0.0
+    for p in agent._model.get_actor_params():
+        if p.grad is not None:
+            total_norm_sq += p.grad.data.norm(2).item() ** 2
+    grad_norm = total_norm_sq ** 0.5
+
+    # Clean up — don't leave stale gradients
+    for p in agent._model.get_actor_params():
+        if p.grad is not None:
+            p.grad.zero_()
+    agent.eval()
+
+    # Reset env so SPSA starts from clean state
+    env.reset()
+
+    return grad_norm
+
+
+# ---------------------------------------------------------------------------
 # Video capture
 # ---------------------------------------------------------------------------
 
@@ -1060,16 +1158,13 @@ def capture_video(viewer, agent, env, engine, num_steps=200, fps=30):
 
 
 # ---------------------------------------------------------------------------
-# Main PGHC loop (one per GPU rank)
+# Worker initialization
 # ---------------------------------------------------------------------------
 
-def pghc_worker(rank, num_procs, device, master_port, args):
-    """Unified single-process PGHC co-design for G1 humanoid.
+def _init_gbc_worker(rank, num_procs, device, master_port, args):
+    """One-time worker setup: distributed init, env/agent build, joint extraction.
 
-    Each GPU rank runs this function. The inner loop (MimicKit training) and
-    FD gradient rollouts are both distributed across all ranks via
-    torch.distributed collective ops. Adam update runs on rank 0; theta is
-    broadcast after.
+    Returns a SimpleNamespace with all state needed by the outer loop.
     """
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
@@ -1113,7 +1208,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
     if is_root:
         print("=" * 70)
-        print("PGHC Co-Design for G1 Humanoid (Level 3 — Unified Single-Process)")
+        print("GBC (Gradient-Based Co-Design) for G1 Humanoid")
         if num_procs > 1:
             print(f"  Multi-GPU: {num_procs} GPUs, {per_rank_envs} envs/GPU "
                   f"({args.num_train_envs} total)")
@@ -1129,28 +1224,24 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     use_wandb = is_root and args.wandb and WANDB_AVAILABLE
     if use_wandb:
         wandb.init(
-            project="pghc-codesign",
+            project="gbc-codesign",
             name=f"g1-unified-{args.num_train_envs}env-{num_procs}gpu",
             config=vars(args),
         )
     elif is_root and args.wandb:
         print("  [wandb] Not available, continuing without")
 
-    # =========================================================
-    # One-time initialization
-    # =========================================================
+    # ---- MimicKit initialization ----
     if is_root:
         print("\n[1/3] Initializing MimicKit...")
 
-    # Generate initial MJCF (theta=0 = unmodified base G1)
-    theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
     mjcf_modifier = G1MJCFModifier(str(BASE_MJCF_PATH))
-
     modified_mjcf = out_dir / "g1_modified.xml"
     modified_env_config = out_dir / "env_config.yaml"
 
+    theta_init = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
     if is_root:
-        mjcf_modifier.generate(theta, str(modified_mjcf))
+        mjcf_modifier.generate(theta_init, str(modified_mjcf))
 
         # Mesh directory symlink for MJCF relative paths
         mesh_src = BASE_MJCF_PATH.parent / "meshes"
@@ -1198,8 +1289,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # Monkey-patch task reward onto env (replaces empty _update_reward)
     env._update_reward = types.MethodType(codesign_task_reward, env)
 
-    # Set task reward attributes now (before build_agent which may trigger env steps).
-    # _total_mass is a placeholder here; overwritten with real value after extract_joint_info.
+    # Placeholder mass (build_agent may trigger env steps before real mass is known)
     env._total_mass = 1.0
     env._vel_reward_weight = args.vel_reward_weight
     env._vel_cmd = args.vel_cmd
@@ -1247,11 +1337,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print(f"  Robot mass: {total_mass:.2f} kg")
 
-    # Set task reward attributes (used by codesign_task_reward, bound earlier)
+    # Overwrite placeholder mass with real value
     env._total_mass = total_mass
-    env._vel_reward_weight = args.vel_reward_weight
-    env._vel_cmd = args.vel_cmd
-    env._vel_tracking_sigma = args.vel_tracking_sigma
 
     # Episode-averaged CoT tracker (hooked into _post_physics_step)
     env._cot_tracker = EpisodeCoTTracker(per_rank_envs, total_mass, device)
@@ -1277,14 +1364,44 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             print(f"  [Viewer] Failed to create viewer: {e}")
             viewer = None
 
+    return types.SimpleNamespace(
+        is_root=is_root, per_rank_envs=per_rank_envs,
+        env=env, agent=agent, engine=engine, sim_model=sim_model,
+        char_id=char_id, total_mass=total_mass,
+        base_quats_dict=base_quats_dict, joint_idx_map=joint_idx_map,
+        viewer=viewer, use_wandb=use_wandb, out_dir=out_dir, log_file=log_file,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main GBC loop (one per GPU rank)
+# ---------------------------------------------------------------------------
+
+def gbc_worker(rank, num_procs, device, master_port, args):
+    """Unified single-process GBC (Gradient-Based Co-Design) for G1 humanoid.
+
+    Each GPU rank runs this function. The inner loop (MimicKit training) and
+    SPSA gradient rollouts are both distributed across all ranks via
+    torch.distributed collective ops. BFGS update runs on rank 0; theta is
+    broadcast after.
+    """
+    ws = _init_gbc_worker(rank, num_procs, device, master_port, args)
+    is_root, per_rank_envs = ws.is_root, ws.per_rank_envs
+    env, agent, engine = ws.env, ws.agent, ws.engine
+    sim_model, char_id, total_mass = ws.sim_model, ws.char_id, ws.total_mass
+    base_quats_dict, joint_idx_map = ws.base_quats_dict, ws.joint_idx_map
+    viewer, use_wandb = ws.viewer, ws.use_wandb
+    out_dir, log_file = ws.out_dir, ws.log_file
+
     # =========================================================
     # Outer loop setup
     # =========================================================
     if is_root:
-        print("[3/3] Starting PGHC outer loop...\n")
+        print("[3/3] Starting GBC outer loop...\n")
 
+    theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
     bfgs = CautiousBFGS(NUM_DESIGN_PARAMS)
-    theta_bounds = (-0.5236, 0.5236)  # +/-30 deg
+    theta_bounds = THETA_BOUNDS
 
     param_names = [
         f"theta_{i}_{SYMMETRIC_PAIRS[i][0].replace('_link', '')}"
@@ -1316,8 +1433,8 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     if args.resume_checkpoint:
         inner_ctrl.ramp_completed = True
         inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
-        agent._task_reward_weight = 1.0
-        agent._disc_reward_weight = 0.0
+        agent._task_reward_weight = 0.9
+        agent._disc_reward_weight = 0.1
         if is_root:
             print(f"  [Resume] Skipping kickoff ramp (ramp_completed=True, "
                   f"min_inner_iters={inner_ctrl.min_inner_iters})")
@@ -1330,6 +1447,13 @@ def pghc_worker(rank, num_procs, device, master_port, args):
         "grad_snr": [],
         "inner_times": [],
     }
+
+    # Adaptive trust region state (1b)
+    trust_radius = np.radians(args.max_step_deg)
+    TRUST_RADIUS_MIN = np.radians(0.05)
+    TRUST_RADIUS_MAX = np.radians(5.0)
+    prev_center_reward = None
+    predicted_improvement = None
     theta_history = deque(maxlen=5)
 
     if is_root:
@@ -1340,21 +1464,24 @@ def pghc_worker(rank, num_procs, device, master_port, args):
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner iters:   {args.max_inner_iters}")
         print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
-        print(f"  Max step size:     {args.max_step_deg} deg/iter ({np.radians(args.max_step_deg):.4f} rad)")
+        print(f"  Max step size:     {args.max_step_deg} deg/iter initial "
+              f"(adaptive trust region, floor={np.degrees(TRUST_RADIUS_MIN):.2f} deg, "
+              f"ceil={np.degrees(TRUST_RADIUS_MAX):.1f} deg)")
         print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
-        print(f"  Theta bounds:      +/-30 deg (+/-0.5236 rad)")
+        print(f"  Theta bounds:      +/-{np.degrees(THETA_BOUNDS[1]):.0f} deg "
+              f"(+/-{THETA_BOUNDS[1]:.4f} rad)")
         if args.kickoff_min_iters > 0:
             print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
-        print(f"  Reward ramp:       disc 1.0→0.0, task 0.0→1.0 "
+        print(f"  Reward ramp:       disc 1.0→0.1, task 0.0→0.9 "
               f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
         _M = args.spsa_sets * NUM_DESIGN_PARAMS
         _n_pert = 1 + 2 * _M
         _wpp = per_rank_envs // _n_pert
         print(f"  SPSA sets:         {args.spsa_sets} ({_M} directions, "
               f"{_n_pert} perturbations, {_wpp} worlds/pert/GPU)")
-        print(f"  FD seeds:          {args.num_fd_seeds} (paired-seed averaging)")
-        print(f"  FD epsilon:        {args.fd_epsilon} rad "
-              f"({np.degrees(args.fd_epsilon):.1f} deg)")
+        print(f"  SPSA seeds:        {args.num_spsa_seeds} (paired-seed averaging)")
+        print(f"  SPSA epsilon:      {args.spsa_epsilon} rad "
+              f"({np.degrees(args.spsa_epsilon):.1f} deg)")
         if args.snr_threshold > 0:
             print(f"  SNR threshold:     {args.snr_threshold}")
         print(f"  Vel reward weight: {args.vel_reward_weight} "
@@ -1408,30 +1535,38 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
             inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
 
-        # ----- FD Gradient Phase (ALL ranks, closed-loop) -----
-        # Clear CoT tracker before FD to prevent cross-contamination
+        # ----- Envelope Theorem validation (1a, root only) -----
+        envelope_grad_norm = None
+        if is_root and inner_ctrl.ramp_completed:
+            envelope_grad_norm = compute_envelope_gradient_norm(
+                agent, env, device)
+            print(f"  [Envelope] Policy gradient norm at convergence: "
+                  f"{envelope_grad_norm:.6f}")
+
+        # ----- SPSA Gradient Phase (ALL ranks, closed-loop) -----
+        # Clear CoT tracker before SPSA to prevent cross-contamination
         env._cot_tracker.get_stats()  # drain any accumulated episodes
         env._cot_tracker.reset_accumulators()
 
         if is_root:
             print(f"\n  [SPSA] Computing orthogonal SPSA gradient "
-                  f"(S={args.spsa_sets}, {args.num_fd_seeds} seeds, "
+                  f"(S={args.spsa_sets}, {args.num_spsa_seeds} seeds, "
                   f"{args.eval_horizon} steps)...")
 
-        fd_base_seed = 42 + outer_iter * 1000
+        spsa_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, grad_stderr, grad_snr, vel_track, cot = compute_fd_gradient_parallel(
+        grad_theta, grad_stderr, grad_snr, vel_track, cot = compute_spsa_gradient_parallel(
             agent, env, engine, char_id, total_mass,
             theta.copy(), base_quats_dict, joint_idx_map,
             per_rank_envs, args.eval_horizon,
             rank, num_procs, device, param_names,
-            num_seeds=args.num_fd_seeds, base_seed=fd_base_seed,
-            eps=args.fd_epsilon, vel_reward_weight=args.vel_reward_weight,
+            num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
+            eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
             vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
             num_spsa_sets=args.spsa_sets,
         )
 
-        # Clear CoT tracker after FD to prevent pollution of inner loop
+        # Clear CoT tracker after SPSA to prevent pollution of inner loop
         env._cot_tracker.get_stats()
         env._cot_tracker.reset_accumulators()
 
@@ -1447,6 +1582,28 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             history["gradients"].append(grad_theta.copy())
             history["grad_snr"].append(grad_snr.copy())
 
+            # ----- Adaptive trust region ratio test (1b) -----
+            center_reward = -cot + args.vel_reward_weight * vel_track
+            rho = None
+            if prev_center_reward is not None and predicted_improvement is not None:
+                actual_improvement = center_reward - prev_center_reward
+                if abs(predicted_improvement) > 1e-12:
+                    rho = actual_improvement / predicted_improvement
+                else:
+                    rho = 0.0
+
+                if rho > 0.75:
+                    trust_radius = min(trust_radius * 1.5, TRUST_RADIUS_MAX)
+                elif rho < 0.25:
+                    trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
+
+                print(f"    [Trust Region] rho={rho:.3f}, "
+                      f"actual={actual_improvement:+.6f}, "
+                      f"predicted={predicted_improvement:+.6f}, "
+                      f"radius={np.degrees(trust_radius):.3f} deg")
+
+            prev_center_reward = center_reward
+
             # ----- Design Update (rank 0 only) -----
             n_clamped = 0
             raw_step = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
@@ -1454,52 +1611,69 @@ def pghc_worker(rank, num_procs, device, master_port, args):
             if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
                 print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
                       f"signaling all ranks to stop.")
-                # Signal via NaN theta — all ranks will detect and break
                 theta[:] = np.nan
+                predicted_improvement = None
             else:
+                # Save raw gradient before SNR masking (Bug B fix: BFGS
+                # must receive the true gradient for correct y-vector)
+                grad_theta_raw = grad_theta.copy()
+
                 # SNR gating: zero out gradient components with low confidence
                 # (inf SNR = high confidence from single seed, kept through)
+                skip_update = False
                 if args.snr_threshold > 0:
                     snr_mask = (grad_snr > args.snr_threshold) | ~np.isfinite(grad_snr)
                     n_masked = NUM_DESIGN_PARAMS - snr_mask.sum()
                     if n_masked == NUM_DESIGN_PARAMS:
+                        # Bug A fix: actually skip the update instead of
+                        # proceeding with all-zero gradients
                         print(f"    [SNR gate] WARNING: All {NUM_DESIGN_PARAMS} params "
                               f"masked (SNR < {args.snr_threshold}), skipping update")
-                    elif n_masked > 0:
-                        print(f"    [SNR gate] Masking {n_masked}/{NUM_DESIGN_PARAMS} params "
-                              f"with SNR < {args.snr_threshold}")
-                    grad_theta = grad_theta * snr_mask.astype(float)
+                        skip_update = True
+                        predicted_improvement = 0.0
+                    else:
+                        if n_masked > 0:
+                            print(f"    [SNR gate] Masking {n_masked}/{NUM_DESIGN_PARAMS} params "
+                                  f"with SNR < {args.snr_threshold}")
+                        grad_theta = grad_theta * snr_mask.astype(float)
 
-                old_theta = theta.copy()
-                direction = bfgs.compute_direction(grad_theta)
-                step = args.design_lr * direction
+                if not skip_update:
+                    old_theta = theta.copy()
+                    direction = bfgs.compute_direction(grad_theta)
+                    step = args.design_lr * direction
 
-                # Trust-region clamp: limit per-parameter step magnitude
-                max_step_rad = np.radians(args.max_step_deg)
-                raw_step = step.copy()
-                step = np.clip(step, -max_step_rad, max_step_rad)
-                n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
-                if n_clamped > 0:
-                    print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
-                          f"params to +/-{args.max_step_deg} deg")
+                    # Adaptive trust-region clamp (1b)
+                    max_step_rad = trust_radius
+                    raw_step = step.copy()
+                    step = np.clip(step, -max_step_rad, max_step_rad)
+                    n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
+                    if n_clamped > 0:
+                        print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
+                              f"params to +/-{np.degrees(max_step_rad):.3f} deg")
 
-                theta = old_theta + step
-                theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
+                    theta = old_theta + step
+                    theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
 
-                # Record actual step (post-clip) for Hessian update
-                actual_s = theta - old_theta
-                bfgs.update(actual_s, grad_theta)
+                    # Record actual step (post-clip) for Hessian update
+                    actual_s = theta - old_theta
+                    # Bug B fix: pass raw (un-masked) gradient to BFGS so
+                    # prev_grad reflects the true gradient for y-vector
+                    bfgs.update(actual_s, grad_theta_raw)
 
-                print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
-                      f"{bfgs.num_skipped} skipped):")
-                for i, name in enumerate(param_names):
-                    delta = theta[i] - old_theta[i]
-                    print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
-                          f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
+                    # Predicted improvement for next iteration's ratio test (1b)
+                    predicted_improvement = grad_theta_raw @ actual_s
+
+                    print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
+                          f"{bfgs.num_skipped} skipped):")
+                    for i, name in enumerate(param_names):
+                        delta = theta[i] - old_theta[i]
+                        print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
+                              f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
 
         # ----- Broadcast theta to all ranks -----
-        # Non-root ranks block here until root finishes FD gradient
-        theta_tensor = torch.from_numpy(theta).float().to(device)
+        # Non-root ranks block here until root finishes SPSA gradient
+        # Bug C fix: use .double() to preserve float64 precision
+        theta_tensor = torch.from_numpy(theta).double().to(device)
         if mp_util.enable_mp():
             theta_tensor = mp_util.broadcast(theta_tensor)
         theta = theta_tensor.cpu().double().numpy()
@@ -1573,6 +1747,16 @@ def pghc_worker(rank, num_procs, device, master_port, args):
                     log_dict["outer/final_disc_reward"] = disc_rewards[-1]
                 if final_actor_loss is not None:
                     log_dict["outer/converged_actor_loss"] = final_actor_loss
+                # 1a: Envelope Theorem validation
+                if envelope_grad_norm is not None:
+                    log_dict["outer/envelope_grad_norm"] = envelope_grad_norm
+                # 1b: Adaptive trust region
+                log_dict["outer/trust_radius_deg"] = np.degrees(trust_radius)
+                log_dict["outer/center_reward"] = center_reward
+                if rho is not None:
+                    log_dict["outer/trust_ratio_rho"] = rho
+                if predicted_improvement is not None:
+                    log_dict["outer/predicted_improvement"] = predicted_improvement
                 wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
@@ -1589,7 +1773,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
     # =========================================================
     if is_root:
         print("\n" + "=" * 70)
-        print("PGHC Co-Design Complete!")
+        print("GBC Co-Design Complete!")
         print("=" * 70)
 
         initial = history["theta"][0]
@@ -1622,7 +1806,7 @@ def pghc_worker(rank, num_procs, device, master_port, args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="PGHC Co-Design for G1 Humanoid (Unified Single-Process)"
+        description="GBC (Gradient-Based Co-Design) for G1 Humanoid"
     )
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable wandb logging")
@@ -1633,10 +1817,10 @@ if __name__ == "__main__":
                         help="Total training envs (divided across GPUs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
                         help="Eval rollout length in control steps (300 = 10s full episode)")
-    parser.add_argument("--num-fd-seeds", type=int, default=30,
-                        help="Number of paired seeds per FD perturbation (K)")
-    parser.add_argument("--fd-epsilon", type=float, default=0.05,
-                        help="FD perturbation size in radians (default: 0.05 ~ 2.9 deg)")
+    parser.add_argument("--num-spsa-seeds", type=int, default=30,
+                        help="Number of paired seeds per SPSA evaluation (K)")
+    parser.add_argument("--spsa-epsilon", type=float, default=0.05,
+                        help="SPSA perturbation size in radians (default: 0.05 ~ 2.9 deg)")
     parser.add_argument("--spsa-sets", type=int, default=3,
                         help="Number of orthogonal basis sets S for SPSA gradient "
                              "(M=S*N directions, n_pert=1+2*S*N). Default: 3")
@@ -1728,14 +1912,14 @@ if __name__ == "__main__":
         torch.multiprocessing.set_start_method("spawn")
         processes = []
         for r in range(num_workers):
-            os.environ["_PGHC_GPU_INDEX"] = str(gpu_indices[r])
+            os.environ["_GBC_GPU_INDEX"] = str(gpu_indices[r])
             p = torch.multiprocessing.Process(
-                target=pghc_worker,
+                target=gbc_worker,
                 args=[r, num_workers, "cuda:0", master_port, args],
             )
             p.start()
             processes.append(p)
-        os.environ.pop("_PGHC_GPU_INDEX", None)
+        os.environ.pop("_GBC_GPU_INDEX", None)
 
         # Wait for all workers and check exit codes
         failed = []
@@ -1750,4 +1934,4 @@ if __name__ == "__main__":
             sys.exit(1)
     else:
         # Single GPU — backward compatible, no spawn overhead
-        pghc_worker(0, 1, args.devices[0], master_port, args)
+        gbc_worker(0, 1, args.devices[0], master_port, args)

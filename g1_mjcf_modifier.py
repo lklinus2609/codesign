@@ -1,5 +1,5 @@
 """
-G1 MJCF Modifier for PGHC Co-Design
+G1 MJCF Modifier for GBC (Gradient-Based Co-Design)
 
 Parses the base G1 MJCF and modifies body frame quaternions for 6 symmetric
 lower-body joint pairs based on design parameter theta (oblique angles).

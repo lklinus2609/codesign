@@ -1,12 +1,10 @@
-# Hybrid Co-Design Module
-# Implements Algorithm 1: Hybrid PPO Control + Differentiable Physics Morphology
+# GBC (Gradient-Based Co-Design) for G1 Humanoid
+# Entry point: codesign_g1_unified.py
 
-from .parametric_g1 import ParametricG1Model
-from .hybrid_agent import HybridAMPAgent
-from .diff_rollout import DifferentiableRollout
+from .g1_mjcf_modifier import G1MJCFModifier, SYMMETRIC_PAIRS, NUM_DESIGN_PARAMS
 
 __all__ = [
-    "ParametricG1Model",
-    "HybridAMPAgent",
-    "DifferentiableRollout",
+    "G1MJCFModifier",
+    "SYMMETRIC_PAIRS",
+    "NUM_DESIGN_PARAMS",
 ]
