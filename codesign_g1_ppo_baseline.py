@@ -495,6 +495,9 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
 
     for epoch in range(n_epochs):
         perm = torch.randperm(total_samples, device=device)
+        # Sync permutation across ranks to keep mini-batch count identical
+        if num_procs > 1:
+            torch.distributed.broadcast(perm, src=0)
 
         for start in range(0, total_samples, mini_batch_size):
             end = min(start + mini_batch_size, total_samples)
@@ -529,7 +532,16 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
             new_lp, _, _ = model.evaluate_actions(flat_obs, flat_acts)
             mean_kl = (flat_old_lp - new_lp).mean().item()
 
-        if mean_kl > 2.0 * desired_kl:
+        # Sync early-stop decision across ranks to prevent NCCL deadlock
+        # (different ranks may compute different KL values)
+        if num_procs > 1:
+            should_break = torch.tensor(
+                [1 if mean_kl > 2.0 * desired_kl else 0],
+                device=device, dtype=torch.int32)
+            torch.distributed.broadcast(should_break, src=0)
+            if should_break.item():
+                break
+        elif mean_kl > 2.0 * desired_kl:
             break
 
     # Adaptive LR
