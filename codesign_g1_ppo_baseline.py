@@ -386,16 +386,18 @@ class RunningMeanStdCUDA:
         """All-reduce normalizer stats across GPU ranks."""
         if num_procs <= 1:
             return
-        stats = torch.stack([
+        n = self.mean.shape[0]
+        # Flatten into a single 1-D buffer: [mean (n), var (n), count (1)]
+        buf = torch.cat([
             self.mean,
             self.var,
             torch.tensor([self.count], device=self.device, dtype=torch.float64),
         ])
-        torch.distributed.all_reduce(stats, op=torch.distributed.ReduceOp.SUM)
-        stats /= num_procs
-        self.mean = stats[0]
-        self.var = stats[1]
-        self.count = stats[2].item()
+        torch.distributed.all_reduce(buf, op=torch.distributed.ReduceOp.SUM)
+        buf /= num_procs
+        self.mean = buf[:n]
+        self.var = buf[n:2*n]
+        self.count = buf[2*n].item()
 
 
 # ---------------------------------------------------------------------------
