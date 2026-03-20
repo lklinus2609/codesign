@@ -804,10 +804,14 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
                                    num_worlds, horizon,
                                    rank, num_procs, device, param_names,
                                    num_seeds=10, base_seed=42,
-                                   eps=0.05, vel_reward_weight=0.1,
-                                   vel_cmd=1.0, vel_tracking_sigma=0.25,
+                                   eps=0.05,
                                    num_spsa_sets=3):
-    """SPSA gradient using walking_env + PPO model (frozen)."""
+    """SPSA gradient using walking_env's 18-term IsaacLab reward as objective.
+
+    Returns (grad, grad_stderr, snr, center_reward, cot_center).
+    center_reward is the mean episode reward from the env.
+    cot_center is a diagnostic-only CoT for the center morphology.
+    """
     n_params = len(theta_np)
     directions = generate_orthogonal_directions(n_params, num_spsa_sets,
                                                  seed=base_seed + 9999)
@@ -820,8 +824,10 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
         print(f"    [SPSA] {num_spsa_sets} sets x {n_params} params = {M} dirs, "
               f"n_pert={n_pert}, {wpp} worlds/pert, {num_seeds} seeds")
 
-    cot_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
-    vel_track_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    # Env reward for all perturbations
+    reward_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    # CoT diagnostic for center perturbation only
+    cot_diag_all = torch.zeros(num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
     _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
@@ -839,16 +845,20 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
         if torch.cuda.is_available():
             torch.cuda.manual_seed(seed)
 
-        # Reset walking env (resets all worlds)
         obs, _ = walking_env.reset()
 
-        power_sum = torch.zeros(num_worlds, device=device)
-        vel_sum = torch.zeros(num_worlds, device=device)
-        vel_track_sum = torch.zeros(num_worlds, device=device)
+        # Per-world env reward accumulators
+        reward_sum = torch.zeros(num_worlds, device=device)
         step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
-        ep_cot_sum = torch.zeros(num_worlds, device=device)
-        ep_vel_track_sum = torch.zeros(num_worlds, device=device)
+        ep_reward_sum = torch.zeros(num_worlds, device=device)
         ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+
+        # CoT diagnostic accumulators (center worlds only, indices 0..wpp-1)
+        power_sum_c = torch.zeros(wpp, device=device)
+        vel_sum_c = torch.zeros(wpp, device=device)
+        step_count_c = torch.zeros(wpp, device=device, dtype=torch.long)
+        ep_cot_sum_c = torch.zeros(wpp, device=device)
+        ep_count_c = torch.zeros(wpp, device=device, dtype=torch.long)
 
         with torch.no_grad():
             for _ in range(horizon):
@@ -856,80 +866,96 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
                 action, _, _ = model.get_action(obs_norm, deterministic=True)
                 obs, reward, done, info = walking_env.step(action)
 
-                # Read engine state for CoT (same engine, all worlds)
-                dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
-                dof_vel = engine.get_dof_vel(char_id)
-                root_vel = engine.get_root_vel(char_id)
-
-                power = torch.sum(torch.abs(
-                    dof_forces[:num_worlds, :_LOCO_DOFS] *
-                    dof_vel[:num_worlds, :_LOCO_DOFS]), dim=-1)
-                fwd_vel = root_vel[:num_worlds, 0]
-                power_sum += power
-                vel_sum += fwd_vel
-                vel_track_sum += torch.exp(
-                    -torch.square(fwd_vel - vel_cmd) / vel_tracking_sigma)
+                # Accumulate env reward (18-term IsaacLab) for all worlds
+                reward_sum += walking_env.rew_buf[:num_worlds]
                 step_count += 1
+
+                # CoT diagnostic: center worlds only (perturbation 0)
+                dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
+                dof_vel_eng = engine.get_dof_vel(char_id)
+                root_vel = engine.get_root_vel(char_id)
+                power = torch.sum(torch.abs(
+                    dof_forces[:wpp, :_LOCO_DOFS] *
+                    dof_vel_eng[:wpp, :_LOCO_DOFS]), dim=-1)
+                power_sum_c += power
+                vel_sum_c += root_vel[:wpp, 0]
+                step_count_c += 1
 
                 done_mask = (done[:num_worlds] > 0)
                 if done_mask.any():
                     di = done_mask.nonzero(as_tuple=True)[0]
-                    vs = step_count[di].float()
-                    valid = vs > 0
+                    valid = step_count[di] > 0
                     if valid.any():
                         vi = di[valid]
-                        vsc = step_count[vi].float()
-                        mp = power_sum[vi] / vsc
-                        mv = vel_sum[vi] / vsc
-                        ep_cot_sum[vi] += compute_cot(mp, mv, total_mass)
-                        ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
+                        ep_reward_sum[vi] += reward_sum[vi]
                         ep_count[vi] += 1
-                    power_sum[di] = 0
-                    vel_sum[di] = 0
-                    vel_track_sum[di] = 0
+                    reward_sum[di] = 0
                     step_count[di] = 0
 
+                    # CoT diagnostic reset for center worlds
+                    center_done = done_mask[:wpp]
+                    if center_done.any():
+                        cdi = center_done.nonzero(as_tuple=True)[0]
+                        cv = step_count_c[cdi] > 0
+                        if cv.any():
+                            cvi = cdi[cv]
+                            mp = power_sum_c[cvi] / step_count_c[cvi].float()
+                            mv = vel_sum_c[cvi] / step_count_c[cvi].float()
+                            ep_cot_sum_c[cvi] += compute_cot(mp, mv, total_mass)
+                            ep_count_c[cvi] += 1
+                        power_sum_c[cdi] = 0
+                        vel_sum_c[cdi] = 0
+                        step_count_c[cdi] = 0
+
+        # Finalize still-alive episodes
         alive = step_count > 0
         if alive.any():
             ai = alive.nonzero(as_tuple=True)[0]
-            vsc = step_count[ai].float()
-            mp = power_sum[ai] / vsc
-            mv = vel_sum[ai] / vsc
-            ep_cot_sum[ai] += compute_cot(mp, mv, total_mass)
-            ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
+            ep_reward_sum[ai] += reward_sum[ai]
             ep_count[ai] += 1
 
+        alive_c = step_count_c > 0
+        if alive_c.any():
+            aci = alive_c.nonzero(as_tuple=True)[0]
+            mp = power_sum_c[aci] / step_count_c[aci].float()
+            mv = vel_sum_c[aci] / step_count_c[aci].float()
+            ep_cot_sum_c[aci] += compute_cot(mp, mv, total_mass)
+            ep_count_c[aci] += 1
+
+        # Aggregate per perturbation
         for p in range(n_pert):
             s, e = p * wpp, (p + 1) * wpp
             counts = ep_count[s:e].float().clamp(min=1)
-            cot = (ep_cot_sum[s:e] / counts).mean().item()
-            vt = (ep_vel_track_sum[s:e] / counts).mean().item()
-            cot_all[p, seed_idx] = cot
-            vel_track_all[p, seed_idx] = vt
+            reward_all[p, seed_idx] = (ep_reward_sum[s:e] / counts).mean().item()
+
+        # CoT diagnostic (center only)
+        cot_counts = ep_count_c.float().clamp(min=1)
+        cot_diag_all[seed_idx] = (ep_cot_sum_c / cot_counts).mean().item()
 
     model.train()
 
+    # Drain SPSA-phase episode stats so they don't leak into inner loop
+    walking_env.pop_completed_episodes()
+
     if num_procs > 1:
-        torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
-        torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
-        cot_all /= num_procs
-        vel_track_all /= num_procs
+        torch.distributed.all_reduce(reward_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(cot_diag_all, op=torch.distributed.ReduceOp.SUM)
+        reward_all /= num_procs
+        cot_diag_all /= num_procs
 
     # Restore original morphology
     update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
                                joint_idx_map, num_worlds)
 
-    # Gradient via least-squares
-    cot_np = cot_all.cpu().numpy()
-    vt_np = vel_track_all.cpu().numpy()
-    cot_center = float(np.mean(cot_np[0]))
-    vel_track_center = float(np.mean(vt_np[0]))
-    reward_all = -cot_np + vel_reward_weight * vt_np
+    # Gradient via least-squares on env reward
+    reward_np = reward_all.cpu().numpy()
+    center_reward = float(np.mean(reward_np[0]))
+    cot_center = float(cot_diag_all.mean().item())
 
     grad_per_seed = []
     for k in range(num_seeds):
         dJ = np.array([
-            (reward_all[2 * m + 1, k] - reward_all[2 * m + 2, k]) / (2 * eps)
+            (reward_np[2 * m + 1, k] - reward_np[2 * m + 2, k]) / (2 * eps)
             for m in range(M)
         ])
         if np.any(np.isnan(dJ)):
@@ -958,7 +984,8 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
     grad = np.clip(grad, -10.0, 10.0)
 
     if rank == 0:
-        print(f"    [SPSA] Center: vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}")
+        print(f"    [SPSA] Center: env_reward={center_reward:.4f}, "
+              f"CoT(diag)={cot_center:.4f}")
         print(f"    [SPSA] Gradient ({len(grad_per_seed)}/{num_seeds} valid seeds):")
         for i, name in enumerate(param_names):
             print(f"      d_reward/d_{name} = {grad[i]:+.6f} "
@@ -968,7 +995,7 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
             print(f"    [SPSA] SNR: min={np.min(finite_snr):.2f}, "
                   f"mean={np.mean(finite_snr):.2f}, max={np.max(finite_snr):.2f}")
 
-    return grad, grad_stderr, snr, vel_track_center, cot_center
+    return grad, grad_stderr, snr, center_reward, cot_center
 
 
 # ---------------------------------------------------------------------------
@@ -1156,7 +1183,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
     history = {
         "theta": [theta.copy()],
-        "vel_tracking": [],
+        "center_reward": [],
         "cot": [],
         "gradients": [],
         "grad_snr": [],
@@ -1215,28 +1242,24 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         spsa_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, grad_stderr, grad_snr, vel_track, cot = compute_spsa_gradient_parallel(
+        grad_theta, grad_stderr, grad_snr, center_reward, cot_diag = compute_spsa_gradient_parallel(
             walking_env, model, obs_rms,
             engine, char_id, total_mass,
             theta.copy(), base_quats_dict, joint_idx_map,
             per_rank_envs, args.eval_horizon,
             rank, num_procs, device, param_names,
             num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
-            eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
-            vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+            eps=args.spsa_epsilon,
             num_spsa_sets=args.spsa_sets,
         )
 
         if is_root:
-            print(f"    Vel tracking = {vel_track:.4f}")
-            print(f"    Cost of Transport = {cot:.4f}")
-            history["vel_tracking"].append(vel_track)
-            history["cot"].append(cot)
+            print(f"    Center env reward = {center_reward:.4f}")
+            print(f"    Cost of Transport (diag) = {cot_diag:.4f}")
+            history["center_reward"].append(center_reward)
+            history["cot"].append(cot_diag)
             history["gradients"].append(grad_theta.copy())
             history["grad_snr"].append(grad_snr.copy())
-
-            # Adaptive trust region
-            center_reward = -cot + args.vel_reward_weight * vel_track
             rho = None
             if prev_center_reward is not None and predicted_improvement is not None:
                 actual_improvement = center_reward - prev_center_reward
@@ -1340,8 +1363,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 finite_snr = grad_snr[np.isfinite(grad_snr)]
                 log_dict = {
                     "outer/iteration": outer_iter + 1,
-                    "outer/vel_tracking": vel_track,
-                    "outer/cot": cot,
+                    "outer/center_reward": center_reward,
+                    "outer/cot_diag": cot_diag,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
                     "outer/grad_snr_min": float(np.min(finite_snr)) if len(finite_snr) > 0 else 0.0,
@@ -1352,7 +1375,6 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     "outer/step_clamped": int(n_clamped),
                     "outer/max_raw_step_deg": float(np.degrees(np.max(np.abs(raw_step)))),
                     "outer/trust_radius_deg": np.degrees(trust_radius),
-                    "outer/center_reward": center_reward,
                     "outer/final_ppo_reward": final_mean_rew,
                 }
                 for i, name in enumerate(param_names):
@@ -1376,8 +1398,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         final = history["theta"][-1]
         for i, name in enumerate(param_names):
             print(f"  {name}: {np.degrees(initial[i]):+.2f} -> {np.degrees(final[i]):+.2f} deg")
+        if history["center_reward"]:
+            print(f"\nEnv reward: {history['center_reward'][0]:.4f} -> "
+                  f"{history['center_reward'][-1]:.4f}")
         if history["cot"]:
-            print(f"\nCoT: {history['cot'][0]:.4f} -> {history['cot'][-1]:.4f}")
+            print(f"CoT (diag): {history['cot'][0]:.4f} -> {history['cot'][-1]:.4f}")
         total_time = sum(history["inner_times"])
         print(f"Total inner loop time: {total_time / 3600:.1f} hours")
 
@@ -1428,11 +1453,6 @@ if __name__ == "__main__":
     parser.add_argument("--min-plateau-outputs", type=int, default=10)
     parser.add_argument("--warmup-iters", type=int, default=5000)
     parser.add_argument("--post-warmup-min-iters", type=int, default=100)
-
-    # Outer loop cost function
-    parser.add_argument("--vel-reward-weight", type=float, default=5.0)
-    parser.add_argument("--vel-cmd", type=float, default=1.0)
-    parser.add_argument("--vel-tracking-sigma", type=float, default=0.25)
 
     # Multi-GPU
     parser.add_argument("--devices", nargs="+", default=None)
