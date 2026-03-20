@@ -506,7 +506,10 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
             log_probs, val_pred, entropy = model.evaluate_actions(
                 flat_obs[mb_idx], flat_acts[mb_idx])
 
-            ratio = torch.exp(log_probs - flat_old_lp[mb_idx])
+            # Clamp log-ratio to prevent exp() overflow → NaN
+            log_ratio = log_probs - flat_old_lp[mb_idx]
+            log_ratio = torch.clamp(log_ratio, -20.0, 20.0)
+            ratio = torch.exp(log_ratio)
             clipped = torch.clamp(ratio, 1 - clip_ratio, 1 + clip_ratio)
             policy_loss = -torch.min(ratio * flat_adv[mb_idx],
                                      clipped * flat_adv[mb_idx]).mean()
@@ -515,6 +518,14 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
 
             optimizer.zero_grad()
             loss.backward()
+
+            # NaN guard: zero out gradients if loss was invalid
+            # (all ranks see same data via synced permutation, so this
+            # fires consistently — no NCCL desync risk)
+            if torch.isnan(loss) or torch.isinf(loss):
+                for p in model.parameters():
+                    if p.grad is not None:
+                        p.grad.zero_()
 
             # Multi-GPU: average gradients
             if num_procs > 1:
