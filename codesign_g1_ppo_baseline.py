@@ -82,7 +82,6 @@ if _GBC_GPU_INDEX is not None:
     wp.config.kernel_cache_dir = _warp_cache
 
 import newton  # noqa: F401
-import torch
 import util.mp_util as mp_util
 import envs.env_builder as env_builder
 
@@ -582,8 +581,8 @@ class PPOInnerLoop:
                  lr=3e-4, gamma=0.99, gae_lambda=0.95,
                  clip_ratio=0.2, entropy_coeff=0.01,
                  desired_kl=0.01, max_grad_norm=1.0,
-                 plateau_threshold=0.0002, plateau_window=10,
-                 min_plateau_outputs=10, max_inner_iters=10000,
+                 kl_conv_threshold=1e-4, kl_window=10,
+                 max_inner_iters=10000,
                  warmup_iters=5000,
                  use_wandb=False, log_every=10):
         self.walking_env = walking_env
@@ -608,23 +607,17 @@ class PPOInnerLoop:
         self.use_wandb = use_wandb
         self.log_every = log_every
 
-        self.plateau_threshold = plateau_threshold
-        self.plateau_window = plateau_window
-        self.min_plateau_outputs = min_plateau_outputs
+        self.kl_conv_threshold = kl_conv_threshold
+        self.kl_window = kl_window
 
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self._global_inner_iter = 0  # monotonic for wandb
 
-    def _check_plateau(self, values):
-        n_required = max(self.plateau_window, self.min_plateau_outputs)
-        if len(values) < n_required:
+    def _check_kl_converged(self, kl_values):
+        if len(kl_values) < self.kl_window:
             return False
-        recent = values[-self.plateau_window:]
-        mean_val = np.mean(recent)
-        spread = max(recent) - min(recent)
-        if abs(mean_val) < 1.0:
-            return spread < self.plateau_threshold
-        return (spread / abs(mean_val)) < self.plateau_threshold
+        recent = list(kl_values)[-self.kl_window:]
+        return np.mean(recent) < self.kl_conv_threshold
 
     def train_until_converged(self, out_dir, min_iters=None):
         """Run PPO until convergence or iteration cap.
@@ -644,10 +637,11 @@ class PPOInnerLoop:
         env.last_obs = obs
 
         model.train()
-        convergence_values = []
+        kl_values = []
         reward_buffer = deque(maxlen=200)
         length_buffer = deque(maxlen=200)
         reward_history = []
+        inter_kl = 0.0
 
         inner_iters = 0
         mean_rew, std_rew, mean_len = 0.0, 0.0, 0.0
@@ -658,6 +652,22 @@ class PPOInnerLoop:
             rollout = collect_rollout(
                 env, model, self.obs_rms, self.horizon, self.device)
 
+            # Inter-iteration KL: measure policy shift on current rollout.
+            # Subsample to keep the post-update forward pass cheap.
+            _KL_SUBSAMPLE = 1024
+            H, N_envs = rollout["rewards"].shape
+            total = H * N_envs
+            flat_obs = rollout["observations"].reshape(total, -1)
+            flat_acts = rollout["actions"].reshape(total, -1)
+            flat_old_lp = rollout["log_probs"].reshape(-1)
+            if total > _KL_SUBSAMPLE:
+                kl_idx = torch.randperm(total, device=self.device)[:_KL_SUBSAMPLE]
+                kl_obs = flat_obs[kl_idx]
+                kl_acts = flat_acts[kl_idx]
+                kl_old_lp = flat_old_lp[kl_idx]
+            else:
+                kl_obs, kl_acts, kl_old_lp = flat_obs, flat_acts, flat_old_lp
+
             mean_kl = ppo_update(
                 model, self.optimizer, rollout,
                 n_epochs=self.n_epochs, clip_ratio=self.clip_ratio,
@@ -667,6 +677,10 @@ class PPOInnerLoop:
                 desired_kl=self.desired_kl, max_grad_norm=self.max_grad_norm,
                 num_procs=self.num_procs, device=self.device,
             )
+
+            with torch.no_grad():
+                new_lp, _, _ = model.evaluate_actions(kl_obs, kl_acts)
+                inter_kl = (kl_old_lp - new_lp).mean().item()
 
             # Sync obs normalizer periodically
             if inner_iters % 50 == 0:
@@ -686,16 +700,18 @@ class PPOInnerLoop:
                 std_rew = np.std(reward_buffer)
                 mean_len = np.mean(length_buffer)
 
-            # Convergence tracking at log intervals
-            if inner_iters % self.log_every == 0 and len(reward_buffer) > 0:
-                convergence_values.append(mean_rew)
-                reward_history.append(mean_rew)
+            # KL convergence tracking at log intervals
+            if inner_iters % self.log_every == 0:
+                kl_values.append(abs(inter_kl))
+                if len(reward_buffer) > 0:
+                    reward_history.append(mean_rew)
 
             # Logging (root only)
             if self.is_root and inner_iters % self.log_every == 0:
                 rollout_mean = rollout["rewards"].mean().item()
                 print(f"    PPO iter {inner_iters}: "
                       f"rew/step={rollout_mean:.3f}, kl={mean_kl:.4f}, "
+                      f"inter_kl={abs(inter_kl):.6f}, "
                       f"lr={current_lr:.1e}, ep_rew={mean_rew:.1f}+/-{std_rew:.1f}, "
                       f"ep_len={mean_len:.0f}")
 
@@ -703,6 +719,7 @@ class PPOInnerLoop:
                     wandb.log({
                         "inner/reward_per_step": rollout_mean,
                         "inner/kl": mean_kl,
+                        "inner/inter_iter_kl": abs(inter_kl),
                         "inner/lr": current_lr,
                         "inner/mean_reward": mean_rew,
                         "inner/reward_std": std_rew,
@@ -710,10 +727,10 @@ class PPOInnerLoop:
                         "inner/iteration": self._global_inner_iter,
                     }, step=self._global_inner_iter)
 
-            # Convergence check
+            # Convergence check (KL-based)
             should_stop = False
             if self.is_root and inner_iters >= effective_min:
-                should_stop = self._check_plateau(convergence_values)
+                should_stop = self._check_kl_converged(kl_values)
 
             if mp_util.enable_mp():
                 flag = torch.tensor([int(should_stop)], dtype=torch.int32,
@@ -1166,9 +1183,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         lr=args.ppo_lr,
         clip_ratio=args.ppo_clip_ratio,
         entropy_coeff=args.ppo_entropy_coeff,
-        plateau_threshold=args.plateau_threshold,
-        plateau_window=args.plateau_window,
-        min_plateau_outputs=args.min_plateau_outputs,
+        kl_conv_threshold=args.kl_conv_threshold,
+        kl_window=args.kl_window,
         max_inner_iters=args.max_inner_iters,
         warmup_iters=args.warmup_iters,
         use_wandb=use_wandb,
@@ -1447,10 +1463,11 @@ if __name__ == "__main__":
     parser.add_argument("--enable-dr", action="store_true", default=True)
     parser.add_argument("--no-dr", dest="enable_dr", action="store_false")
 
-    # Convergence
-    parser.add_argument("--plateau-threshold", type=float, default=0.0002)
-    parser.add_argument("--plateau-window", type=int, default=10)
-    parser.add_argument("--min-plateau-outputs", type=int, default=10)
+    # Convergence (KL-based)
+    parser.add_argument("--kl-conv-threshold", type=float, default=1e-4,
+                        help="Inner convergence: mean inter-iteration KL threshold")
+    parser.add_argument("--kl-window", type=int, default=10,
+                        help="Inner convergence: window size (in log intervals)")
     parser.add_argument("--warmup-iters", type=int, default=5000)
     parser.add_argument("--post-warmup-min-iters", type=int, default=100)
 
