@@ -473,6 +473,8 @@ class InnerLoopController:
                  min_plateau_outputs=10, max_inner_iters=10000,
                  min_inner_iters=0,
                  convergence_signal='task_reward',
+                 kl_conv_threshold=1e-4, kl_window=10,
+                 use_kl_convergence=True,
                  ramp_start_iter=1000, ramp_end_iter=2500,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
@@ -485,6 +487,9 @@ class InnerLoopController:
         self.max_inner_iters = max_inner_iters
         self.min_inner_iters = min_inner_iters
         self.convergence_signal = convergence_signal
+        self.kl_conv_threshold = kl_conv_threshold
+        self.kl_window = kl_window
+        self.use_kl_convergence = use_kl_convergence
         self.ramp_start_iter = ramp_start_iter
         self.ramp_end_iter = ramp_end_iter
         self.ramp_completed = False  # set True after first ramp finishes
@@ -533,6 +538,12 @@ class InnerLoopController:
             return spread < self.plateau_threshold
         return (spread / abs(mean_val)) < self.plateau_threshold
 
+    def _check_kl_converged(self, kl_values):
+        if len(kl_values) < self.kl_window:
+            return False
+        recent = list(kl_values)[-self.kl_window:]
+        return np.mean(recent) < self.kl_conv_threshold
+
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or iteration cap.
 
@@ -568,6 +579,7 @@ class InnerLoopController:
 
         disc_rewards = []
         convergence_values = []
+        kl_values = []
         converged = False
         start_time = time.time()
         test_info = _EMPTY_TEST_INFO
@@ -615,6 +627,13 @@ class InnerLoopController:
                         if disc_r is not None:
                             convergence_values.append(disc_r)
 
+                    # Track approx_kl for KL-based convergence
+                    akl = train_info.get("approx_kl")
+                    if akl is not None:
+                        if torch.is_tensor(akl):
+                            akl = akl.item()
+                        kl_values.append(abs(akl))
+
                 # Track actor loss as envelope theorem quality proxy
                 al = train_info.get("actor_loss")
                 if al is not None:
@@ -642,8 +661,12 @@ class InnerLoopController:
                 # and hanging while root does slow I/O.
                 should_stop = False
                 if self.is_root:
-                    should_stop = (inner_iters >= self.min_inner_iters
-                                   and self._check_plateau(convergence_values))
+                    if self.use_kl_convergence:
+                        should_stop = (inner_iters >= self.min_inner_iters
+                                       and self._check_kl_converged(kl_values))
+                    else:
+                        should_stop = (inner_iters >= self.min_inner_iters
+                                       and self._check_plateau(convergence_values))
 
                 if mp_util.enable_mp():
                     flag = torch.tensor([int(should_stop)], dtype=torch.int32,
@@ -687,14 +710,21 @@ class InnerLoopController:
 
                 if should_stop:
                     if self.is_root:
-                        recent = convergence_values[-self.plateau_window:]
-                        spread = max(recent) - min(recent)
                         actor_loss_str = (f", actor_loss={last_actor_loss:.6f}"
                                           if last_actor_loss is not None else "")
-                        print(f"    [Inner] CONVERGED ({len(convergence_values)} outputs, "
-                              f"{inner_iters} iters, "
-                              f"{self.convergence_signal}={np.mean(recent):.4f}, "
-                              f"spread={spread:.4f}{actor_loss_str})")
+                        if self.use_kl_convergence:
+                            recent_kl = kl_values[-self.kl_window:]
+                            mean_kl = np.mean(recent_kl)
+                            print(f"    [Inner] CONVERGED ({len(kl_values)} KL samples, "
+                                  f"{inner_iters} iters, "
+                                  f"mean_kl={mean_kl:.6f}{actor_loss_str})")
+                        else:
+                            recent = convergence_values[-self.plateau_window:]
+                            spread = max(recent) - min(recent)
+                            print(f"    [Inner] CONVERGED ({len(convergence_values)} outputs, "
+                                  f"{inner_iters} iters, "
+                                  f"{self.convergence_signal}={np.mean(recent):.4f}, "
+                                  f"spread={spread:.4f}{actor_loss_str})")
                     converged = True
                     break
 
@@ -1415,6 +1445,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         min_plateau_outputs=args.min_plateau_outputs,
         max_inner_iters=args.max_inner_iters,
         min_inner_iters=args.kickoff_min_iters,  # first outer iter; reset to 0 after
+        kl_conv_threshold=args.kl_conv_threshold,
+        kl_window=args.kl_window,
+        use_kl_convergence=not args.use_plateau_convergence,
         ramp_start_iter=args.ramp_start_iter,
         ramp_end_iter=args.ramp_end_iter,
         use_wandb=use_wandb,
@@ -1835,12 +1868,18 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
+    parser.add_argument("--kl-conv-threshold", type=float, default=1e-4,
+                        help="Inner convergence: mean approx_kl threshold (KL mode)")
+    parser.add_argument("--kl-window", type=int, default=10,
+                        help="Inner convergence: KL window size (in output intervals)")
+    parser.add_argument("--use-plateau-convergence", action="store_true",
+                        help="Use reward plateau instead of KL for inner convergence")
     parser.add_argument("--plateau-threshold", type=float, default=0.0002,
-                        help="Inner convergence: spread/mean threshold")
+                        help="Inner convergence: spread/mean threshold (plateau mode)")
     parser.add_argument("--plateau-window", type=int, default=10,
-                        help="Inner convergence: window size (in output intervals)")
+                        help="Inner convergence: window size in output intervals (plateau mode)")
     parser.add_argument("--min-plateau-outputs", type=int, default=10,
-                        help="Inner convergence: min output intervals before early stop")
+                        help="Inner convergence: min output intervals before early stop (plateau mode)")
     parser.add_argument("--save-interval", type=int, default=500,
                         help="Save numbered model checkpoint every N inner iterations")
     parser.add_argument("--kickoff-min-iters", type=int, default=2500,
