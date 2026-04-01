@@ -90,6 +90,7 @@ from g1_mjcf_modifier import (
     quat_from_x_rotation, quat_multiply, quat_normalize,
 )
 from g1_ppo_env import G1WalkingEnvWrapper, G1WalkingConfig
+from convergence_gate import CompositeConvergenceGate
 
 try:
     import wandb
@@ -117,9 +118,7 @@ def compute_cot(mean_power, mean_fwd_vel, total_mass):
 # ---------------------------------------------------------------------------
 
 class EpisodeCoTTracker:
-    """Tracks per-episode Cost of Transport."""
-
-    LOCOMOTION_DOFS = 15
+    """Tracks per-episode Cost of Transport (all joints)."""
 
     @staticmethod
     def get_dof_forces_safe(engine, char_id):
@@ -148,8 +147,6 @@ class EpisodeCoTTracker:
         dof_forces = self.get_dof_forces_safe(engine, char_id)
         dof_vel = engine.get_dof_vel(char_id)
         root_vel = engine.get_root_vel(char_id)
-        dof_forces = dof_forces[:, :self.LOCOMOTION_DOFS]
-        dof_vel = dof_vel[:, :self.LOCOMOTION_DOFS]
         power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
         self.power_sum += power
         self.vel_sum += root_vel[:, 0]
@@ -479,7 +476,13 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
         returns = advantages + values
 
     adv_flat = advantages.reshape(-1)
+    adv_std_raw = adv_flat.std().item()
     advantages = (advantages - adv_flat.mean()) / (adv_flat.std() + 1e-8)
+
+    # Pre-update explained variance: how well the critic predicted returns
+    with torch.no_grad():
+        ret_var = returns.var()
+        explained_variance = (1.0 - (returns - values).var() / (ret_var + 1e-8)).item()
 
     # Flatten for mini-batch sampling
     flat_obs = rollout["observations"].reshape(H * N, -1)
@@ -491,8 +494,14 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
     total_samples = H * N
     mini_batch_size = max(1, total_samples // num_mini_batches)
     mean_kl = 0.0
+    last_epoch_critic_loss = 0.0
+    last_epoch_entropy = 0.0
 
     for epoch in range(n_epochs):
+        epoch_critic_loss = 0.0
+        epoch_entropy = 0.0
+        epoch_batches = 0
+
         perm = torch.randperm(total_samples, device=device)
         # Sync permutation across ranks to keep mini-batch count identical
         if num_procs > 1:
@@ -537,6 +546,13 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
 
+            epoch_critic_loss += value_loss.item()
+            epoch_entropy += entropy.item()
+            epoch_batches += 1
+
+        last_epoch_critic_loss = epoch_critic_loss / max(epoch_batches, 1)
+        last_epoch_entropy = epoch_entropy / max(epoch_batches, 1)
+
         # Approximate KL
         with torch.no_grad():
             new_lp, _, _ = model.evaluate_actions(flat_obs, flat_acts)
@@ -565,7 +581,14 @@ def ppo_update(model, optimizer, rollout, n_epochs=5, clip_ratio=0.2,
     for pg in optimizer.param_groups:
         pg['lr'] = new_lr
 
-    return mean_kl
+    return {
+        "mean_kl": mean_kl,
+        "value_loss": last_epoch_critic_loss,
+        "entropy": last_epoch_entropy,
+        "adv_std": adv_std_raw,
+        "explained_variance": explained_variance,
+        "lr": optimizer.param_groups[0]['lr'],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +607,12 @@ class PPOInnerLoop:
                  kl_conv_threshold=1e-4, kl_window=10,
                  max_inner_iters=10000,
                  warmup_iters=5000,
+                 convergence_mode='composite',
+                 convergence_window=10,
+                 critic_loss_plateau_threshold=0.05,
+                 adv_std_threshold=0.1,
+                 entropy_plateau_threshold=0.05,
+                 explained_variance_threshold=0.95,
                  use_wandb=False, log_every=10):
         self.walking_env = walking_env
         self.model = model
@@ -604,11 +633,24 @@ class PPOInnerLoop:
         self.max_grad_norm = max_grad_norm
         self.max_inner_iters = max_inner_iters
         self.warmup_iters = warmup_iters
+        self.convergence_mode = convergence_mode
         self.use_wandb = use_wandb
         self.log_every = log_every
 
+        # Legacy KL convergence (fallback)
         self.kl_conv_threshold = kl_conv_threshold
         self.kl_window = kl_window
+
+        # Composite convergence gate
+        self.convergence_gate = CompositeConvergenceGate(window=convergence_window)
+        self.convergence_gate.add_signal(
+            'critic_loss', 'plateau', critic_loss_plateau_threshold)
+        self.convergence_gate.add_signal(
+            'adv_std', 'below', adv_std_threshold)
+        self.convergence_gate.add_signal(
+            'entropy', 'plateau', entropy_plateau_threshold)
+        self.convergence_gate.add_signal(
+            'explained_variance', 'above', explained_variance_threshold)
 
         self.optimizer = optim.Adam(model.parameters(), lr=lr)
         self._global_inner_iter = 0  # monotonic for wandb
@@ -637,6 +679,7 @@ class PPOInnerLoop:
         env.last_obs = obs
 
         model.train()
+        self.convergence_gate.reset()
         kl_values = []
         reward_buffer = deque(maxlen=200)
         length_buffer = deque(maxlen=200)
@@ -668,7 +711,7 @@ class PPOInnerLoop:
             else:
                 kl_obs, kl_acts, kl_old_lp = flat_obs, flat_acts, flat_old_lp
 
-            mean_kl = ppo_update(
+            update_info = ppo_update(
                 model, self.optimizer, rollout,
                 n_epochs=self.n_epochs, clip_ratio=self.clip_ratio,
                 gamma=self.gamma, gae_lambda=self.gae_lambda,
@@ -677,6 +720,7 @@ class PPOInnerLoop:
                 desired_kl=self.desired_kl, max_grad_norm=self.max_grad_norm,
                 num_procs=self.num_procs, device=self.device,
             )
+            mean_kl = update_info["mean_kl"]
 
             with torch.no_grad():
                 new_lp, _, _ = model.evaluate_actions(kl_obs, kl_acts)
@@ -700,7 +744,15 @@ class PPOInnerLoop:
                 std_rew = np.std(reward_buffer)
                 mean_len = np.mean(length_buffer)
 
-            # KL convergence tracking at log intervals
+            # Feed convergence gate every iteration
+            self.convergence_gate.update({
+                'critic_loss': update_info["value_loss"],
+                'adv_std': update_info["adv_std"],
+                'entropy': update_info["entropy"],
+                'explained_variance': update_info["explained_variance"],
+            })
+
+            # KL convergence tracking at log intervals (legacy fallback)
             if inner_iters % self.log_every == 0:
                 kl_values.append(abs(inter_kl))
                 if len(reward_buffer) > 0:
@@ -709,28 +761,42 @@ class PPOInnerLoop:
             # Logging (root only)
             if self.is_root and inner_iters % self.log_every == 0:
                 rollout_mean = rollout["rewards"].mean().item()
+                gate_diag = self.convergence_gate.get_diagnostics()
                 print(f"    PPO iter {inner_iters}: "
                       f"rew/step={rollout_mean:.3f}, kl={mean_kl:.4f}, "
                       f"inter_kl={abs(inter_kl):.6f}, "
                       f"lr={current_lr:.1e}, ep_rew={mean_rew:.1f}+/-{std_rew:.1f}, "
-                      f"ep_len={mean_len:.0f}")
+                      f"ep_len={mean_len:.0f}, "
+                      f"v_loss={update_info['value_loss']:.4f}, "
+                      f"adv_std={update_info['adv_std']:.3f}, "
+                      f"ev={update_info['explained_variance']:.3f}, "
+                      f"gate={'ALL' if gate_diag.get('gate/all_converged') else 'no'}")
 
+                log_dict = {
+                    "inner/reward_per_step": rollout_mean,
+                    "inner/kl": mean_kl,
+                    "inner/inter_iter_kl": abs(inter_kl),
+                    "inner/lr": current_lr,
+                    "inner/mean_reward": mean_rew,
+                    "inner/reward_std": std_rew,
+                    "inner/episode_length": mean_len,
+                    "inner/value_loss": update_info["value_loss"],
+                    "inner/adv_std": update_info["adv_std"],
+                    "inner/entropy": update_info["entropy"],
+                    "inner/explained_variance": update_info["explained_variance"],
+                    "inner/iteration": self._global_inner_iter,
+                }
+                log_dict.update(gate_diag)
                 if self.use_wandb:
-                    wandb.log({
-                        "inner/reward_per_step": rollout_mean,
-                        "inner/kl": mean_kl,
-                        "inner/inter_iter_kl": abs(inter_kl),
-                        "inner/lr": current_lr,
-                        "inner/mean_reward": mean_rew,
-                        "inner/reward_std": std_rew,
-                        "inner/episode_length": mean_len,
-                        "inner/iteration": self._global_inner_iter,
-                    }, step=self._global_inner_iter)
+                    wandb.log(log_dict, step=self._global_inner_iter)
 
-            # Convergence check (KL-based)
+            # Convergence check
             should_stop = False
             if self.is_root and inner_iters >= effective_min:
-                should_stop = self._check_kl_converged(kl_values)
+                if self.convergence_mode == 'composite':
+                    should_stop = self.convergence_gate.check_converged()
+                else:
+                    should_stop = self._check_kl_converged(kl_values)
 
             if mp_util.enable_mp():
                 flag = torch.tensor([int(should_stop)], dtype=torch.int32,
@@ -740,7 +806,9 @@ class PPOInnerLoop:
 
             if should_stop:
                 if self.is_root:
-                    print(f"    [Inner] CONVERGED at iter {inner_iters}")
+                    diag = self.convergence_gate.get_diagnostics()
+                    print(f"    [Inner] CONVERGED at iter {inner_iters} "
+                          f"(mode={self.convergence_mode}, {diag})")
                 break
 
         elapsed = time.time() - start_time
@@ -847,7 +915,6 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
     cot_diag_all = torch.zeros(num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
-    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
 
     apply_partitioned_morphologies(sim_model, theta_np, eps, n_params,
                                    base_quats_dict, joint_idx_map,
@@ -892,8 +959,8 @@ def compute_spsa_gradient_parallel(walking_env, model, obs_rms,
                 dof_vel_eng = engine.get_dof_vel(char_id)
                 root_vel = engine.get_root_vel(char_id)
                 power = torch.sum(torch.abs(
-                    dof_forces[:wpp, :_LOCO_DOFS] *
-                    dof_vel_eng[:wpp, :_LOCO_DOFS]), dim=-1)
+                    dof_forces[:wpp] *
+                    dof_vel_eng[:wpp]), dim=-1)
                 power_sum_c += power
                 vel_sum_c += root_vel[:wpp, 0]
                 step_count_c += 1
@@ -1187,6 +1254,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         kl_window=args.kl_window,
         max_inner_iters=args.max_inner_iters,
         warmup_iters=args.warmup_iters,
+        convergence_mode=args.convergence_mode,
+        convergence_window=args.convergence_window,
+        critic_loss_plateau_threshold=args.critic_loss_plateau_threshold,
+        adv_std_threshold=args.adv_std_threshold,
+        entropy_plateau_threshold=args.entropy_plateau_threshold,
+        explained_variance_threshold=args.explained_variance_threshold,
         use_wandb=use_wandb,
     )
 
@@ -1463,11 +1536,20 @@ if __name__ == "__main__":
     parser.add_argument("--enable-dr", action="store_true", default=True)
     parser.add_argument("--no-dr", dest="enable_dr", action="store_false")
 
-    # Convergence (KL-based)
+    # Convergence
+    parser.add_argument("--convergence-mode", type=str, default="composite",
+                        choices=["composite", "kl"],
+                        help="Inner convergence: 'composite' (multi-signal gate) or 'kl' (legacy)")
+    parser.add_argument("--convergence-window", type=int, default=10,
+                        help="Window size for convergence gate signals")
+    parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05)
+    parser.add_argument("--adv-std-threshold", type=float, default=0.1)
+    parser.add_argument("--entropy-plateau-threshold", type=float, default=0.05)
+    parser.add_argument("--explained-variance-threshold", type=float, default=0.95)
     parser.add_argument("--kl-conv-threshold", type=float, default=1e-4,
-                        help="Inner convergence: mean inter-iteration KL threshold")
+                        help="Legacy KL convergence threshold (only used with --convergence-mode=kl)")
     parser.add_argument("--kl-window", type=int, default=10,
-                        help="Inner convergence: window size (in log intervals)")
+                        help="Legacy KL convergence window (only used with --convergence-mode=kl)")
     parser.add_argument("--warmup-iters", type=int, default=5000)
     parser.add_argument("--post-warmup-min-iters", type=int, default=100)
 

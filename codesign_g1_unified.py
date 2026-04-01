@@ -110,6 +110,7 @@ from g1_mjcf_modifier import (
     G1MJCFModifier, SYMMETRIC_PAIRS, NUM_DESIGN_PARAMS,
     quat_from_x_rotation, quat_multiply, quat_normalize,
 )
+from convergence_gate import CompositeConvergenceGate
 try:
     import wandb
     WANDB_AVAILABLE = True
@@ -146,15 +147,11 @@ class EpisodeCoTTracker:
     since the last call, giving a much smoother signal than an instantaneous
     snapshot.
 
-    Only counts lower-body + torso DoFs (indices 0-14) for power, excluding
-    arm joints whose energy use is not relevant to locomotion co-design.
+    Counts all DoFs (legs, torso, and arms) for power.
 
     Must be called via ``accumulate()`` + ``finalize_episodes()`` every env
     step (hooked into ``_post_physics_step``).
     """
-
-    # G1 DoF layout: 0-5 left leg, 6-11 right leg, 12-14 torso, 15-28 arms
-    LOCOMOTION_DOFS = 15  # first 15 DoFs = legs + torso
 
     @staticmethod
     def get_dof_forces_safe(engine, char_id):
@@ -195,8 +192,6 @@ class EpisodeCoTTracker:
         dof_forces = self.get_dof_forces_safe(engine, char_id)
         dof_vel = engine.get_dof_vel(char_id)
         root_vel = engine.get_root_vel(char_id)
-        dof_forces = dof_forces[:, :self.LOCOMOTION_DOFS]
-        dof_vel = dof_vel[:, :self.LOCOMOTION_DOFS]
         power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
         self.power_sum += power
         self.vel_sum += root_vel[:, 0]
@@ -256,10 +251,9 @@ def codesign_task_reward(self):
     fwd_vel = root_vel[:, 0]
 
     # 1. Per-step CoT: power / (m * g * safe_v)
-    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
     dof_forces = EpisodeCoTTracker.get_dof_forces_safe(self._engine, char_id)
     dof_vel = self._engine.get_dof_vel(char_id)
-    mech_power = torch.sum(torch.abs(dof_forces[:, :_LOCO_DOFS] * dof_vel[:, :_LOCO_DOFS]), dim=-1)
+    mech_power = torch.sum(torch.abs(dof_forces * dof_vel), dim=-1)
     cot = compute_cot(mech_power, fwd_vel, self._total_mass)
 
     # 2. Velocity tracking: exp(-|v_x - v_cmd|^2 / sigma)
@@ -473,6 +467,11 @@ class InnerLoopController:
                  min_plateau_outputs=10, max_inner_iters=10000,
                  min_inner_iters=0,
                  convergence_signal='task_reward',
+                 convergence_mode='composite',
+                 convergence_window=10,
+                 critic_loss_plateau_threshold=0.05,
+                 adv_std_threshold=0.1,
+                 actor_loss_plateau_threshold=0.05,
                  kl_conv_threshold=1e-4, kl_window=10,
                  use_kl_convergence=True,
                  ramp_start_iter=1000, ramp_end_iter=2500,
@@ -487,6 +486,7 @@ class InnerLoopController:
         self.max_inner_iters = max_inner_iters
         self.min_inner_iters = min_inner_iters
         self.convergence_signal = convergence_signal
+        self.convergence_mode = convergence_mode
         self.kl_conv_threshold = kl_conv_threshold
         self.kl_window = kl_window
         self.use_kl_convergence = use_kl_convergence
@@ -502,6 +502,15 @@ class InnerLoopController:
         self.is_root = is_root
         self.device = device
         self.rank = rank
+
+        # Composite convergence gate (MimicKit signals)
+        self.convergence_gate = CompositeConvergenceGate(window=convergence_window)
+        self.convergence_gate.add_signal(
+            'critic_loss', 'plateau', critic_loss_plateau_threshold)
+        self.convergence_gate.add_signal(
+            'adv_std', 'below', adv_std_threshold)
+        self.convergence_gate.add_signal(
+            'actor_loss', 'plateau', actor_loss_plateau_threshold)
 
     def _log_wandb_inner(self):
         """Forward inner loop metrics + episode CoT to wandb."""
@@ -580,6 +589,7 @@ class InnerLoopController:
         disc_rewards = []
         convergence_values = []
         kl_values = []
+        self.convergence_gate.reset()
         converged = False
         start_time = time.time()
         test_info = _EMPTY_TEST_INFO
@@ -641,6 +651,15 @@ class InnerLoopController:
                         al = al.item()
                     last_actor_loss = al
 
+                # Feed composite convergence gate (only after ramp completes)
+                if self.ramp_completed:
+                    gate_metrics = {}
+                    for key in ('critic_loss', 'adv_std', 'actor_loss'):
+                        v = train_info.get(key)
+                        if v is not None:
+                            gate_metrics[key] = v.item() if torch.is_tensor(v) else float(v)
+                    self.convergence_gate.update(gate_metrics)
+
                 test_info = _EMPTY_TEST_INFO
 
             env_diag_info = env.get_diagnostics()
@@ -660,13 +679,13 @@ class InnerLoopController:
                 # to prevent non-root ranks from reaching the broadcast first
                 # and hanging while root does slow I/O.
                 should_stop = False
-                if self.is_root:
-                    if self.use_kl_convergence:
-                        should_stop = (inner_iters >= self.min_inner_iters
-                                       and self._check_kl_converged(kl_values))
+                if self.is_root and inner_iters >= self.min_inner_iters:
+                    if self.convergence_mode == 'composite':
+                        should_stop = self.convergence_gate.check_converged()
+                    elif self.use_kl_convergence:
+                        should_stop = self._check_kl_converged(kl_values)
                     else:
-                        should_stop = (inner_iters >= self.min_inner_iters
-                                       and self._check_plateau(convergence_values))
+                        should_stop = self._check_plateau(convergence_values)
 
                 if mp_util.enable_mp():
                     flag = torch.tensor([int(should_stop)], dtype=torch.int32,
@@ -687,6 +706,9 @@ class InnerLoopController:
 
                     if self.use_wandb:
                         self._log_wandb_inner()
+                        # Log gate diagnostics
+                        gate_diag = self.convergence_gate.get_diagnostics()
+                        wandb.log(gate_diag, step=agent._iter)
 
                     # Video capture every video_interval iterations
                     if (self.use_wandb and self.viewer is not None
@@ -712,19 +734,10 @@ class InnerLoopController:
                     if self.is_root:
                         actor_loss_str = (f", actor_loss={last_actor_loss:.6f}"
                                           if last_actor_loss is not None else "")
-                        if self.use_kl_convergence:
-                            recent_kl = kl_values[-self.kl_window:]
-                            mean_kl = np.mean(recent_kl)
-                            print(f"    [Inner] CONVERGED ({len(kl_values)} KL samples, "
-                                  f"{inner_iters} iters, "
-                                  f"mean_kl={mean_kl:.6f}{actor_loss_str})")
-                        else:
-                            recent = convergence_values[-self.plateau_window:]
-                            spread = max(recent) - min(recent)
-                            print(f"    [Inner] CONVERGED ({len(convergence_values)} outputs, "
-                                  f"{inner_iters} iters, "
-                                  f"{self.convergence_signal}={np.mean(recent):.4f}, "
-                                  f"spread={spread:.4f}{actor_loss_str})")
+                        diag = self.convergence_gate.get_diagnostics()
+                        print(f"    [Inner] CONVERGED ({inner_iters} iters, "
+                              f"mode={self.convergence_mode}{actor_loss_str}, "
+                              f"gate={diag})")
                     converged = True
                     break
 
@@ -877,7 +890,6 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     vel_track_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
-    _LOCO_DOFS = EpisodeCoTTracker.LOCOMOTION_DOFS
 
     # Apply all perturbed morphologies to their world partitions (1 GPU<->CPU round-trip)
     apply_partitioned_morphologies(sim_model, theta_np, eps, n_params,
@@ -918,8 +930,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                 root_vel = engine.get_root_vel(char_id)
 
                 power = torch.sum(torch.abs(
-                    dof_forces[:num_worlds, :_LOCO_DOFS] *
-                    dof_vel[:num_worlds, :_LOCO_DOFS]), dim=-1)
+                    dof_forces[:num_worlds] *
+                    dof_vel[:num_worlds]), dim=-1)
                 fwd_vel = root_vel[:num_worlds, 0]
                 power_sum += power
                 vel_sum += fwd_vel
@@ -1438,6 +1450,14 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         for i in range(NUM_DESIGN_PARAMS)
     ]
 
+    # Handle deprecated --use-plateau-convergence flag
+    convergence_mode = args.convergence_mode
+    if args.use_plateau_convergence and convergence_mode == 'composite':
+        convergence_mode = 'plateau'
+        if is_root:
+            print("  [WARN] --use-plateau-convergence is deprecated, "
+                  "use --convergence-mode=plateau instead")
+
     inner_ctrl = InnerLoopController(
         agent,
         plateau_threshold=args.plateau_threshold,
@@ -1445,6 +1465,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         min_plateau_outputs=args.min_plateau_outputs,
         max_inner_iters=args.max_inner_iters,
         min_inner_iters=args.kickoff_min_iters,  # first outer iter; reset to 0 after
+        convergence_mode=convergence_mode,
+        convergence_window=args.convergence_window,
+        critic_loss_plateau_threshold=args.critic_loss_plateau_threshold,
+        adv_std_threshold=args.adv_std_threshold,
+        actor_loss_plateau_threshold=args.actor_loss_plateau_threshold,
         kl_conv_threshold=args.kl_conv_threshold,
         kl_window=args.kl_window,
         use_kl_convergence=not args.use_plateau_convergence,
@@ -1868,18 +1893,30 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
+    parser.add_argument("--convergence-mode", type=str, default="composite",
+                        choices=["composite", "kl", "plateau"],
+                        help="Inner convergence mode: 'composite' (multi-signal gate), "
+                             "'kl' (legacy KL), 'plateau' (legacy reward plateau)")
+    parser.add_argument("--convergence-window", type=int, default=10,
+                        help="Window size for composite convergence gate signals")
+    parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05,
+                        help="Composite gate: critic_loss plateau threshold")
+    parser.add_argument("--adv-std-threshold", type=float, default=0.1,
+                        help="Composite gate: adv_std below threshold")
+    parser.add_argument("--actor-loss-plateau-threshold", type=float, default=0.05,
+                        help="Composite gate: actor_loss plateau threshold")
     parser.add_argument("--kl-conv-threshold", type=float, default=1e-4,
-                        help="Inner convergence: mean approx_kl threshold (KL mode)")
+                        help="Legacy KL convergence threshold (--convergence-mode=kl)")
     parser.add_argument("--kl-window", type=int, default=10,
-                        help="Inner convergence: KL window size (in output intervals)")
+                        help="Legacy KL convergence window (--convergence-mode=kl)")
     parser.add_argument("--use-plateau-convergence", action="store_true",
-                        help="Use reward plateau instead of KL for inner convergence")
+                        help="[DEPRECATED] Use --convergence-mode=plateau instead")
     parser.add_argument("--plateau-threshold", type=float, default=0.0002,
-                        help="Inner convergence: spread/mean threshold (plateau mode)")
+                        help="Legacy plateau threshold (--convergence-mode=plateau)")
     parser.add_argument("--plateau-window", type=int, default=10,
-                        help="Inner convergence: window size in output intervals (plateau mode)")
+                        help="Legacy plateau window (--convergence-mode=plateau)")
     parser.add_argument("--min-plateau-outputs", type=int, default=10,
-                        help="Inner convergence: min output intervals before early stop (plateau mode)")
+                        help="Legacy plateau min outputs (--convergence-mode=plateau)")
     parser.add_argument("--save-interval", type=int, default=500,
                         help="Save numbered model checkpoint every N inner iterations")
     parser.add_argument("--kickoff-min-iters", type=int, default=2500,
