@@ -1,19 +1,47 @@
 #!/bin/bash
-#SBATCH -J codesign
-#SBATCH -o codesign_%j.out
-#SBATCH -e codesign_%j.err
-#SBATCH -p gpu-a100
-#SBATCH -N 1
-#SBATCH -t 12:00:00
-#SBATCH -A IRI25030
-#SBATCH --mail-type=all
-#SBATCH --mail-user=lkim23@utexas.edu
 
+# --- Submission wrapper (runs when invoked directly) ---
+# Usage: ./run_codesign.sh [--partition PARTITION] [extra python args...]
+# Partitions: gpu-a100, gpu-h100 (ls6) | amd-rtx, h100 (stampede3)
+if [[ -z "$SLURM_JOB_ID" ]]; then
+    PARTITION="gpu-a100"
+    PYTHON_ARGS=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --partition) PARTITION="$2"; shift 2 ;;
+            *) PYTHON_ARGS+=("$1"); shift ;;
+        esac
+    done
+
+    # Validate partition
+    case "$PARTITION" in
+        gpu-a100|gpu-h100|amd-rtx|h100) ;;
+        *) echo "Error: invalid partition '$PARTITION'"
+           echo "Valid: gpu-a100, gpu-h100 (ls6) | amd-rtx, h100 (stampede3)"
+           exit 1 ;;
+    esac
+
+    echo "Submitting to partition: $PARTITION"
+    exec sbatch \
+        -J codesign \
+        -o "codesign_%j.out" \
+        -e "codesign_%j.err" \
+        -p "$PARTITION" \
+        -N 1 \
+        -t "12:00:00" \
+        -A IRI25030 \
+        --mail-type=all \
+        --mail-user=lkim23@utexas.edu \
+        "$0" "${PYTHON_ARGS[@]}"
+fi
+
+# --- Job body (runs inside SLURM) ---
 source ~/.bashrc
 cd /work/11297/lklinus0926/ls6/codesign_workspace
 conda activate codesign
 
 echo "=== $(date) ==="
+echo "Partition: $SLURM_JOB_PARTITION"
 nvidia-smi
 
 python codesign/codesign_g1_unified.py \
