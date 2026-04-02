@@ -13,15 +13,16 @@ if [[ -z "$SLURM_JOB_ID" ]]; then
         esac
     done
 
-    # Validate partition
+    # Map partition to account
     case "$PARTITION" in
-        gpu-a100|gpu-h100|amd-rtx|h100) ;;
+        gpu-a100|gpu-h100) ACCOUNT="IRI25030" ;;
+        amd-rtx|h100)      ACCOUNT="IRI26004" ;;
         *) echo "Error: invalid partition '$PARTITION'"
            echo "Valid: gpu-a100, gpu-h100 (ls6) | amd-rtx, h100 (stampede3)"
            exit 1 ;;
     esac
 
-    echo "Submitting to partition: $PARTITION"
+    echo "Submitting to partition: $PARTITION (account: $ACCOUNT)"
     exec sbatch \
         -J codesign \
         -o "codesign_%j.out" \
@@ -29,7 +30,7 @@ if [[ -z "$SLURM_JOB_ID" ]]; then
         -p "$PARTITION" \
         -N 1 \
         -t "12:00:00" \
-        -A IRI25030 \
+        -A "$ACCOUNT" \
         --mail-type=all \
         --mail-user=lkim23@utexas.edu \
         "$0" "${PYTHON_ARGS[@]}"
