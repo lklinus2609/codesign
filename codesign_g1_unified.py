@@ -244,7 +244,7 @@ def codesign_task_reward(self):
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
 
     Uses the same cost function as the outer loop SPSA objective:
-        reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+        reward = -0.1*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
@@ -263,7 +263,7 @@ def codesign_task_reward(self):
     # 3. Termination penalty
     term_penalty = TERM_PENALTY * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
 
-    self._reward_buf[:] = -cot + vel_reward + term_penalty
+    self._reward_buf[:] = -0.1 * cot + vel_reward + term_penalty
 
 
 def _make_post_physics_hook(original_fn, char_id):
@@ -467,13 +467,16 @@ class InnerLoopController:
                  min_plateau_outputs=10, max_inner_iters=10000,
                  min_inner_iters=0,
                  convergence_signal='task_reward',
-                 convergence_mode='composite',
+                 convergence_mode='codesign',
                  convergence_window=10,
                  critic_loss_plateau_threshold=0.05,
                  adv_std_threshold=0.1,
                  actor_loss_plateau_threshold=0.05,
                  kl_conv_threshold=1e-4, kl_window=10,
                  use_kl_convergence=True,
+                 ep_len_threshold_frac=0.9,
+                 task_plateau_threshold=0.02,
+                 task_plateau_window=10,
                  ramp_start_iter=1000, ramp_end_iter=2500,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
@@ -503,6 +506,14 @@ class InnerLoopController:
         self.device = device
         self.rank = rank
 
+        # Codesign convergence: ep_len gate + task_reward plateau
+        self.ep_len_threshold_frac = ep_len_threshold_frac
+        self.task_plateau_threshold = task_plateau_threshold
+        self.task_plateau_window = task_plateau_window
+        self._ep_len_gate_passed = False
+        self._task_plateau_values = []
+        self._last_ep_len = 0.0
+
         # Composite convergence gate (MimicKit signals)
         self.convergence_gate = CompositeConvergenceGate(window=convergence_window)
         self.convergence_gate.add_signal(
@@ -512,12 +523,21 @@ class InnerLoopController:
         self.convergence_gate.add_signal(
             'actor_loss', 'plateau', actor_loss_plateau_threshold)
 
+    # MimicKit logger keys forwarded to wandb (allowlist)
+    _INNER_WANDB_KEYS = {
+        "Train_Return", "Train_Episode_Length",
+        "Critic_Loss", "Actor_Loss",
+        "Disc_Reward_Mean",
+    }
+
     def _log_wandb_inner(self):
-        """Forward inner loop metrics + episode CoT to wandb."""
+        """Forward essential inner loop metrics to wandb."""
         agent = self.agent
         env = agent._env
         wlog = {}
         for k, entry in agent._logger.log_current_row.items():
+            if k not in self._INNER_WANDB_KEYS:
+                continue
             v = entry.val
             try:
                 wlog[f"inner/{k}"] = float(v)
@@ -527,11 +547,8 @@ class InnerLoopController:
         cot, mech_power, fwd_vel, n_eps = cot_tracker.get_stats()
         if cot is not None:
             wlog["inner/cot"] = cot
-            wlog["inner/mechanical_power"] = mech_power
             wlog["inner/forward_velocity"] = fwd_vel
-            wlog["inner/cot_episodes"] = n_eps
         wlog["inner/task_reward_weight"] = agent._task_reward_weight
-        wlog["inner/disc_reward_weight"] = agent._disc_reward_weight
         if wlog:
             wandb.log(wlog, step=agent._iter)
 
@@ -552,6 +569,17 @@ class InnerLoopController:
             return False
         recent = list(kl_values)[-self.kl_window:]
         return np.mean(recent) < self.kl_conv_threshold
+
+    def _check_task_plateau(self):
+        """Check if task_reward has plateaued (codesign convergence stage 2)."""
+        if len(self._task_plateau_values) < self.task_plateau_window:
+            return False
+        recent = self._task_plateau_values[-self.task_plateau_window:]
+        mean_val = np.mean(recent)
+        spread = max(recent) - min(recent)
+        if abs(mean_val) < 1.0:
+            return spread < self.task_plateau_threshold
+        return (spread / abs(mean_val)) < self.task_plateau_threshold
 
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or iteration cap.
@@ -583,13 +611,18 @@ class InnerLoopController:
         # When the ramp has completed, we must stay at the final blend;
         # otherwise the ramp logic below will set them on the first iteration.
         if self.ramp_completed:
-            agent._task_reward_weight = 0.9
-            agent._disc_reward_weight = 0.1
+            agent._task_reward_weight = 0.5
+            agent._disc_reward_weight = 0.5
 
         disc_rewards = []
         convergence_values = []
         kl_values = []
         self.convergence_gate.reset()
+        self._ep_len_gate_passed = False
+        self._task_plateau_values = []
+        self._last_ep_len = 0.0
+        # Max episode length in steps (episode_length_s * control_freq)
+        self._max_ep_steps = env._episode_length * 30
         converged = False
         start_time = time.time()
         test_info = _EMPTY_TEST_INFO
@@ -608,13 +641,13 @@ class InnerLoopController:
                     agent._task_reward_weight = 0.0
                     agent._disc_reward_weight = 1.0
                 elif it >= self.ramp_end_iter:
-                    agent._task_reward_weight = 0.9
-                    agent._disc_reward_weight = 0.1
+                    agent._task_reward_weight = 0.5
+                    agent._disc_reward_weight = 0.5
                     self.ramp_completed = True
                 else:
                     t = (it - self.ramp_start_iter) / (self.ramp_end_iter - self.ramp_start_iter)
-                    agent._task_reward_weight = 0.9 * t
-                    agent._disc_reward_weight = 1.0 - 0.9 * t
+                    agent._task_reward_weight = 0.5 * t
+                    agent._disc_reward_weight = 1.0 - 0.5 * t
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
@@ -660,6 +693,21 @@ class InnerLoopController:
                             gate_metrics[key] = v.item() if torch.is_tensor(v) else float(v)
                     self.convergence_gate.update(gate_metrics)
 
+                # Codesign convergence: ep_len gate + task_reward plateau
+                # (extract mean_ep_len before _log_train_info pops it)
+                if self.ramp_completed and self.convergence_mode == 'codesign':
+                    ep_len = train_info.get("mean_ep_len")
+                    if ep_len is not None:
+                        ep_len = ep_len.item() if torch.is_tensor(ep_len) else float(ep_len)
+                        self._last_ep_len = ep_len
+                        if ep_len >= self.ep_len_threshold_frac * self._max_ep_steps:
+                            self._ep_len_gate_passed = True
+                        if self._ep_len_gate_passed:
+                            tv = train_info.get("task_reward_mean")
+                            if tv is not None:
+                                self._task_plateau_values.append(
+                                    tv.item() if torch.is_tensor(tv) else float(tv))
+
                 test_info = _EMPTY_TEST_INFO
 
             env_diag_info = env.get_diagnostics()
@@ -680,7 +728,10 @@ class InnerLoopController:
                 # and hanging while root does slow I/O.
                 should_stop = False
                 if self.is_root and inner_iters >= self.min_inner_iters:
-                    if self.convergence_mode == 'composite':
+                    if self.convergence_mode == 'codesign':
+                        should_stop = (self._ep_len_gate_passed
+                                       and self._check_task_plateau())
+                    elif self.convergence_mode == 'composite':
                         should_stop = self.convergence_gate.check_converged()
                     elif self.use_kl_convergence:
                         should_stop = self._check_kl_converged(kl_values)
@@ -706,9 +757,16 @@ class InnerLoopController:
 
                     if self.use_wandb:
                         self._log_wandb_inner()
-                        # Log gate diagnostics
-                        gate_diag = self.convergence_gate.get_diagnostics()
-                        wandb.log(gate_diag, step=agent._iter)
+                        # Log gate diagnostics for active convergence mode
+                        if self.convergence_mode == 'codesign':
+                            wandb.log({
+                                "gate/ep_len_passed": int(self._ep_len_gate_passed),
+                                "gate/mean_ep_len": self._last_ep_len,
+                                "gate/task_plateau_passed": int(self._check_task_plateau()),
+                            }, step=agent._iter)
+                        elif self.convergence_mode == 'composite':
+                            gate_diag = self.convergence_gate.get_diagnostics()
+                            wandb.log(gate_diag, step=agent._iter)
 
                     # Video capture every video_interval iterations
                     if (self.use_wandb and self.viewer is not None
@@ -734,10 +792,18 @@ class InnerLoopController:
                     if self.is_root:
                         actor_loss_str = (f", actor_loss={last_actor_loss:.6f}"
                                           if last_actor_loss is not None else "")
-                        diag = self.convergence_gate.get_diagnostics()
-                        print(f"    [Inner] CONVERGED ({inner_iters} iters, "
-                              f"mode={self.convergence_mode}{actor_loss_str}, "
-                              f"gate={diag})")
+                        if self.convergence_mode == 'codesign':
+                            recent_task = self._task_plateau_values[-self.task_plateau_window:]
+                            task_mean = np.mean(recent_task) if recent_task else 0.0
+                            print(f"    [Inner] CONVERGED ({inner_iters} iters, "
+                                  f"mode=codesign{actor_loss_str}, "
+                                  f"ep_len={self._last_ep_len:.0f}/{self._max_ep_steps:.0f}, "
+                                  f"task_reward={task_mean:.4f})")
+                        else:
+                            diag = self.convergence_gate.get_diagnostics()
+                            print(f"    [Inner] CONVERGED ({inner_iters} iters, "
+                                  f"mode={self.convergence_mode}{actor_loss_str}, "
+                                  f"gate={diag})")
                     converged = True
                     break
 
@@ -859,7 +925,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     Gradient reconstructed via least-squares solve per seed.
 
     Cost function matches inner loop task reward:
-        reward = -CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+        reward = -0.1*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
 
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
@@ -999,8 +1065,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     cot_center = float(np.mean(cot_np[0]))
     vel_track_center = float(np.mean(vt_np[0]))
 
-    # reward = -CoT + vel_reward_weight * vel_tracking
-    reward_all = -cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
+    # reward = -0.1*CoT + vel_reward_weight * vel_tracking
+    reward_all = -0.1 * cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
 
     # Per-seed: compute directional finite differences, then solve for gradient
     grad_per_seed = []
@@ -1473,6 +1539,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         kl_conv_threshold=args.kl_conv_threshold,
         kl_window=args.kl_window,
         use_kl_convergence=not args.use_plateau_convergence,
+        ep_len_threshold_frac=args.ep_len_threshold_frac,
+        task_plateau_threshold=args.task_plateau_threshold,
+        task_plateau_window=args.task_plateau_window,
         ramp_start_iter=args.ramp_start_iter,
         ramp_end_iter=args.ramp_end_iter,
         use_wandb=use_wandb,
@@ -1491,8 +1560,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     if args.resume_checkpoint:
         inner_ctrl.ramp_completed = True
         inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
-        agent._task_reward_weight = 0.9
-        agent._disc_reward_weight = 0.1
+        agent._task_reward_weight = 0.5
+        agent._disc_reward_weight = 0.5
         if is_root:
             print(f"  [Resume] Skipping kickoff ramp (ramp_completed=True, "
                   f"min_inner_iters={inner_ctrl.min_inner_iters})")
@@ -1530,8 +1599,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
               f"(+/-{THETA_BOUNDS[1]:.4f} rad)")
         if args.kickoff_min_iters > 0:
             print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
-        print(f"  Reward ramp:       disc 1.0→0.1, task 0.0→0.9 "
+        print(f"  Reward ramp:       disc 1.0→0.5, task 0.0→0.5 "
               f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
+        print(f"  Convergence mode:  {convergence_mode}")
+        if convergence_mode == 'codesign':
+            print(f"    ep_len gate:     >= {args.ep_len_threshold_frac:.0%} of max episode length")
+            print(f"    task plateau:    {args.task_plateau_threshold:.0%} spread over "
+                  f"window={args.task_plateau_window}")
         _M = args.spsa_sets * NUM_DESIGN_PARAMS
         _n_pert = 1 + 2 * _M
         _wpp = per_rank_envs // _n_pert
@@ -1641,7 +1715,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             history["grad_snr"].append(grad_snr.copy())
 
             # ----- Adaptive trust region ratio test (1b) -----
-            center_reward = -cot + args.vel_reward_weight * vel_track
+            center_reward = -0.1 * cot + args.vel_reward_weight * vel_track
             rho = None
             if prev_center_reward is not None and predicted_improvement is not None:
                 actual_improvement = center_reward - prev_center_reward
@@ -1782,39 +1856,17 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     "outer/iteration": outer_iter + 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
+                    "outer/center_reward": center_reward,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
-                    "outer/grad_snr_min": float(np.min(finite_snr)) if len(finite_snr) > 0 else 0.0,
                     "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
-                    "outer/bfgs_updates": bfgs.num_updates,
-                    "outer/bfgs_skipped": bfgs.num_skipped,
-                    "outer/bfgs_cond": float(np.linalg.cond(bfgs.H)),
-                    "outer/step_clamped": int(n_clamped),
-                    "outer/max_raw_step_deg": float(np.degrees(np.max(np.abs(raw_step)))),
-                    "outer/spsa_sets": args.spsa_sets,
-                    "outer/spsa_directions": args.spsa_sets * NUM_DESIGN_PARAMS,
-                    "outer/worlds_per_pert": per_rank_envs // (1 + 2 * args.spsa_sets * NUM_DESIGN_PARAMS),
+                    "outer/trust_radius_deg": np.degrees(trust_radius),
                 }
-                for i, name in enumerate(param_names):
-                    log_dict[f"outer/{name}_rad"] = theta[i]
-                    log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
-                    log_dict[f"outer/grad_{name}"] = grad_theta[i]
-                    log_dict[f"outer/snr_{name}"] = grad_snr[i] if np.isfinite(grad_snr[i]) else 0.0
-                    log_dict[f"outer/stderr_{name}"] = grad_stderr[i] if np.isfinite(grad_stderr[i]) else 0.0
-                if disc_rewards:
-                    log_dict["outer/final_disc_reward"] = disc_rewards[-1]
-                if final_actor_loss is not None:
-                    log_dict["outer/converged_actor_loss"] = final_actor_loss
-                # 1a: Envelope Theorem validation
-                if envelope_grad_norm is not None:
-                    log_dict["outer/envelope_grad_norm"] = envelope_grad_norm
-                # 1b: Adaptive trust region
-                log_dict["outer/trust_radius_deg"] = np.degrees(trust_radius)
-                log_dict["outer/center_reward"] = center_reward
                 if rho is not None:
                     log_dict["outer/trust_ratio_rho"] = rho
-                if predicted_improvement is not None:
-                    log_dict["outer/predicted_improvement"] = predicted_improvement
+                for i, name in enumerate(param_names):
+                    log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
+                    log_dict[f"outer/grad_{name}"] = grad_theta[i]
                 wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
@@ -1893,12 +1945,21 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
-    parser.add_argument("--convergence-mode", type=str, default="composite",
-                        choices=["composite", "kl", "plateau"],
-                        help="Inner convergence mode: 'composite' (multi-signal gate), "
+    parser.add_argument("--convergence-mode", type=str, default="codesign",
+                        choices=["codesign", "composite", "kl", "plateau"],
+                        help="Inner convergence mode: 'codesign' (ep_len gate + task_reward plateau), "
+                             "'composite' (multi-signal gate), "
                              "'kl' (legacy KL), 'plateau' (legacy reward plateau)")
     parser.add_argument("--convergence-window", type=int, default=10,
                         help="Window size for composite convergence gate signals")
+    parser.add_argument("--ep-len-threshold-frac", type=float, default=0.9,
+                        help="Codesign mode: fraction of max episode length for stage-1 gate "
+                             "(default: 0.9 = 90%% of max)")
+    parser.add_argument("--task-plateau-threshold", type=float, default=0.02,
+                        help="Codesign mode: relative spread threshold for task_reward plateau "
+                             "(default: 0.02 = 2%%)")
+    parser.add_argument("--task-plateau-window", type=int, default=10,
+                        help="Codesign mode: window size for task_reward plateau check")
     parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05,
                         help="Composite gate: critic_loss plateau threshold")
     parser.add_argument("--adv-std-threshold", type=float, default=0.1,
