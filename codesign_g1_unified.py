@@ -805,6 +805,8 @@ class InnerLoopController:
                                   f"mode={self.convergence_mode}{actor_loss_str}, "
                                   f"gate={diag})")
                     converged = True
+                    agent._iter += 1
+                    inner_iters += 1
                     break
 
                 # Reset after test (matches MimicKit train_model behavior)
