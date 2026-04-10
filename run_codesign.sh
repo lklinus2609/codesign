@@ -17,6 +17,6 @@ nvidia-smi
 
 python codesign/codesign_g1_unified.py \
     --num-train-envs 16392 \
-    --outer-iters 5 \
+    --outer-iters 100 \
     --max-inner-iters 10000 \
     "$@"
