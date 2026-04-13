@@ -263,7 +263,7 @@ def codesign_task_reward(self):
     # 3. Termination penalty
     term_penalty = TERM_PENALTY * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
 
-    self._reward_buf[:] = -0.1 * cot + vel_reward + term_penalty
+    self._reward_buf[:] = -5.0 * cot + vel_reward + term_penalty
 
 
 def _make_post_physics_hook(original_fn, char_id):
