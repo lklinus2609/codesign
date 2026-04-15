@@ -94,9 +94,12 @@ if _GBC_GPU_INDEX is not None:
 import newton  # noqa: F401
 from newton.viewer import ViewerGL
 import torch
+import torch.nn.functional as F
 
 # MimicKit modules (newton_engine.py sets wp.config.enable_backward = False)
 import util.mp_util as mp_util
+import util.torch_util as torch_util
+import util.circular_buffer as circular_buffer
 import envs.env_builder as env_builder
 import learning.agent_builder as agent_builder
 import learning.base_agent as base_agent_mod
@@ -297,6 +300,269 @@ def _make_compute_rewards_hook(agent):
         return info
 
     return hooked
+
+
+# ---------------------------------------------------------------------------
+# Morphology-invariant AMP discriminator obs (Option B)
+#
+# Default AMPEnv disc obs includes joint_rot_obs (computed via dof_to_rot
+# whose joint axes rotate with joint_X_p) and key_pos (FK body positions
+# under modified joint_X_p). Both shift systematically with morphology
+# perturbations, biasing log D in SPSA evaluations.
+#
+# We replace those features with raw dof_pos (scalar joint angles, true
+# numerical invariant under joint_X_p rotation). All other features
+# (root_pos_obs, root_rot_obs, root_vel_obs, root_ang_vel_obs, dof_vel)
+# stay as-is.
+#
+# Wired in by monkey-patching env methods before agent build, so the
+# discriminator MLP gets sized to the new (smaller) obs space.
+# ---------------------------------------------------------------------------
+
+
+@torch.jit.script
+def compute_disc_obs_morph_inv(ref_root_pos, ref_root_rot,
+                                root_pos, root_rot,
+                                root_vel, root_ang_vel,
+                                dof_pos, dof_vel,
+                                global_obs, root_height_obs):
+    # type: (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, bool, bool) -> Tensor
+    """Morphology-invariant disc obs: drop joint_rot_obs and key_pos.
+
+    Layout (per history step, then flattened across steps):
+      [root_pos_obs, root_rot_obs, dof_pos, root_vel_obs, root_ang_vel_obs, dof_vel]
+    """
+    ref_root_pos = ref_root_pos.unsqueeze(-2)
+    root_pos_obs = root_pos - ref_root_pos
+
+    if not global_obs:
+        heading_inv_rot = torch_util.calc_heading_quat_inv(ref_root_rot)
+        heading_inv_rot_expand = heading_inv_rot.unsqueeze(-2)
+        heading_inv_rot_expand = heading_inv_rot_expand.repeat(
+            (1, root_pos.shape[1], 1)
+        )
+        heading_inv_rot_flat = heading_inv_rot_expand.reshape(
+            (heading_inv_rot_expand.shape[0] * heading_inv_rot_expand.shape[1],
+             heading_inv_rot_expand.shape[2])
+        )
+
+        root_pos_obs_flat = torch.reshape(
+            root_pos_obs,
+            [root_pos_obs.shape[0] * root_pos_obs.shape[1], root_pos_obs.shape[2]]
+        )
+        root_pos_obs_flat = torch_util.quat_rotate(
+            heading_inv_rot_flat, root_pos_obs_flat
+        )
+        root_pos_obs = torch.reshape(root_pos_obs_flat, root_pos.shape)
+
+        root_rot = torch_util.quat_mul(heading_inv_rot_expand, root_rot)
+
+        root_vel_flat = torch.reshape(
+            root_vel,
+            [root_vel.shape[0] * root_vel.shape[1], root_vel.shape[2]]
+        )
+        root_vel_flat = torch_util.quat_rotate(heading_inv_rot_flat, root_vel_flat)
+        root_vel_obs = torch.reshape(root_vel_flat, root_vel.shape)
+
+        root_ang_vel_flat = torch.reshape(
+            root_ang_vel,
+            [root_ang_vel.shape[0] * root_ang_vel.shape[1], root_ang_vel.shape[2]]
+        )
+        root_ang_vel_flat = torch_util.quat_rotate(
+            heading_inv_rot_flat, root_ang_vel_flat
+        )
+        root_ang_vel_obs = torch.reshape(root_ang_vel_flat, root_ang_vel.shape)
+    else:
+        root_vel_obs = root_vel
+        root_ang_vel_obs = root_ang_vel
+
+    if root_height_obs:
+        root_pos_obs[..., 2] = root_pos[..., 2]
+    else:
+        root_pos_obs = root_pos_obs[..., :2]
+
+    root_rot_flat = torch.reshape(
+        root_rot, [root_rot.shape[0] * root_rot.shape[1], root_rot.shape[2]]
+    )
+    root_rot_obs_flat = torch_util.quat_to_tan_norm(root_rot_flat)
+    root_rot_obs = torch.reshape(
+        root_rot_obs_flat,
+        [root_rot.shape[0], root_rot.shape[1], root_rot_obs_flat.shape[-1]]
+    )
+
+    obs = torch.cat(
+        [root_pos_obs, root_rot_obs, dof_pos, root_vel_obs, root_ang_vel_obs, dof_vel],
+        dim=-1,
+    )
+    obs = torch.reshape(obs, [obs.shape[0], -1])
+    return obs
+
+
+def _attach_dof_pos_buffer(env):
+    """Add a dof_pos history buffer, mirroring AMPEnv's existing _disc_hist_*.
+
+    Called once after env build, before agent build. Buffer shape matches
+    _disc_hist_dof_vel (same num_dofs).
+    """
+    char_id = env._get_char_id()
+    dof_pos_sample = env._engine.get_dof_pos(char_id)
+    n = env._num_disc_obs_steps
+    env._disc_hist_dof_pos = circular_buffer.CircularBuffer(
+        batch_size=env.get_num_envs(),
+        buffer_len=n,
+        shape=dof_pos_sample.shape[1:],
+        dtype=dof_pos_sample.dtype,
+        device=env._device,
+    )
+
+
+def _update_disc_hist_with_dof_pos(self):
+    """Replacement for AMPEnv._update_disc_hist that also pushes dof_pos.
+
+    Mirrors amp_env.py:161-180 verbatim, plus a dof_pos push at the end.
+    """
+    char_id = self._get_char_id()
+    root_pos = self._engine.get_root_pos(char_id)
+    root_rot = self._engine.get_root_rot(char_id)
+    root_vel = self._engine.get_root_vel(char_id)
+    root_ang_vel = self._engine.get_root_ang_vel(char_id)
+    dof_pos = self._engine.get_dof_pos(char_id)
+    dof_vel = self._engine.get_dof_vel(char_id)
+    body_pos = self._engine.get_body_pos(char_id)
+
+    self._disc_hist_root_pos.push(root_pos)
+    self._disc_hist_root_rot.push(root_rot)
+    self._disc_hist_root_vel.push(root_vel)
+    self._disc_hist_root_ang_vel.push(root_ang_vel)
+    self._disc_hist_dof_vel.push(dof_vel)
+    self._disc_hist_body_pos.push(body_pos)
+    self._disc_hist_dof_pos.push(dof_pos)
+
+    joint_rot = self._kin_char_model.dof_to_rot(dof_pos)
+    self._disc_hist_joint_rot.push(joint_rot)
+
+
+def _reset_disc_hist_morph_inv(self, env_ids):
+    """Replacement for AMPEnv._reset_disc_hist that also fills dof_pos.
+
+    Mirrors amp_env.py:285-297 plus a dof_pos fill derived from mocap quats.
+    """
+    motion_ids = self._motion_ids[env_ids]
+    motion_times0 = self._get_motion_times(env_ids)
+    root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, body_pos = \
+        self._fetch_disc_demo_data(motion_ids, motion_times0)
+
+    self._disc_hist_root_pos.fill(env_ids, root_pos)
+    self._disc_hist_root_rot.fill(env_ids, root_rot)
+    self._disc_hist_root_vel.fill(env_ids, root_vel)
+    self._disc_hist_root_ang_vel.fill(env_ids, root_ang_vel)
+    self._disc_hist_joint_rot.fill(env_ids, joint_rot)
+    self._disc_hist_dof_vel.fill(env_ids, dof_vel)
+    self._disc_hist_body_pos.fill(env_ids, body_pos)
+
+    dof_pos = self._kin_char_model.rot_to_dof(joint_rot)
+    self._disc_hist_dof_pos.fill(env_ids, dof_pos)
+
+
+def _update_disc_obs_morph_inv(self, env_ids=None):
+    """Replacement for AMPEnv._update_disc_obs using morph-invariant features.
+
+    Mirrors amp_env.py:194-242 but reads dof_pos from the new buffer instead
+    of joint_rot/body_pos, and calls compute_disc_obs_morph_inv.
+    """
+    root_pos = self._disc_hist_root_pos.get_all()
+    root_rot = self._disc_hist_root_rot.get_all()
+    root_vel = self._disc_hist_root_vel.get_all()
+    root_ang_vel = self._disc_hist_root_ang_vel.get_all()
+    dof_pos = self._disc_hist_dof_pos.get_all()
+    dof_vel = self._disc_hist_dof_vel.get_all()
+
+    if env_ids is not None:
+        root_pos = root_pos[env_ids]
+        root_rot = root_rot[env_ids]
+        root_vel = root_vel[env_ids]
+        root_ang_vel = root_ang_vel[env_ids]
+        dof_pos = dof_pos[env_ids]
+        dof_vel = dof_vel[env_ids]
+
+    if self._track_global_root():
+        ref_root_pos = torch.zeros_like(root_pos[..., -1, :])
+        ref_root_rot = torch.zeros_like(root_rot[..., -1, :])
+        ref_root_rot[..., -1] = 1
+    else:
+        ref_root_pos = root_pos[..., -1, :]
+        ref_root_rot = root_rot[..., -1, :]
+
+    disc_obs = compute_disc_obs_morph_inv(
+        ref_root_pos=ref_root_pos,
+        ref_root_rot=ref_root_rot,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        root_vel=root_vel,
+        root_ang_vel=root_ang_vel,
+        dof_pos=dof_pos,
+        dof_vel=dof_vel,
+        global_obs=self._global_obs,
+        root_height_obs=self._root_height_obs,
+    )
+
+    if env_ids is None:
+        self._disc_obs_buf[:] = disc_obs
+    else:
+        self._disc_obs_buf[env_ids] = disc_obs
+
+
+def _compute_disc_obs_demo_morph_inv(self, motion_ids, motion_times0):
+    """Replacement for AMPEnv._compute_disc_obs_demo using morph-invariant features.
+
+    Mirrors amp_env.py:34-61 but derives dof_pos from mocap joint_rot via
+    the kin_char_model, then calls compute_disc_obs_morph_inv.
+    """
+    root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel, _body_pos = \
+        self._fetch_disc_demo_data(motion_ids, motion_times0)
+
+    if self._track_global_root():
+        ref_root_pos = torch.zeros_like(root_pos[..., -1, :])
+        ref_root_rot = torch.zeros_like(root_rot[..., -1, :])
+        ref_root_rot[..., -1] = 1
+    else:
+        ref_root_pos = root_pos[..., -1, :]
+        ref_root_rot = root_rot[..., -1, :]
+
+    # joint_rot has shape [num_samples * num_steps, num_joints-1, 4]; rot_to_dof
+    # operates on the last two dims and returns [..., dof_size].
+    dof_pos = self._kin_char_model.rot_to_dof(joint_rot)
+
+    disc_obs = compute_disc_obs_morph_inv(
+        ref_root_pos=ref_root_pos,
+        ref_root_rot=ref_root_rot,
+        root_pos=root_pos,
+        root_rot=root_rot,
+        root_vel=root_vel,
+        root_ang_vel=root_ang_vel,
+        dof_pos=dof_pos,
+        dof_vel=dof_vel,
+        global_obs=self._global_obs,
+        root_height_obs=self._root_height_obs,
+    )
+    return disc_obs
+
+
+def compute_disc_reward_for_obs(agent, disc_obs):
+    """Match AMP's _calc_disc_rewards (amp_agent.py:209-217) for SPSA use.
+
+    Returns a per-env disc reward tensor matching what the inner loop sees.
+    Caller passes the un-normalized disc_obs; we apply the agent's running
+    normalizer first, same as AMP does internally.
+    """
+    with torch.no_grad():
+        norm = agent._disc_obs_norm.normalize(disc_obs)
+        disc_logits = agent._model.eval_disc(norm).squeeze(-1)
+        prob = torch.sigmoid(disc_logits)
+        floor = torch.tensor(0.0001, device=disc_logits.device)
+        disc_r = -torch.log(torch.maximum(1 - prob, floor))
+        disc_r = disc_r * agent._disc_reward_scale
+    return disc_r
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +1184,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   num_seeds=10, base_seed=42,
                                   eps=0.05, vel_reward_weight=0.1,
                                   vel_cmd=1.0, vel_tracking_sigma=0.25,
-                                  num_spsa_sets=3):
+                                  num_spsa_sets=3,
+                                  outer_disc_weight=0.0,
+                                  eval_disc_reward=False):
     """Compute closed-loop gradient with orthogonal SPSA world-partitioned perturbations.
 
     Generates S random orthogonal bases (S*N directions total), partitions
@@ -956,6 +1224,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     # Result tensors: (n_pert, num_seeds)
     cot_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
     vel_track_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    # Disc reward: only meaningful when eval_disc_reward; otherwise zeros so
+    # downstream `reward_all = ... + outer_disc_weight * disc_all` is a no-op.
+    disc_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
 
@@ -983,9 +1254,11 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
         power_sum = torch.zeros(num_worlds, device=device)
         vel_sum = torch.zeros(num_worlds, device=device)
         vel_track_sum = torch.zeros(num_worlds, device=device)
+        disc_sum = torch.zeros(num_worlds, device=device)
         step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
         ep_cot_sum = torch.zeros(num_worlds, device=device)
         ep_vel_track_sum = torch.zeros(num_worlds, device=device)
+        ep_disc_sum = torch.zeros(num_worlds, device=device)
         ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
 
         with torch.no_grad():
@@ -1006,6 +1279,13 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                 vel_track_sum += torch.exp(-torch.square(fwd_vel - vel_cmd) / vel_tracking_sigma)
                 step_count += 1
 
+                if eval_disc_reward:
+                    # env.step already updated _disc_obs_buf via _update_disc_obs;
+                    # mirror AMP's per-step disc reward computation.
+                    disc_obs_step = env._disc_obs_buf[:num_worlds]
+                    disc_r_step = compute_disc_reward_for_obs(agent, disc_obs_step)
+                    disc_sum += disc_r_step
+
                 # Finalize episodes that just ended (env already auto-reset)
                 done_mask = (done[:num_worlds] > 0)
                 if done_mask.any():
@@ -1019,10 +1299,13 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                         mv = vel_sum[vi] / vsc
                         ep_cot_sum[vi] += compute_cot(mp, mv, total_mass)
                         ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
+                        if eval_disc_reward:
+                            ep_disc_sum[vi] += disc_sum[vi] / vsc
                         ep_count[vi] += 1
                     power_sum[di] = 0
                     vel_sum[di] = 0
                     vel_track_sum[di] = 0
+                    disc_sum[di] = 0
                     step_count[di] = 0
 
         # Finalize trailing partial episodes (worlds still alive at horizon)
@@ -1034,6 +1317,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
             mv = vel_sum[ai] / vsc
             ep_cot_sum[ai] += compute_cot(mp, mv, total_mass)
             ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
+            if eval_disc_reward:
+                ep_disc_sum[ai] += disc_sum[ai] / vsc
             ep_count[ai] += 1
 
         # Extract per-partition metrics
@@ -1044,6 +1329,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
             vt = (ep_vel_track_sum[s:e] / counts).mean().item()
             cot_all[p, seed_idx] = cot
             vel_track_all[p, seed_idx] = vt
+            if eval_disc_reward:
+                disc_all[p, seed_idx] = (ep_disc_sum[s:e] / counts).mean().item()
 
     agent.set_mode(base_agent_mod.AgentMode.TRAIN)
     agent.train()
@@ -1054,6 +1341,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
         torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
         cot_all /= num_procs
         vel_track_all /= num_procs
+        if eval_disc_reward:
+            torch.distributed.all_reduce(disc_all, op=torch.distributed.ReduceOp.SUM)
+            disc_all /= num_procs
 
     # Restore original morphology
     update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
@@ -1062,13 +1352,22 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     # Gradient computation via least-squares on orthogonal directions
     cot_np = cot_all.cpu().numpy()
     vt_np = vel_track_all.cpu().numpy()
+    disc_np = disc_all.cpu().numpy()
 
     # Center metrics (mean over seeds)
     cot_center = float(np.mean(cot_np[0]))
     vel_track_center = float(np.mean(vt_np[0]))
+    disc_center = float(np.mean(disc_np[0])) if eval_disc_reward else 0.0
 
-    # reward = -5.0*CoT + vel_reward_weight * vel_tracking
-    reward_all = -5.0 * cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
+    # reward = -5.0*CoT + vel_reward_weight * vel_tracking + outer_disc_weight * disc
+    # Inner loop blends task_r with disc_r at the same outer_disc_weight after
+    # the AMP ramp completes; matching the formula here aligns the SPSA
+    # gradient with the objective the policy is actually optimizing.
+    reward_all = (
+        -5.0 * cot_np
+        + vel_reward_weight * vt_np
+        + outer_disc_weight * disc_np
+    )  # (n_pert, num_seeds)
 
     # Per-seed: compute directional finite differences, then solve for gradient
     grad_per_seed = []
@@ -1109,8 +1408,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     grad = np.clip(grad, -10.0, 10.0)
 
     if rank == 0:
+        disc_str = (f", disc={disc_center:.4f}" if eval_disc_reward else "")
         print(f"    [SPSA] Center (mean over {num_seeds} seeds): "
-              f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}")
+              f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}{disc_str}")
         print(f"    [SPSA] Gradient ({len(grad_per_seed)}/{num_seeds} valid seeds):")
         for i, name in enumerate(param_names):
             print(f"      d_reward/d_{name} = {grad[i]:+.6f} "
@@ -1121,7 +1421,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                   f"mean={np.mean(finite_snr):.2f}, "
                   f"max={np.max(finite_snr):.2f}")
 
-    return grad, grad_stderr, snr, vel_track_center, cot_center
+    return grad, grad_stderr, snr, vel_track_center, cot_center, disc_center
 
 
 # ---------------------------------------------------------------------------
@@ -1400,6 +1700,36 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     # Monkey-patch task reward onto env (replaces empty _update_reward)
     env._update_reward = types.MethodType(codesign_task_reward, env)
 
+    # Option B: morphology-invariant disc obs. Must be wired BEFORE
+    # build_agent() because the agent reads env.get_disc_obs_space() to
+    # size the discriminator MLP. Tracks original shape for the post-build
+    # sanity assertion.
+    expected_disc_obs_dim = None
+    if args.disc_morph_invariant:
+        _attach_dof_pos_buffer(env)
+        env._update_disc_hist = types.MethodType(_update_disc_hist_with_dof_pos, env)
+        env._reset_disc_hist = types.MethodType(_reset_disc_hist_morph_inv, env)
+        env._update_disc_obs = types.MethodType(_update_disc_obs_morph_inv, env)
+        env._compute_disc_obs_demo = types.MethodType(
+            _compute_disc_obs_demo_morph_inv, env
+        )
+        # _disc_obs_buf was sized in env __init__ from the OLD compute_disc_obs
+        # shape; rebuild it for the morph-invariant shape so _update_disc_obs
+        # writes don't trip a shape mismatch.
+        new_obs_space = env.get_disc_obs_space()
+        env._disc_obs_buf = torch.zeros(
+            [env.get_num_envs()] + list(new_obs_space.shape),
+            device=env._device,
+            dtype=env._disc_obs_buf.dtype,
+        )
+        # The wrapped env._info["disc_obs"] handle (set in
+        # AMPEnv._build_data_buffers) still points at the old buffer — re-bind.
+        env._info["disc_obs"] = env._disc_obs_buf
+        expected_disc_obs_dim = int(new_obs_space.shape[0])
+        if is_root:
+            print(f"  [Option B] morph-invariant disc obs enabled "
+                  f"(disc_obs_dim={expected_disc_obs_dim})")
+
     # Placeholder mass (build_agent may trigger env steps before real mass is known)
     env._total_mass = 1.0
     env._vel_reward_weight = args.vel_reward_weight
@@ -1407,6 +1737,13 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     env._vel_tracking_sigma = args.vel_tracking_sigma
 
     agent = agent_builder.build_agent(str(BASE_AGENT_CONFIG), env, device)
+
+    if expected_disc_obs_dim is not None:
+        actual_dim = int(agent._disc_obs_norm.get_shape()[0])
+        assert actual_dim == expected_disc_obs_dim, (
+            f"Disc MLP sized to {actual_dim} but env.get_disc_obs_space() "
+            f"returned {expected_disc_obs_dim}; monkey-patch ordering broken."
+        )
 
     # Ensure disc replay buffer can hold a full rollout batch.
     # With 16384 envs x 32 steps_per_iter = 524k samples, but default buffer is 200k.
@@ -1690,16 +2027,22 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         spsa_base_seed = 42 + outer_iter * 1000
 
-        grad_theta, grad_stderr, grad_snr, vel_track, cot = compute_spsa_gradient_parallel(
-            agent, env, engine, char_id, total_mass,
-            theta.copy(), base_quats_dict, joint_idx_map,
-            per_rank_envs, args.eval_horizon,
-            rank, num_procs, device, param_names,
-            num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
-            eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
-            vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
-            num_spsa_sets=args.spsa_sets,
+        eval_disc_in_outer = (
+            args.disc_morph_invariant and args.outer_disc_weight != 0.0
         )
+        grad_theta, grad_stderr, grad_snr, vel_track, cot, disc_center = \
+            compute_spsa_gradient_parallel(
+                agent, env, engine, char_id, total_mass,
+                theta.copy(), base_quats_dict, joint_idx_map,
+                per_rank_envs, args.eval_horizon,
+                rank, num_procs, device, param_names,
+                num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
+                eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
+                vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+                num_spsa_sets=args.spsa_sets,
+                outer_disc_weight=args.outer_disc_weight,
+                eval_disc_reward=eval_disc_in_outer,
+            )
 
         # Clear CoT tracker after SPSA to prevent pollution of inner loop
         env._cot_tracker.get_stats()
@@ -1718,7 +2061,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             history["grad_snr"].append(grad_snr.copy())
 
             # ----- Adaptive trust region ratio test (1b) -----
-            center_reward = -5.0 * cot + args.vel_reward_weight * vel_track
+            # Match SPSA reward formula so trust-region ratio is consistent.
+            center_reward = (
+                -5.0 * cot
+                + args.vel_reward_weight * vel_track
+                + args.outer_disc_weight * disc_center
+            )
             rho = None
             if prev_center_reward is not None and predicted_improvement is not None:
                 actual_improvement = center_reward - prev_center_reward
@@ -1859,6 +2207,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     "outer/iteration": outer_iter + 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
+                    "outer/disc_center": disc_center,
+                    "outer/disc_reward_term": args.outer_disc_weight * disc_center,
                     "outer/center_reward": center_reward,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
@@ -1999,6 +2349,22 @@ if __name__ == "__main__":
                         help="Target forward velocity for velocity tracking (m/s)")
     parser.add_argument("--vel-tracking-sigma", type=float, default=0.25,
                         help="Sigma for Gaussian velocity tracking reward")
+    # Option B: morphology-invariant disc obs + style reward in outer loop
+    parser.add_argument("--disc-morph-invariant", dest="disc_morph_invariant",
+                        action="store_true", default=True,
+                        help="Use morphology-invariant AMP disc obs (drops "
+                             "joint_rot_obs and key_pos, adds raw dof_pos). "
+                             "Required for --outer-disc-weight to be safe. "
+                             "Default: True.")
+    parser.add_argument("--no-disc-morph-invariant", dest="disc_morph_invariant",
+                        action="store_false",
+                        help="Revert to baseline AMP disc obs (morph-dependent).")
+    parser.add_argument("--outer-disc-weight", type=float, default=0.5,
+                        help="Blend weight for log D in the outer SPSA reward. "
+                             "Match inner-loop blend (typically 0.5) so inner "
+                             "and outer optimize the same objective. Set 0.0 "
+                             "to disable the disc term in the outer loop. "
+                             "Only takes effect when --disc-morph-invariant.")
     parser.add_argument("--no-video", action="store_true",
                         help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
@@ -2025,6 +2391,23 @@ if __name__ == "__main__":
             f"--kickoff-min-iters ({args.kickoff_min_iters}) must be >= "
             f"--ramp-end-iter ({args.ramp_end_iter}) so the outer loop "
             f"only starts after the reward ramp completes"
+        )
+
+    if args.outer_disc_weight != 0.0 and not args.disc_morph_invariant:
+        parser.error(
+            f"--outer-disc-weight ({args.outer_disc_weight}) requires "
+            f"--disc-morph-invariant. Without morph-invariant disc obs, "
+            f"log D shifts non-behaviorally with morphology perturbations "
+            f"and the outer SPSA gradient is biased. Either pass "
+            f"--disc-morph-invariant or set --outer-disc-weight 0."
+        )
+
+    if args.resume_checkpoint and args.disc_morph_invariant:
+        print(
+            f"  [WARN] --resume-checkpoint with --disc-morph-invariant: the "
+            f"discriminator MLP shape depends on disc obs dim. If the "
+            f"checkpoint was trained with a different setting, agent.load() "
+            f"will fail with a shape mismatch."
         )
 
     # Flip --no-wandb to args.wandb for downstream use
