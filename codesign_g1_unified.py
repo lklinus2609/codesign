@@ -244,7 +244,7 @@ def codesign_task_reward(self):
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
 
     Uses the same cost function as the outer loop SPSA objective:
-        reward = -0.1*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+        reward = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
@@ -927,7 +927,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     Gradient reconstructed via least-squares solve per seed.
 
     Cost function matches inner loop task reward:
-        reward = -0.1*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+        reward = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
 
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
@@ -1067,8 +1067,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     cot_center = float(np.mean(cot_np[0]))
     vel_track_center = float(np.mean(vt_np[0]))
 
-    # reward = -0.1*CoT + vel_reward_weight * vel_tracking
-    reward_all = -0.1 * cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
+    # reward = -5.0*CoT + vel_reward_weight * vel_tracking
+    reward_all = -5.0 * cot_np + vel_reward_weight * vt_np  # (n_pert, num_seeds)
 
     # Per-seed: compute directional finite differences, then solve for gradient
     grad_per_seed = []
@@ -1333,9 +1333,10 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     # --- wandb (root only) ---
     use_wandb = is_root and args.wandb and WANDB_AVAILABLE
     if use_wandb:
+        partition = os.environ.get("SLURM_JOB_PARTITION", "local")
         wandb.init(
             project="gbc-codesign",
-            name=f"g1-unified-{args.num_train_envs}env-{num_procs}gpu",
+            name=f"g1-unified-{partition}-{args.num_train_envs}env-{num_procs}gpu",
             config=vars(args),
         )
     elif is_root and args.wandb:
@@ -1717,7 +1718,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             history["grad_snr"].append(grad_snr.copy())
 
             # ----- Adaptive trust region ratio test (1b) -----
-            center_reward = -0.1 * cot + args.vel_reward_weight * vel_track
+            center_reward = -5.0 * cot + args.vel_reward_weight * vel_track
             rho = None
             if prev_center_reward is not None and predicted_improvement is not None:
                 actual_improvement = center_reward - prev_center_reward
