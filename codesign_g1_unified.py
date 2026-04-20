@@ -1921,7 +1921,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     TRUST_RADIUS_MAX = np.radians(5.0)
     prev_center_reward = None
     predicted_improvement = None
-    theta_history = deque(maxlen=5)
+    reward_history = deque(maxlen=5)
 
     if is_root:
         print(f"Configuration:")
@@ -2174,19 +2174,43 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         )
 
         # ----- Outer convergence check -----
+        # Reward + gradient AND: stop only if the objective has plateaued AND
+        # the SPSA gradient signal is weak (noise-dominated or near zero).
+        # Prevents false-positive from trust-region throttling.
+        REWARD_PLATEAU_PCT = 0.05   # 5% relative range over window
+        SNR_NOISE_FLOOR    = 5.0    # mean SPSA SNR below this = noise-dominated
+        GRAD_NORM_TOL      = 0.10   # ||grad|| below this = near-zero gradient
+
         # Broadcast BEFORE root-only saves to prevent non-root ranks from
         # reaching the broadcast first and hanging while root does slow I/O.
         outer_converged = False
         if is_root:
-            theta_history.append(theta.copy())
-            if len(theta_history) >= 5:
-                theta_stack = np.array(list(theta_history))
-                ranges = theta_stack.max(axis=0) - theta_stack.min(axis=0)
-                max_range = ranges.max()
-                if max_range < np.radians(0.5):
-                    print(f"\n  OUTER CONVERGED: theta stable "
-                          f"(max range = {np.degrees(max_range):.3f} deg)")
+            reward_history.append(center_reward)
+            if len(reward_history) >= 5:
+                r = np.array(list(reward_history))
+                r_mean = float(np.mean(r))
+                reward_range_rel = (r.max() - r.min()) / (abs(r_mean) + 1e-8)
+                reward_plateau = reward_range_rel < REWARD_PLATEAU_PCT
+
+                finite_snr = grad_snr[np.isfinite(grad_snr)]
+                mean_snr = float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0
+                grad_norm = float(np.linalg.norm(grad_theta))
+                grad_weak = (mean_snr < SNR_NOISE_FLOOR) or (grad_norm < GRAD_NORM_TOL)
+
+                if reward_plateau and grad_weak:
+                    print(
+                        f"\n  OUTER CONVERGED: reward plateau "
+                        f"(range={reward_range_rel*100:.2f}%) AND gradient weak "
+                        f"(mean SNR={mean_snr:.2f}, ||grad||={grad_norm:.3f})"
+                    )
                     outer_converged = True
+                else:
+                    print(
+                        f"  [Convergence] not yet: reward_range={reward_range_rel*100:.2f}% "
+                        f"(plateau? {reward_plateau}), "
+                        f"||grad||={grad_norm:.3f}, mean SNR={mean_snr:.2f} "
+                        f"(weak? {grad_weak})"
+                    )
 
         if mp_util.enable_mp():
             flag = torch.tensor([int(outer_converged)], dtype=torch.int32,
