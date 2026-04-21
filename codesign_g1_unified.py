@@ -743,6 +743,8 @@ class InnerLoopController:
                  ep_len_threshold_frac=0.9,
                  task_plateau_threshold=0.02,
                  task_plateau_window=10,
+                 cot_plateau_threshold=0.05,
+                 cot_plateau_window=10,
                  ramp_start_iter=1000, ramp_end_iter=2500,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
@@ -772,12 +774,18 @@ class InnerLoopController:
         self.device = device
         self.rank = rank
 
-        # Codesign convergence: ep_len gate + task_reward plateau
+        # Codesign convergence: ep_len gate + task_reward plateau AND CoT plateau
         self.ep_len_threshold_frac = ep_len_threshold_frac
         self.task_plateau_threshold = task_plateau_threshold
         self.task_plateau_window = task_plateau_window
+        self.cot_plateau_threshold = cot_plateau_threshold
+        self.cot_plateau_window = cot_plateau_window
         self._ep_len_gate_passed = False
         self._task_plateau_values = []
+        self._cot_plateau_values = []
+        # Cached CoT snapshot from most recent get_stats() so wandb logger does
+        # not clear the tracker a second time (get_stats clears buffers).
+        self._last_cot_snapshot = (None, None, None, 0)
         self._last_ep_len = 0.0
 
         # Composite convergence gate (MimicKit signals)
@@ -809,8 +817,9 @@ class InnerLoopController:
                 wlog[f"inner/{k}"] = float(v)
             except (TypeError, ValueError):
                 pass
-        cot_tracker = env._cot_tracker
-        cot, mech_power, fwd_vel, n_eps = cot_tracker.get_stats()
+        # Use cached snapshot (populated in train_until_converged) because
+        # cot_tracker.get_stats() clears episode buffers on each call.
+        cot, mech_power, fwd_vel, n_eps = self._last_cot_snapshot
         if cot is not None:
             wlog["inner/cot"] = cot
             wlog["inner/forward_velocity"] = fwd_vel
@@ -846,6 +855,17 @@ class InnerLoopController:
         if abs(mean_val) < 1.0:
             return spread < self.task_plateau_threshold
         return (spread / abs(mean_val)) < self.task_plateau_threshold
+
+    def _check_cot_plateau(self):
+        """Check if episode-averaged CoT has plateaued (stage 3, AND'd with task)."""
+        if len(self._cot_plateau_values) < self.cot_plateau_window:
+            return False
+        recent = self._cot_plateau_values[-self.cot_plateau_window:]
+        mean_val = np.mean(recent)
+        spread = max(recent) - min(recent)
+        if abs(mean_val) < 1.0:
+            return spread < self.cot_plateau_threshold
+        return (spread / abs(mean_val)) < self.cot_plateau_threshold
 
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or iteration cap.
@@ -886,6 +906,8 @@ class InnerLoopController:
         self.convergence_gate.reset()
         self._ep_len_gate_passed = False
         self._task_plateau_values = []
+        self._cot_plateau_values = []
+        self._last_cot_snapshot = (None, None, None, 0)
         self._last_ep_len = 0.0
         # Max episode length in steps (episode_length_s * control_freq)
         self._max_ep_steps = env._episode_length * 30
@@ -973,6 +995,12 @@ class InnerLoopController:
                             if tv is not None:
                                 self._task_plateau_values.append(
                                     tv.item() if torch.is_tensor(tv) else float(tv))
+                    # Pull CoT once per output iter. get_stats() clears episode
+                    # buffers, so cache the snapshot for _log_wandb_inner.
+                    cot_snap = env._cot_tracker.get_stats()
+                    self._last_cot_snapshot = cot_snap
+                    if self._ep_len_gate_passed and cot_snap[0] is not None:
+                        self._cot_plateau_values.append(float(cot_snap[0]))
 
                 test_info = _EMPTY_TEST_INFO
 
@@ -996,7 +1024,8 @@ class InnerLoopController:
                 if self.is_root and inner_iters >= self.min_inner_iters:
                     if self.convergence_mode == 'codesign':
                         should_stop = (self._ep_len_gate_passed
-                                       and self._check_task_plateau())
+                                       and self._check_task_plateau()
+                                       and self._check_cot_plateau())
                     elif self.convergence_mode == 'composite':
                         should_stop = self.convergence_gate.check_converged()
                     elif self.use_kl_convergence:
@@ -1029,6 +1058,7 @@ class InnerLoopController:
                                 "gate/ep_len_passed": int(self._ep_len_gate_passed),
                                 "gate/mean_ep_len": self._last_ep_len,
                                 "gate/task_plateau_passed": int(self._check_task_plateau()),
+                                "gate/cot_plateau_passed": int(self._check_cot_plateau()),
                             }, step=agent._iter)
                         elif self.convergence_mode == 'composite':
                             gate_diag = self.convergence_gate.get_diagnostics()
@@ -1061,10 +1091,12 @@ class InnerLoopController:
                         if self.convergence_mode == 'codesign':
                             recent_task = self._task_plateau_values[-self.task_plateau_window:]
                             task_mean = np.mean(recent_task) if recent_task else 0.0
+                            recent_cot = self._cot_plateau_values[-self.cot_plateau_window:]
+                            cot_mean = np.mean(recent_cot) if recent_cot else 0.0
                             print(f"    [Inner] CONVERGED ({inner_iters} iters, "
                                   f"mode=codesign{actor_loss_str}, "
                                   f"ep_len={self._last_ep_len:.0f}/{self._max_ep_steps:.0f}, "
-                                  f"task_reward={task_mean:.4f})")
+                                  f"task_reward={task_mean:.4f}, cot={cot_mean:.4f})")
                         else:
                             diag = self.convergence_gate.get_diagnostics()
                             print(f"    [Inner] CONVERGED ({inner_iters} iters, "
@@ -1882,6 +1914,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         ep_len_threshold_frac=args.ep_len_threshold_frac,
         task_plateau_threshold=args.task_plateau_threshold,
         task_plateau_window=args.task_plateau_window,
+        cot_plateau_threshold=args.inner_cot_plateau_threshold,
+        cot_plateau_window=args.inner_cot_plateau_window,
         ramp_start_iter=args.ramp_start_iter,
         ramp_end_iter=args.ramp_end_iter,
         use_wandb=use_wandb,
@@ -1922,6 +1956,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     prev_center_reward = None
     predicted_improvement = None
     reward_history = deque(maxlen=5)
+    cot_history = deque(maxlen=args.outer_cot_plateau_window)
 
     if is_root:
         print(f"Configuration:")
@@ -1946,6 +1981,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"    ep_len gate:     >= {args.ep_len_threshold_frac:.0%} of max episode length")
             print(f"    task plateau:    {args.task_plateau_threshold:.0%} spread over "
                   f"window={args.task_plateau_window}")
+            print(f"    cot plateau:     {args.inner_cot_plateau_threshold:.0%} spread over "
+                  f"window={args.inner_cot_plateau_window} (AND'd with task)")
+        print(f"  Outer convergence: reward {0.05:.0%} AND cot "
+              f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
+              f"AND weak grad")
         _M = args.spsa_sets * NUM_DESIGN_PARAMS
         _n_pert = 1 + 2 * _M
         _wpp = per_rank_envs // _n_pert
@@ -2184,23 +2224,38 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         # Broadcast BEFORE root-only saves to prevent non-root ranks from
         # reaching the broadcast first and hanging while root does slow I/O.
         outer_converged = False
+        reward_range_rel = 0.0
+        reward_plateau = False
+        cot_range_rel = 0.0
+        cot_plateau = False
+        mean_snr = 0.0
+        grad_norm = 0.0
+        grad_weak = False
         if is_root:
             reward_history.append(center_reward)
+            cot_history.append(cot)
             if len(reward_history) >= 5:
                 r = np.array(list(reward_history))
                 r_mean = float(np.mean(r))
                 reward_range_rel = (r.max() - r.min()) / (abs(r_mean) + 1e-8)
                 reward_plateau = reward_range_rel < REWARD_PLATEAU_PCT
 
+                if len(cot_history) >= args.outer_cot_plateau_window:
+                    c = np.array(list(cot_history))
+                    c_mean = float(np.mean(c))
+                    cot_range_rel = (c.max() - c.min()) / (abs(c_mean) + 1e-8)
+                    cot_plateau = cot_range_rel < args.outer_cot_plateau_pct
+
                 finite_snr = grad_snr[np.isfinite(grad_snr)]
                 mean_snr = float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0
                 grad_norm = float(np.linalg.norm(grad_theta))
                 grad_weak = (mean_snr < SNR_NOISE_FLOOR) or (grad_norm < GRAD_NORM_TOL)
 
-                if reward_plateau and grad_weak:
+                if reward_plateau and cot_plateau and grad_weak:
                     print(
                         f"\n  OUTER CONVERGED: reward plateau "
-                        f"(range={reward_range_rel*100:.2f}%) AND gradient weak "
+                        f"(range={reward_range_rel*100:.2f}%) AND CoT plateau "
+                        f"(range={cot_range_rel*100:.2f}%) AND gradient weak "
                         f"(mean SNR={mean_snr:.2f}, ||grad||={grad_norm:.3f})"
                     )
                     outer_converged = True
@@ -2208,6 +2263,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     print(
                         f"  [Convergence] not yet: reward_range={reward_range_rel*100:.2f}% "
                         f"(plateau? {reward_plateau}), "
+                        f"cot_range={cot_range_rel*100:.2f}% (plateau? {cot_plateau}), "
                         f"||grad||={grad_norm:.3f}, mean SNR={mean_snr:.2f} "
                         f"(weak? {grad_weak})"
                     )
@@ -2238,6 +2294,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     "outer/grad_norm": np.linalg.norm(grad_theta),
                     "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
                     "outer/trust_radius_deg": np.degrees(trust_radius),
+                    "outer/reward_range_rel": reward_range_rel,
+                    "outer/reward_plateau_passed": int(reward_plateau),
+                    "outer/cot_range_rel": cot_range_rel,
+                    "outer/cot_plateau_passed": int(cot_plateau),
+                    "outer/grad_weak_passed": int(grad_weak),
                 }
                 if rho is not None:
                     log_dict["outer/trust_ratio_rho"] = rho
@@ -2337,6 +2398,16 @@ if __name__ == "__main__":
                              "(default: 0.02 = 2%%)")
     parser.add_argument("--task-plateau-window", type=int, default=10,
                         help="Codesign mode: window size for task_reward plateau check")
+    parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.05,
+                        help="Codesign mode: relative spread threshold for inner CoT plateau "
+                             "(AND'd with task_reward plateau). Default 0.05 = 5%%")
+    parser.add_argument("--inner-cot-plateau-window", type=int, default=10,
+                        help="Codesign mode: window size for inner CoT plateau check")
+    parser.add_argument("--outer-cot-plateau-pct", type=float, default=0.10,
+                        help="Outer convergence: relative range cutoff for CoT plateau "
+                             "(AND'd with reward plateau and weak-grad). Default 0.10 = 10%%")
+    parser.add_argument("--outer-cot-plateau-window", type=int, default=5,
+                        help="Outer convergence: window size for CoT plateau check")
     parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05,
                         help="Composite gate: critic_loss plateau threshold")
     parser.add_argument("--adv-std-threshold", type=float, default=0.1,
