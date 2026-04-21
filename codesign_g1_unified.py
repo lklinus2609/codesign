@@ -2398,14 +2398,14 @@ if __name__ == "__main__":
                              "(default: 0.02 = 2%%)")
     parser.add_argument("--task-plateau-window", type=int, default=10,
                         help="Codesign mode: window size for task_reward plateau check")
-    parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.05,
+    parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.001,
                         help="Codesign mode: relative spread threshold for inner CoT plateau "
-                             "(AND'd with task_reward plateau). Default 0.05 = 5%%")
+                             "(AND'd with task_reward plateau). Default 0.001 = 0.1%%")
     parser.add_argument("--inner-cot-plateau-window", type=int, default=10,
                         help="Codesign mode: window size for inner CoT plateau check")
-    parser.add_argument("--outer-cot-plateau-pct", type=float, default=0.10,
+    parser.add_argument("--outer-cot-plateau-pct", type=float, default=0.002,
                         help="Outer convergence: relative range cutoff for CoT plateau "
-                             "(AND'd with reward plateau and weak-grad). Default 0.10 = 10%%")
+                             "(AND'd with reward plateau and weak-grad). Default 0.002 = 0.2%%")
     parser.add_argument("--outer-cot-plateau-window", type=int, default=5,
                         help="Outer convergence: window size for CoT plateau check")
     parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05,
