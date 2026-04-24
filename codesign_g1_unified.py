@@ -2057,6 +2057,16 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         history["inner_times"].append(inner_time)
 
+        # Baseline mode: exit after inner convergence on first outer iter.
+        # All ranks break together — train_until_converged is a barrier, so
+        # every rank reaches this point at the same time.
+        if args.baseline:
+            if is_root:
+                print(f"\n  [Baseline] Inner loop converged in "
+                      f"{inner_time / 60:.1f} min. Final checkpoint at "
+                      f"{iter_dir / 'model.pt'}. Exiting without SPSA.")
+            break
+
         # After kickoff, disable min_inner_iters gate for subsequent iters.
         # Reward weights are now handled by the ramp inside train_until_converged
         # (disc 1.0→0.0, task 0.0→1.0 over ramp_start..ramp_end iters).
@@ -2409,6 +2419,11 @@ if __name__ == "__main__":
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=20)
+    parser.add_argument("--baseline", action="store_true",
+                        help="Baseline mode: exit after inner-loop convergence on "
+                             "the first outer iter. Skips SPSA, BFGS, and all "
+                             "further outer iterations. For fixed-morphology "
+                             "PPO/AMP baseline runs.")
     parser.add_argument("--design-lr", type=float, default=1.0,
                         help="Step size scaling on BFGS direction (default: 1.0, BFGS self-scales)")
     parser.add_argument("--num-train-envs", type=int, default=4096,
