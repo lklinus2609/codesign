@@ -110,9 +110,16 @@ import envs.base_env as base_env_mod
 
 # Co-design modules
 from g1_mjcf_modifier import (
-    G1MJCFModifier, SYMMETRIC_PAIRS, NUM_DESIGN_PARAMS,
+    G1MJCFModifier,
+    DESIGN_GROUPS_BY_SCOPE, group_param_name, body_to_joint_name,
+    LOWER_SYMMETRIC_GROUPS,
     quat_from_x_rotation, quat_multiply, quat_normalize,
 )
+
+# Design-parameter scope — initialised to lower-body (6-param) default.
+# main() overwrites these based on --design-scope before any use.
+DESIGN_GROUPS = LOWER_SYMMETRIC_GROUPS
+NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
 from convergence_gate import CompositeConvergenceGate
 try:
     import wandb
@@ -670,9 +677,10 @@ def extract_joint_info(model, num_worlds):
     base_quats_dict = {}
     joint_idx_map = {}
 
-    for left_body, right_body in SYMMETRIC_PAIRS:
-        for body_name in (left_body, right_body):
-            joint_name = body_name.replace("_link", "_joint")
+    expected_joint_count = sum(len(g) for g in DESIGN_GROUPS)
+    for group in DESIGN_GROUPS:
+        for body_name in group:
+            joint_name = body_to_joint_name(body_name)
             if joint_name in joint_name_to_idx:
                 idx = joint_name_to_idx[joint_name]
             else:
@@ -685,7 +693,7 @@ def extract_joint_info(model, num_worlds):
             joint_idx_map[body_name] = idx
 
     print(f"  [JointInfo] Found {len(joint_idx_map)} parameterized joints "
-          f"(expected {NUM_DESIGN_PARAMS * 2})")
+          f"(expected {expected_joint_count})")
     return base_quats_dict, joint_idx_map
 
 
@@ -701,10 +709,10 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
     joint_X_p_np = model.joint_X_p.numpy()
 
     world_indices = np.arange(num_worlds)
-    for i, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
+    for i, group in enumerate(DESIGN_GROUPS):
         angle = float(theta_np[i])
         delta_q = quat_from_x_rotation(angle)
-        for body_name in (left_body, right_body):
+        for body_name in group:
             if body_name not in joint_idx_map:
                 continue
             base_q = base_quats_dict[body_name]
@@ -1167,10 +1175,10 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
 
         # Write quaternions for this partition's world range
         world_indices = np.arange(w_start, w_end)
-        for i, (left_body, right_body) in enumerate(SYMMETRIC_PAIRS):
+        for i, group in enumerate(DESIGN_GROUPS):
             angle = float(theta_pert[i])
             delta_q = quat_from_x_rotation(angle)
-            for body_name in (left_body, right_body):
+            for body_name in group:
                 if body_name not in joint_idx_map:
                     continue
                 base_q = base_quats_dict[body_name]
@@ -1217,6 +1225,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   eps=0.05, vel_reward_weight=0.1,
                                   vel_cmd=1.0, vel_tracking_sigma=0.25,
                                   num_spsa_sets=3,
+                                  outer_task_weight=1.0,
                                   outer_disc_weight=0.0,
                                   eval_disc_reward=False):
     """Compute closed-loop gradient with orthogonal SPSA world-partitioned perturbations.
@@ -1226,8 +1235,11 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     simultaneously. The seed loop (K iterations) remains sequential.
     Gradient reconstructed via least-squares solve per seed.
 
-    Cost function matches inner loop task reward:
-        reward = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+    Cost function matches inner loop blended reward (post-AMP-ramp):
+        reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_tracking)
+                 + outer_disc_weight * disc
+    Set outer_task_weight=0.5, outer_disc_weight=0.5 to exactly match the
+    inner-loop coefficients after the AMP reward-weight ramp completes.
 
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
@@ -1391,13 +1403,16 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     vel_track_center = float(np.mean(vt_np[0]))
     disc_center = float(np.mean(disc_np[0])) if eval_disc_reward else 0.0
 
-    # reward = -5.0*CoT + vel_reward_weight * vel_tracking + outer_disc_weight * disc
-    # Inner loop blends task_r with disc_r at the same outer_disc_weight after
-    # the AMP ramp completes; matching the formula here aligns the SPSA
-    # gradient with the objective the policy is actually optimizing.
+    # reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_tracking)
+    #          + outer_disc_weight * disc
+    # Inner-loop post-AMP-ramp effective reward is
+    #     0.5 * task_r + 0.5 * disc_r   (task_reward_weight = disc_reward_weight = 0.5)
+    # so passing outer_task_weight=0.5, outer_disc_weight=0.5 matches the inner
+    # coefficients on CoT, vel, and disc exactly. Termination penalty and
+    # per-step-vs-episode-average structural differences are NOT addressed by
+    # these scalars — see codesign_task_reward() for the inner formula.
     reward_all = (
-        -5.0 * cot_np
-        + vel_reward_weight * vt_np
+        outer_task_weight * (-5.0 * cot_np + vel_reward_weight * vt_np)
         + outer_disc_weight * disc_np
     )  # (n_pert, num_seeds)
 
@@ -1617,7 +1632,7 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
         torch.cuda.set_device(device)
 
     # Seed per rank for diverse rollouts
-    seed = int(np.uint64(42) + np.uint64(41 * rank))
+    seed = int(np.uint64(args.seed) + np.uint64(41 * rank))
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     if "cuda" in device:
@@ -1678,7 +1693,7 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print("\n[1/3] Initializing MimicKit...")
 
-    mjcf_modifier = G1MJCFModifier(str(BASE_MJCF_PATH))
+    mjcf_modifier = G1MJCFModifier(str(BASE_MJCF_PATH), scope=args.design_scope)
     modified_mjcf = out_dir / "g1_modified.xml"
     modified_env_config = out_dir / "env_config.yaml"
 
@@ -1884,7 +1899,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     theta_bounds = THETA_BOUNDS
 
     param_names = [
-        f"theta_{i}_{SYMMETRIC_PAIRS[i][0].replace('_link', '')}"
+        f"theta_{i}_{group_param_name(DESIGN_GROUPS[i])}"
         for i in range(NUM_DESIGN_PARAMS)
     ]
 
@@ -1969,7 +1984,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         print(f"  Max step size:     {args.max_step_deg} deg/iter initial "
               f"(adaptive trust region, floor={np.degrees(TRUST_RADIUS_MIN):.2f} deg, "
               f"ceil={np.degrees(TRUST_RADIUS_MAX):.1f} deg)")
-        print(f"  Design params:     {NUM_DESIGN_PARAMS} (symmetric lower-body)")
+        _scope_label = {
+            "lower": "symmetric lower-body (6 leg pairs)",
+            "full": "full-body symmetric (6 leg pairs + 3 waist singletons + 7 arm pairs)",
+        }.get(args.design_scope, args.design_scope)
+        print(f"  Design params:     {NUM_DESIGN_PARAMS} ({_scope_label})")
         print(f"  Theta bounds:      +/-{np.degrees(THETA_BOUNDS[1]):.0f} deg "
               f"(+/-{THETA_BOUNDS[1]:.4f} rad)")
         if args.kickoff_min_iters > 0:
@@ -2065,7 +2084,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                   f"(S={args.spsa_sets}, {args.num_spsa_seeds} seeds, "
                   f"{args.eval_horizon} steps)...")
 
-        spsa_base_seed = 42 + outer_iter * 1000
+        spsa_base_seed = args.seed + outer_iter * 1000
 
         eval_disc_in_outer = (
             args.disc_morph_invariant and args.outer_disc_weight != 0.0
@@ -2080,6 +2099,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
                 vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
                 num_spsa_sets=args.spsa_sets,
+                outer_task_weight=args.outer_task_weight,
                 outer_disc_weight=args.outer_disc_weight,
                 eval_disc_reward=eval_disc_in_outer,
             )
@@ -2103,8 +2123,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             # ----- Adaptive trust region ratio test (1b) -----
             # Match SPSA reward formula so trust-region ratio is consistent.
             center_reward = (
-                -5.0 * cot
-                + args.vel_reward_weight * vel_track
+                args.outer_task_weight * (
+                    -5.0 * cot
+                    + args.vel_reward_weight * vel_track
+                )
                 + args.outer_disc_weight * disc_center
             )
             rho = None
@@ -2283,28 +2305,56 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
             if use_wandb:
                 finite_snr = grad_snr[np.isfinite(grad_snr)]
+                bfgs_attempted = bfgs.num_updates + bfgs.num_skipped
+                bfgs_skip_rate = (
+                    bfgs.num_skipped / bfgs_attempted if bfgs_attempted > 0 else 0.0
+                )
                 log_dict = {
                     "outer/iteration": outer_iter + 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
                     "outer/disc_center": disc_center,
                     "outer/disc_reward_term": args.outer_disc_weight * disc_center,
+                    "outer/task_reward_term": args.outer_task_weight * (
+                        -5.0 * cot + args.vel_reward_weight * vel_track
+                    ),
                     "outer/center_reward": center_reward,
                     "outer/inner_time_min": inner_time / 60.0,
                     "outer/grad_norm": np.linalg.norm(grad_theta),
                     "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
                     "outer/trust_radius_deg": np.degrees(trust_radius),
+                    # Trust-region ratio: NaN before first update (no prior reward).
+                    # Logged unconditionally so the trace stays continuous.
+                    "outer/trust_ratio_rho": rho if rho is not None else float("nan"),
                     "outer/reward_range_rel": reward_range_rel,
                     "outer/reward_plateau_passed": int(reward_plateau),
                     "outer/cot_range_rel": cot_range_rel,
                     "outer/cot_plateau_passed": int(cot_plateau),
                     "outer/grad_weak_passed": int(grad_weak),
+                    # Envelope-theorem residual ||grad_theta J|| at policy
+                    # convergence. Only meaningful after the AMP ramp completes;
+                    # None before that -> NaN so wandb trace stays continuous.
+                    "outer/envelope_grad_norm": (
+                        envelope_grad_norm if envelope_grad_norm is not None
+                        else float("nan")
+                    ),
+                    # BFGS cautious-filter cumulative stats (skips when sTy<=threshold)
+                    "outer/bfgs_num_updates": bfgs.num_updates,
+                    "outer/bfgs_num_skipped": bfgs.num_skipped,
+                    "outer/bfgs_skip_rate": bfgs_skip_rate,
+                    # Cumulative inner-loop training samples across all ranks
+                    # (agent._sample_count is all-reduced in the inner controller).
+                    "outer/inner_samples_cumulative": int(agent._sample_count),
                 }
-                if rho is not None:
-                    log_dict["outer/trust_ratio_rho"] = rho
                 for i, name in enumerate(param_names):
                     log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
                     log_dict[f"outer/grad_{name}"] = grad_theta[i]
+                    # Per-parameter SNR: infinite SNR (single-seed, zero stderr)
+                    # logged as NaN to keep traces well-behaved in wandb.
+                    snr_val = grad_snr[i]
+                    log_dict[f"outer/snr_{name}"] = (
+                        float(snr_val) if np.isfinite(snr_val) else float("nan")
+                    )
                 wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
@@ -2365,6 +2415,16 @@ if __name__ == "__main__":
                         help="Total training envs (divided across GPUs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
                         help="Eval rollout length in control steps (300 = 10s full episode)")
+    parser.add_argument("--seed", type=int, default=7,
+                        help="Master random seed. Drives training RNG (per-rank) "
+                             "and SPSA base seed. Change to run multi-seed sweeps. "
+                             "Default: 7.")
+    parser.add_argument("--design-scope", choices=["lower", "full"], default="lower",
+                        help="Design parameter scope. 'lower' = 6 symmetric lower-body "
+                             "pairs (legs only, 12 joints). 'full' = 16 symmetric "
+                             "groups covering all 29 G1 joints (6 leg pairs + 3 waist "
+                             "singletons + 7 arm pairs). Going to 'full' multiplies "
+                             "SPSA cost per gradient estimate ~2.7x. Default: lower.")
     parser.add_argument("--num-spsa-seeds", type=int, default=30,
                         help="Number of paired seeds per SPSA evaluation (K)")
     parser.add_argument("--spsa-epsilon", type=float, default=0.05,
@@ -2454,6 +2514,13 @@ if __name__ == "__main__":
     parser.add_argument("--no-disc-morph-invariant", dest="disc_morph_invariant",
                         action="store_false",
                         help="Revert to baseline AMP disc obs (morph-dependent).")
+    parser.add_argument("--outer-task-weight", type=float, default=0.5,
+                        help="Blend weight for task reward (-5*CoT + w*vel) in "
+                             "the outer SPSA objective. Default 0.5 matches the "
+                             "inner-loop task_reward_weight after the AMP ramp "
+                             "completes, so outer and inner use identical "
+                             "coefficients on CoT and vel_tracking. Set 1.0 for "
+                             "the pre-alignment behavior (task at full weight).")
     parser.add_argument("--outer-disc-weight", type=float, default=0.5,
                         help="Blend weight for log D in the outer SPSA reward. "
                              "Match inner-loop blend (typically 0.5) so inner "
@@ -2474,6 +2541,14 @@ if __name__ == "__main__":
                         help="torch.distributed backend "
                              "(try 'gloo' if nccl hangs, 'auto' for platform default)")
     args = parser.parse_args()
+
+    # Resolve design-parameter scope from CLI flag. The three functions that
+    # iterate over the design groups (extract_joint_info,
+    # update_training_joint_X_p, apply_partitioned_morphologies) read these
+    # module-level names at call time, so setting them here — before any call
+    # — is sufficient.
+    DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
+    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
 
     # Auto-detect GPUs if --devices not specified
     if args.devices is None:

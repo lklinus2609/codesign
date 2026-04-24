@@ -18,17 +18,67 @@ import numpy as np
 import yaml
 
 
-# 6 symmetric pairs of body names whose frame quaternions we modify
-SYMMETRIC_PAIRS = [
-    ("left_hip_pitch_link", "right_hip_pitch_link"),
-    ("left_hip_roll_link", "right_hip_roll_link"),
-    ("left_hip_yaw_link", "right_hip_yaw_link"),
-    ("left_knee_link", "right_knee_link"),
-    ("left_ankle_pitch_link", "right_ankle_pitch_link"),
-    ("left_ankle_roll_link", "right_ankle_roll_link"),
+# Design groups: each group is a list of body names sharing a single scalar design
+# parameter. Pairs (2 bodies) enforce L/R symmetry; singletons (1 body) are for
+# midline joints (waist).
+#
+# Lower-body scope: 6 leg pairs = 6 params covering 12 joints.
+LOWER_SYMMETRIC_GROUPS = [
+    ["left_hip_pitch_link", "right_hip_pitch_link"],
+    ["left_hip_roll_link", "right_hip_roll_link"],
+    ["left_hip_yaw_link", "right_hip_yaw_link"],
+    ["left_knee_link", "right_knee_link"],
+    ["left_ankle_pitch_link", "right_ankle_pitch_link"],
+    ["left_ankle_roll_link", "right_ankle_roll_link"],
 ]
 
-NUM_DESIGN_PARAMS = len(SYMMETRIC_PAIRS)  # 6
+# Full-body symmetric scope: 6 leg pairs + 3 waist singletons + 7 arm pairs
+# = 16 params covering all 29 G1 joints.
+FULL_SYMMETRIC_GROUPS = LOWER_SYMMETRIC_GROUPS + [
+    ["waist_yaw_link"],
+    ["waist_roll_link"],
+    ["torso_link"],  # body hosts the waist_pitch_joint (name mismatch — see BODY_TO_JOINT)
+    ["left_shoulder_pitch_link", "right_shoulder_pitch_link"],
+    ["left_shoulder_roll_link", "right_shoulder_roll_link"],
+    ["left_shoulder_yaw_link", "right_shoulder_yaw_link"],
+    ["left_elbow_link", "right_elbow_link"],
+    ["left_wrist_roll_link", "right_wrist_roll_link"],
+    ["left_wrist_pitch_link", "right_wrist_pitch_link"],
+    ["left_wrist_yaw_link", "right_wrist_yaw_link"],
+]
+
+DESIGN_GROUPS_BY_SCOPE = {
+    "lower": LOWER_SYMMETRIC_GROUPS,
+    "full": FULL_SYMMETRIC_GROUPS,
+}
+
+# Some G1 bodies host a joint whose name doesn't match the
+# body_name.replace("_link","_joint") convention. Map exceptions here.
+BODY_TO_JOINT = {
+    "torso_link": "waist_pitch_joint",
+}
+
+
+def body_to_joint_name(body_name):
+    """Resolve the joint name hosted by a given body, handling G1 exceptions."""
+    if body_name in BODY_TO_JOINT:
+        return BODY_TO_JOINT[body_name]
+    return body_name.replace("_link", "_joint")
+
+
+def group_param_name(group):
+    """Short label for a design group.
+    Pairs: uses the 'left_*' body name stripped of '_link'
+           (e.g. 'left_hip_pitch') — back-compat with existing wandb keys.
+    Singletons: the body name stripped of '_link' (e.g. 'waist_yaw').
+    """
+    first = group[0]
+    return first[:-len("_link")] if first.endswith("_link") else first
+
+
+# Back-compat aliases (point at lower-body scope, the pre-refactor default).
+SYMMETRIC_PAIRS = [tuple(g) for g in LOWER_SYMMETRIC_GROUPS]
+NUM_DESIGN_PARAMS = len(LOWER_SYMMETRIC_GROUPS)  # 6
 
 
 def quat_from_x_rotation(angle):
@@ -61,10 +111,12 @@ def quat_normalize(q):
 class G1MJCFModifier:
     """Modifies G1 MJCF body frame quaternions for co-design."""
 
-    def __init__(self, base_mjcf_path):
+    def __init__(self, base_mjcf_path, scope="lower"):
         self.base_mjcf_path = os.path.abspath(base_mjcf_path)
         self.tree = ET.parse(self.base_mjcf_path)
         self.root = self.tree.getroot()
+        self.scope = scope
+        self.groups = DESIGN_GROUPS_BY_SCOPE[scope]
 
         # Build name→element map and extract original quaternions
         self._body_map = {}
@@ -75,8 +127,8 @@ class G1MJCFModifier:
 
         # Store original quaternions for all parameterized bodies
         self._original_quats = {}  # body_name → (w, x, y, z)
-        for left, right in SYMMETRIC_PAIRS:
-            for name in (left, right):
+        for group in self.groups:
+            for name in group:
                 elem = self._body_map.get(name)
                 if elem is None:
                     raise ValueError(f"Body '{name}' not found in MJCF")
@@ -92,10 +144,11 @@ class G1MJCFModifier:
         """Write modified MJCF to output_path.
 
         Args:
-            theta_np: numpy array of shape (6,) — oblique angles in radians
+            theta_np: numpy array — one oblique angle in radians per design
+                group (len == len(self.groups)).
             output_path: where to write the modified XML
         """
-        assert len(theta_np) == NUM_DESIGN_PARAMS
+        assert len(theta_np) == len(self.groups)
 
         # Deep copy the tree
         tree = copy.deepcopy(self.tree)
@@ -107,11 +160,11 @@ class G1MJCFModifier:
             if name:
                 body_map[name] = body
 
-        for i, (left, right) in enumerate(SYMMETRIC_PAIRS):
+        for i, group in enumerate(self.groups):
             angle = float(theta_np[i])
             delta_q = quat_from_x_rotation(angle)
 
-            for name in (left, right):
+            for name in group:
                 base_q = self._original_quats[name]
                 new_q = quat_normalize(quat_multiply(delta_q, base_q))
                 quat_str = f"{new_q[0]:.8f} {new_q[1]:.8f} {new_q[2]:.8f} {new_q[3]:.8f}"
