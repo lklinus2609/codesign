@@ -750,9 +750,9 @@ class InnerLoopController:
                  use_kl_convergence=True,
                  ep_len_threshold_frac=0.9,
                  task_plateau_threshold=0.02,
-                 task_plateau_window=10,
+                 task_plateau_window=30,
                  cot_plateau_threshold=0.05,
-                 cot_plateau_window=10,
+                 cot_plateau_window=30,
                  ramp_start_iter=1000, ramp_end_iter=2500,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
@@ -847,6 +847,32 @@ class InnerLoopController:
             return spread < self.plateau_threshold
         return (spread / abs(mean_val)) < self.plateau_threshold
 
+    def _check_slope_plateau(self, values, window, threshold):
+        """Convergence via linear-regression slope.
+
+        Triggers when the relative change predicted over the window
+        (|slope| * (window-1) / |mean|) falls below `threshold`. Robust
+        to smooth slow descents that fool range-based detection (a
+        monotone descent with low per-output noise can have small
+        max-min spread while still descending meaningfully).
+
+        Returns (passed, rel_change_over_window). rel_change_over_window
+        is None when there is insufficient data or near-zero mean.
+        """
+        if len(values) < window:
+            return False, None
+        recent = np.asarray(values[-window:], dtype=float)
+        mean_val = float(recent.mean())
+        if abs(mean_val) < 1e-8:
+            return False, None
+        t = np.arange(window, dtype=float)
+        t_centered = t - t.mean()
+        var_t = float((t_centered ** 2).sum())
+        cov_ty = float((t_centered * (recent - mean_val)).sum())
+        slope = cov_ty / var_t
+        rel_change = abs(slope) * (window - 1) / abs(mean_val)
+        return rel_change < threshold, rel_change
+
     def _check_kl_converged(self, kl_values):
         if len(kl_values) < self.kl_window:
             return False
@@ -855,25 +881,21 @@ class InnerLoopController:
 
     def _check_task_plateau(self):
         """Check if task_reward has plateaued (codesign convergence stage 2)."""
-        if len(self._task_plateau_values) < self.task_plateau_window:
-            return False
-        recent = self._task_plateau_values[-self.task_plateau_window:]
-        mean_val = np.mean(recent)
-        spread = max(recent) - min(recent)
-        if abs(mean_val) < 1.0:
-            return spread < self.task_plateau_threshold
-        return (spread / abs(mean_val)) < self.task_plateau_threshold
+        passed, _ = self._check_slope_plateau(
+            self._task_plateau_values,
+            self.task_plateau_window,
+            self.task_plateau_threshold,
+        )
+        return passed
 
     def _check_cot_plateau(self):
         """Check if episode-averaged CoT has plateaued (stage 3, AND'd with task)."""
-        if len(self._cot_plateau_values) < self.cot_plateau_window:
-            return False
-        recent = self._cot_plateau_values[-self.cot_plateau_window:]
-        mean_val = np.mean(recent)
-        spread = max(recent) - min(recent)
-        if abs(mean_val) < 1.0:
-            return spread < self.cot_plateau_threshold
-        return (spread / abs(mean_val)) < self.cot_plateau_threshold
+        passed, _ = self._check_slope_plateau(
+            self._cot_plateau_values,
+            self.cot_plateau_window,
+            self.cot_plateau_threshold,
+        )
+        return passed
 
     def train_until_converged(self, out_dir):
         """Run inner training loop until convergence or iteration cap.
@@ -1062,11 +1084,25 @@ class InnerLoopController:
                         self._log_wandb_inner()
                         # Log gate diagnostics for active convergence mode
                         if self.convergence_mode == 'codesign':
+                            cot_passed, cot_slope_rel = self._check_slope_plateau(
+                                self._cot_plateau_values,
+                                self.cot_plateau_window,
+                                self.cot_plateau_threshold)
+                            task_passed, task_slope_rel = self._check_slope_plateau(
+                                self._task_plateau_values,
+                                self.task_plateau_window,
+                                self.task_plateau_threshold)
                             wandb.log({
                                 "gate/ep_len_passed": int(self._ep_len_gate_passed),
                                 "gate/mean_ep_len": self._last_ep_len,
-                                "gate/task_plateau_passed": int(self._check_task_plateau()),
-                                "gate/cot_plateau_passed": int(self._check_cot_plateau()),
+                                "gate/task_plateau_passed": int(task_passed),
+                                "gate/cot_plateau_passed": int(cot_passed),
+                                "gate/cot_slope_rel": (cot_slope_rel
+                                                       if cot_slope_rel is not None
+                                                       else float("nan")),
+                                "gate/task_slope_rel": (task_slope_rel
+                                                        if task_slope_rel is not None
+                                                        else float("nan")),
                             }, step=agent._iter)
                         elif self.convergence_mode == 'composite':
                             gate_diag = self.convergence_gate.get_diagnostics()
@@ -2471,12 +2507,12 @@ if __name__ == "__main__":
     parser.add_argument("--task-plateau-threshold", type=float, default=0.02,
                         help="Codesign mode: relative spread threshold for task_reward plateau "
                              "(default: 0.02 = 2%%)")
-    parser.add_argument("--task-plateau-window", type=int, default=10,
+    parser.add_argument("--task-plateau-window", type=int, default=30,
                         help="Codesign mode: window size for task_reward plateau check")
     parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.001,
                         help="Codesign mode: relative spread threshold for inner CoT plateau "
                              "(AND'd with task_reward plateau). Default 0.001 = 0.1%%")
-    parser.add_argument("--inner-cot-plateau-window", type=int, default=10,
+    parser.add_argument("--inner-cot-plateau-window", type=int, default=30,
                         help="Codesign mode: window size for inner CoT plateau check")
     parser.add_argument("--outer-cot-plateau-pct", type=float, default=0.002,
                         help="Outer convergence: relative range cutoff for CoT plateau "
