@@ -2509,9 +2509,10 @@ if __name__ == "__main__":
                              "(default: 0.02 = 2%%)")
     parser.add_argument("--task-plateau-window", type=int, default=30,
                         help="Codesign mode: window size for task_reward plateau check")
-    parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.001,
-                        help="Codesign mode: relative spread threshold for inner CoT plateau "
-                             "(AND'd with task_reward plateau). Default 0.001 = 0.1%%")
+    parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.0005,
+                        help="Codesign mode: relative slope threshold for inner CoT plateau "
+                             "(AND'd with task_reward plateau). Default 0.0005 = 0.05%% "
+                             "predicted change over the window.")
     parser.add_argument("--inner-cot-plateau-window", type=int, default=30,
                         help="Codesign mode: window size for inner CoT plateau check")
     parser.add_argument("--outer-cot-plateau-pct", type=float, default=0.002,
