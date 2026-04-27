@@ -2986,7 +2986,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-step-deg", type=float, default=0.5,
                         help="Max per-parameter step size in degrees per outer iteration. "
                              "Ensures policy stability across morphology updates. Default: 0.5")
-    parser.add_argument("--max-inner-iters", type=int, default=10000,
+    parser.add_argument("--max-inner-iters", type=int, default=50000,
                         help="Max inner iterations per outer loop (env-count-invariant safety cap)")
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
