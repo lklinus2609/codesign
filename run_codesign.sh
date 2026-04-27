@@ -16,7 +16,7 @@ echo "Partition: $SLURM_JOB_PARTITION"
 nvidia-smi
 
 python codesign/codesign_g1_unified.py \
-    --num-train-envs 16392 \
+    --num-train-envs 16384 \
     --outer-iters 100 \
     --max-inner-iters 10000 \
     "$@"

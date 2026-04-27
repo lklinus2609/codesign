@@ -138,6 +138,14 @@ THETA_BOUNDS = (-np.radians(30), np.radians(30))  # +/-30 deg
 _EMPTY_TEST_INFO = {"mean_return": 0.0, "mean_ep_len": 0.0, "num_eps": 0}
 
 
+def _seed_all(seed):
+    """Set numpy + torch (cpu/cuda) RNG seeds in one call."""
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+
+
 def compute_cot(mean_power, mean_fwd_vel, total_mass):
     """Cost of Transport: power / (m * g * |v|), with velocity smoothing."""
     safe_v = torch.sqrt(mean_fwd_vel ** 2 + VELOCITY_EPSILON)
@@ -247,14 +255,16 @@ class EpisodeCoTTracker:
 # ---------------------------------------------------------------------------
 
 def codesign_task_reward(self):
-    """Task reward aligned with outer loop objective: -CoT + w * vel_tracking.
+    """Task reward aligned with outer loop objective.
 
     Replaces AMPEnv._update_reward (which is empty by default) so that
     the agent's reward blending picks up a non-zero task_r:
         r = task_reward_weight * task_r + disc_reward_weight * disc_r
 
-    Uses the same cost function as the outer loop SPSA objective:
-        reward = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+    Per-step task_r:
+        r = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
+            + TERM_PENALTY * is_failed
+    The -5.0 multiplier on CoT and TERM_PENALTY (-10) are hardcoded.
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
@@ -566,8 +576,9 @@ def compute_disc_reward_for_obs(agent, disc_obs):
         norm = agent._disc_obs_norm.normalize(disc_obs)
         disc_logits = agent._model.eval_disc(norm).squeeze(-1)
         prob = torch.sigmoid(disc_logits)
-        floor = torch.tensor(0.0001, device=disc_logits.device)
-        disc_r = -torch.log(torch.maximum(1 - prob, floor))
+        # torch.clamp avoids the per-call GPU-scalar tensor allocation that
+        # torch.maximum(..., torch.tensor(0.0001, device=...)) would incur.
+        disc_r = -torch.log(torch.clamp(1.0 - prob, min=0.0001))
         disc_r = disc_r * agent._disc_reward_scale
     return disc_r
 
@@ -651,6 +662,10 @@ class CautiousBFGS:
                           f"threshold — resetting H to identity")
                     self.H = np.eye(self.n, dtype=np.float64)
                     self.initialized = False
+                    # NOTE: prev_grad is intentionally retained. The next valid
+                    # update re-applies Shanno-Phua scaling (initialized=False
+                    # path above) using the fresh y vector, so prev_grad's role
+                    # is just as the old endpoint of y = prev_grad - grad_new.
             else:
                 self.num_skipped += 1
 
@@ -681,11 +696,17 @@ def extract_joint_info(model, num_worlds):
     for group in DESIGN_GROUPS:
         for body_name in group:
             joint_name = body_to_joint_name(body_name)
-            if joint_name in joint_name_to_idx:
-                idx = joint_name_to_idx[joint_name]
-            else:
-                print(f"  [WARN] Joint not found: {joint_name} (body: {body_name})")
-                continue
+            if joint_name not in joint_name_to_idx:
+                # Hard fail: silently skipping a joint here desyncs theta
+                # indexing (BFGS / SPSA still allocate that dim) from the
+                # actually-applied morphology updates, producing a phantom
+                # design parameter.
+                raise ValueError(
+                    f"Joint not found in Newton model: {joint_name} "
+                    f"(body: {body_name}). Available joints: "
+                    f"{sorted(joint_name_to_idx.keys())[:10]}..."
+                )
+            idx = joint_name_to_idx[joint_name]
             # joint_X_p numpy layout: [px,py,pz, qx,qy,qz,qw] (xyzw)
             # Reorder to (qw,qx,qy,qz) for g1_mjcf_modifier's wxyz convention
             raw = joint_X_p_np[idx, 3:7].tolist()  # [qx,qy,qz,qw]
@@ -754,6 +775,7 @@ class InnerLoopController:
                  cot_plateau_threshold=0.05,
                  cot_plateau_window=30,
                  ramp_start_iter=1000, ramp_end_iter=2500,
+                 ramp_end_task_weight=0.5, ramp_end_disc_weight=0.5,
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
                  log_file=None,
@@ -771,6 +793,8 @@ class InnerLoopController:
         self.use_kl_convergence = use_kl_convergence
         self.ramp_start_iter = ramp_start_iter
         self.ramp_end_iter = ramp_end_iter
+        self.ramp_end_task_weight = ramp_end_task_weight
+        self.ramp_end_disc_weight = ramp_end_disc_weight
         self.ramp_completed = False  # set True after first ramp finishes
         self.use_wandb = use_wandb
         self.viewer = viewer
@@ -864,7 +888,10 @@ class InnerLoopController:
         recent = np.asarray(values[-window:], dtype=float)
         mean_val = float(recent.mean())
         if abs(mean_val) < 1e-8:
-            return False, None
+            # Signal has effectively settled at zero — treat as plateau so
+            # degenerate states (e.g. agent stalled, CoT collapsed to ~0)
+            # don't block inner-loop exit at max_inner_iters.
+            return True, 0.0
         t = np.arange(window, dtype=float)
         t_centered = t - t.mean()
         var_t = float((t_centered ** 2).sum())
@@ -927,8 +954,8 @@ class InnerLoopController:
         # When the ramp has completed, we must stay at the final blend;
         # otherwise the ramp logic below will set them on the first iteration.
         if self.ramp_completed:
-            agent._task_reward_weight = 0.5
-            agent._disc_reward_weight = 0.5
+            agent._task_reward_weight = self.ramp_end_task_weight
+            agent._disc_reward_weight = self.ramp_end_disc_weight
 
         disc_rewards = []
         convergence_values = []
@@ -951,21 +978,27 @@ class InnerLoopController:
             train_info = agent._train_iter()                      # COLLECTIVE
             agent._sample_count = agent._update_sample_count()    # COLLECTIVE
 
-            # Reward weight ramp: disc 1.0→0.1, task 0.0→0.9 over [ramp_start, ramp_end]
-            # Only runs during kickoff; after ramp completes, stays at task=0.9/disc=0.1
+            # Reward weight ramp: linearly blend (task=0, disc=1) -> (ramp_end_*)
+            # over [ramp_start, ramp_end]. Only runs during kickoff; after ramp
+            # completes, weights stay at ramp_end_task_weight / ramp_end_disc_weight.
             if not self.ramp_completed:
                 it = inner_iters
+                w_task_end = self.ramp_end_task_weight
+                w_disc_end = self.ramp_end_disc_weight
                 if it <= self.ramp_start_iter:
                     agent._task_reward_weight = 0.0
                     agent._disc_reward_weight = 1.0
                 elif it >= self.ramp_end_iter:
-                    agent._task_reward_weight = 0.5
-                    agent._disc_reward_weight = 0.5
+                    agent._task_reward_weight = w_task_end
+                    agent._disc_reward_weight = w_disc_end
                     self.ramp_completed = True
+                    if self.is_root:
+                        print(f"    [Ramp] complete at inner iter {it}: "
+                              f"task={w_task_end:.3f}, disc={w_disc_end:.3f}")
                 else:
                     t = (it - self.ramp_start_iter) / (self.ramp_end_iter - self.ramp_start_iter)
-                    agent._task_reward_weight = 0.5 * t
-                    agent._disc_reward_weight = 1.0 - 0.5 * t
+                    agent._task_reward_weight = w_task_end * t
+                    agent._disc_reward_weight = 1.0 + (w_disc_end - 1.0) * t
 
             output_iter = (agent._iter % agent._iters_per_output == 0)
 
@@ -1300,6 +1333,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   num_spsa_sets=3,
                                   outer_task_weight=1.0,
                                   outer_disc_weight=0.0,
+                                  outer_term_penalty=-10.0,
                                   eval_disc_reward=False):
     """Compute closed-loop gradient with orthogonal SPSA world-partitioned perturbations.
 
@@ -1309,15 +1343,19 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     Gradient reconstructed via least-squares solve per seed.
 
     Cost function matches inner loop blended reward (post-AMP-ramp):
-        reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_tracking)
-                 + outer_disc_weight * disc
-    Set outer_task_weight=0.5, outer_disc_weight=0.5 to exactly match the
-    inner-loop coefficients after the AMP reward-weight ramp completes.
+        reward = outer_task_weight * (
+                    -5.0*CoT + vel_reward_weight*vel_tracking
+                    + outer_term_penalty * term_rate
+                 ) + outer_disc_weight * disc
+    With outer_task_weight=0.5, outer_disc_weight=0.5, outer_term_penalty=-10
+    the inner and outer coefficients on CoT, vel, disc, and termination match
+    exactly (modulo per-step-vs-episode-average structural differences).
 
     Each GPU partitions its own per_rank_envs worlds independently. Multi-GPU
     results are averaged via all_reduce(SUM) / num_procs.
 
-    Returns (grad, grad_stderr, snr, vel_tracking_center, cot_center) on all ranks.
+    Returns (grad, grad_stderr, snr, vel_tracking_center, cot_center,
+    disc_center, term_rate_center) on all ranks.
     """
     n_params = len(theta_np)
     assert num_spsa_sets >= 1, f"num_spsa_sets must be >= 1, got {num_spsa_sets}"
@@ -1344,6 +1382,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     # Disc reward: only meaningful when eval_disc_reward; otherwise zeros so
     # downstream `reward_all = ... + outer_disc_weight * disc_all` is a no-op.
     disc_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
+    # Termination rate: fraction of completed episodes that ended in DoneFlags.FAIL
+    term_all = torch.zeros(n_pert, num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
 
@@ -1356,12 +1396,11 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     agent.eval()
     agent.set_mode(base_agent_mod.AgentMode.TEST)
 
+    fail_value = base_env_mod.DoneFlags.FAIL.value
+
     for seed_idx in range(num_seeds):
         seed = base_seed + seed_idx
-        torch.manual_seed(seed)
-        np.random.seed(seed % (2**32))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+        _seed_all(seed)
 
         obs, info = env.reset()
 
@@ -1377,6 +1416,7 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
         ep_vel_track_sum = torch.zeros(num_worlds, device=device)
         ep_disc_sum = torch.zeros(num_worlds, device=device)
         ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        fail_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
 
         with torch.no_grad():
             for _ in range(horizon):
@@ -1403,8 +1443,12 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                     disc_r_step = compute_disc_reward_for_obs(agent, disc_obs_step)
                     disc_sum += disc_r_step
 
-                # Finalize episodes that just ended (env already auto-reset)
-                done_mask = (done[:num_worlds] > 0)
+                # Finalize episodes that just ended (env already auto-reset).
+                # Read env._done_buf to distinguish FAIL from time-limit terminations
+                # (the `done` returned by step() typically aliases _done_buf for
+                # MimicKit but we read the canonical buffer to be explicit).
+                done_buf = env._done_buf[:num_worlds]
+                done_mask = (done_buf > 0)
                 if done_mask.any():
                     di = done_mask.nonzero(as_tuple=True)[0]
                     vs = step_count[di].float()
@@ -1419,13 +1463,15 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                         if eval_disc_reward:
                             ep_disc_sum[vi] += disc_sum[vi] / vsc
                         ep_count[vi] += 1
+                        fail_count[vi] += (done_buf[vi] == fail_value).long()
                     power_sum[di] = 0
                     vel_sum[di] = 0
                     vel_track_sum[di] = 0
                     disc_sum[di] = 0
                     step_count[di] = 0
 
-        # Finalize trailing partial episodes (worlds still alive at horizon)
+        # Finalize trailing partial episodes (worlds still alive at horizon).
+        # These did NOT terminate in FAIL — fail_count stays unchanged.
         alive = step_count > 0
         if alive.any():
             ai = alive.nonzero(as_tuple=True)[0]
@@ -1446,6 +1492,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
             vt = (ep_vel_track_sum[s:e] / counts).mean().item()
             cot_all[p, seed_idx] = cot
             vel_track_all[p, seed_idx] = vt
+            # Termination rate: failed episodes / completed episodes (per partition)
+            tot_ep = ep_count[s:e].float().sum().clamp(min=1.0)
+            term_all[p, seed_idx] = (fail_count[s:e].float().sum() / tot_ep).item()
             if eval_disc_reward:
                 disc_all[p, seed_idx] = (ep_disc_sum[s:e] / counts).mean().item()
 
@@ -1456,8 +1505,10 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     if num_procs > 1:
         torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(term_all, op=torch.distributed.ReduceOp.SUM)
         cot_all /= num_procs
         vel_track_all /= num_procs
+        term_all /= num_procs
         if eval_disc_reward:
             torch.distributed.all_reduce(disc_all, op=torch.distributed.ReduceOp.SUM)
             disc_all /= num_procs
@@ -1470,22 +1521,26 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     cot_np = cot_all.cpu().numpy()
     vt_np = vel_track_all.cpu().numpy()
     disc_np = disc_all.cpu().numpy()
+    term_np = term_all.cpu().numpy()
 
     # Center metrics (mean over seeds)
     cot_center = float(np.mean(cot_np[0]))
     vel_track_center = float(np.mean(vt_np[0]))
     disc_center = float(np.mean(disc_np[0])) if eval_disc_reward else 0.0
+    term_center = float(np.mean(term_np[0]))
 
-    # reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_tracking)
-    #          + outer_disc_weight * disc
-    # Inner-loop post-AMP-ramp effective reward is
-    #     0.5 * task_r + 0.5 * disc_r   (task_reward_weight = disc_reward_weight = 0.5)
-    # so passing outer_task_weight=0.5, outer_disc_weight=0.5 matches the inner
-    # coefficients on CoT, vel, and disc exactly. Termination penalty and
-    # per-step-vs-episode-average structural differences are NOT addressed by
-    # these scalars — see codesign_task_reward() for the inner formula.
+    # reward = outer_task_weight * (
+    #             -5.0*CoT + vel_reward_weight * vel_tracking
+    #             + outer_term_penalty * term_rate
+    #          ) + outer_disc_weight * disc
+    # With outer_task_weight=0.5, outer_disc_weight=0.5, outer_term_penalty=-10
+    # inner and outer share coefficients on CoT, vel, disc, and termination.
     reward_all = (
-        outer_task_weight * (-5.0 * cot_np + vel_reward_weight * vt_np)
+        outer_task_weight * (
+            -5.0 * cot_np
+            + vel_reward_weight * vt_np
+            + outer_term_penalty * term_np
+        )
         + outer_disc_weight * disc_np
     )  # (n_pert, num_seeds)
 
@@ -1530,7 +1585,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     if rank == 0:
         disc_str = (f", disc={disc_center:.4f}" if eval_disc_reward else "")
         print(f"    [SPSA] Center (mean over {num_seeds} seeds): "
-              f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}{disc_str}")
+              f"vel_track={vel_track_center:.4f}, CoT={cot_center:.4f}, "
+              f"term_rate={term_center:.4f}{disc_str}")
         print(f"    [SPSA] Gradient ({len(grad_per_seed)}/{num_seeds} valid seeds):")
         for i, name in enumerate(param_names):
             print(f"      d_reward/d_{name} = {grad[i]:+.6f} "
@@ -1541,7 +1597,8 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                   f"mean={np.mean(finite_snr):.2f}, "
                   f"max={np.max(finite_snr):.2f}")
 
-    return grad, grad_stderr, snr, vel_track_center, cot_center, disc_center
+    return (grad, grad_stderr, snr,
+            vel_track_center, cot_center, disc_center, term_center)
 
 
 # ---------------------------------------------------------------------------
@@ -1558,14 +1615,17 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
                                     vel_cmd=1.0, vel_tracking_sigma=0.25,
                                     outer_task_weight=1.0,
                                     outer_disc_weight=0.0,
+                                    outer_term_penalty=-10.0,
                                     eval_disc_reward=False):
     """Closed-loop fitness evaluation for a CMA-ES population.
 
     Mirrors compute_spsa_gradient_parallel but partitions worlds by candidate
     (no center, no plus/minus pairing) and aggregates per-candidate fitness
     instead of running lstsq for a gradient. Reward formula matches SPSA:
-        reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_track)
-                 + outer_disc_weight * disc
+        reward = outer_task_weight * (
+                    -5.0*CoT + vel_reward_weight*vel_track
+                    + outer_term_penalty * term_rate
+                 ) + outer_disc_weight * disc
     Returns negated reward as fitness (CMA-ES minimizes).
 
     Args:
@@ -1573,8 +1633,8 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
         theta_np: pre-population theta (used only to restore the training env
                   morphology after eval).
 
-    Returns (fitness, vel_track_per_cand, cot_per_cand, disc_per_cand) on all
-    ranks. fitness shape: (popsize,).
+    Returns (fitness, vel_track_per_cand, cot_per_cand, disc_per_cand,
+    term_per_cand) on all ranks. fitness shape: (popsize,).
     """
     popsize, n_params = candidates.shape
     wpp = num_worlds // popsize
@@ -1589,6 +1649,7 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
     cot_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
     vel_track_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
     disc_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
+    term_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
 
     sim_model = engine._sim_model
 
@@ -1598,12 +1659,11 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
     agent.eval()
     agent.set_mode(base_agent_mod.AgentMode.TEST)
 
+    fail_value = base_env_mod.DoneFlags.FAIL.value
+
     for seed_idx in range(num_seeds):
         seed = base_seed + seed_idx
-        torch.manual_seed(seed)
-        np.random.seed(seed % (2**32))
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed(seed)
+        _seed_all(seed)
 
         obs, info = env.reset()
 
@@ -1616,6 +1676,7 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
         ep_vel_track_sum = torch.zeros(num_worlds, device=device)
         ep_disc_sum = torch.zeros(num_worlds, device=device)
         ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        fail_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
 
         with torch.no_grad():
             for _ in range(horizon):
@@ -1640,7 +1701,8 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
                     disc_r_step = compute_disc_reward_for_obs(agent, disc_obs_step)
                     disc_sum += disc_r_step
 
-                done_mask = (done[:num_worlds] > 0)
+                done_buf = env._done_buf[:num_worlds]
+                done_mask = (done_buf > 0)
                 if done_mask.any():
                     di = done_mask.nonzero(as_tuple=True)[0]
                     vs = step_count[di].float()
@@ -1655,6 +1717,7 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
                         if eval_disc_reward:
                             ep_disc_sum[vi] += disc_sum[vi] / vsc
                         ep_count[vi] += 1
+                        fail_count[vi] += (done_buf[vi] == fail_value).long()
                     power_sum[di] = 0
                     vel_sum[di] = 0
                     vel_track_sum[di] = 0
@@ -1678,6 +1741,8 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
             counts = ep_count[s:e].float().clamp(min=1)
             cot_all[p, seed_idx] = (ep_cot_sum[s:e] / counts).mean().item()
             vel_track_all[p, seed_idx] = (ep_vel_track_sum[s:e] / counts).mean().item()
+            tot_ep = ep_count[s:e].float().sum().clamp(min=1.0)
+            term_all[p, seed_idx] = (fail_count[s:e].float().sum() / tot_ep).item()
             if eval_disc_reward:
                 disc_all[p, seed_idx] = (ep_disc_sum[s:e] / counts).mean().item()
 
@@ -1687,8 +1752,10 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
     if num_procs > 1:
         torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
         torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(term_all, op=torch.distributed.ReduceOp.SUM)
         cot_all /= num_procs
         vel_track_all /= num_procs
+        term_all /= num_procs
         if eval_disc_reward:
             torch.distributed.all_reduce(disc_all, op=torch.distributed.ReduceOp.SUM)
             disc_all /= num_procs
@@ -1700,19 +1767,26 @@ def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
     cot_np = cot_all.cpu().numpy()
     vt_np = vel_track_all.cpu().numpy()
     disc_np = disc_all.cpu().numpy()
+    term_np = term_all.cpu().numpy()
 
     # Mean over seeds → per-candidate metrics
     cot_per_cand = cot_np.mean(axis=1)
     vel_track_per_cand = vt_np.mean(axis=1)
     disc_per_cand = disc_np.mean(axis=1) if eval_disc_reward else np.zeros(popsize)
+    term_per_cand = term_np.mean(axis=1)
 
     reward_per_cand = (
-        outer_task_weight * (-5.0 * cot_per_cand + vel_reward_weight * vel_track_per_cand)
+        outer_task_weight * (
+            -5.0 * cot_per_cand
+            + vel_reward_weight * vel_track_per_cand
+            + outer_term_penalty * term_per_cand
+        )
         + outer_disc_weight * disc_per_cand
     )
     fitness = -reward_per_cand  # CMA-ES minimizes
 
-    return fitness, vel_track_per_cand, cot_per_cand, disc_per_cand
+    return (fitness, vel_track_per_cand, cot_per_cand,
+            disc_per_cand, term_per_cand)
 
 
 # ---------------------------------------------------------------------------
@@ -1799,6 +1873,9 @@ def compute_envelope_gradient_norm(agent, env, device, num_steps=None):
         if p.grad is not None:
             p.grad.zero_()
     agent.eval()
+    # Restore deterministic-rollout mode so the next call site (e.g. SPSA)
+    # sees the canonical state regardless of order.
+    agent.set_mode(base_agent_mod.AgentMode.TEST)
 
     # Reset env so SPSA starts from clean state
     env.reset()
@@ -1867,6 +1944,14 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
 
     Returns a SimpleNamespace with all state needed by the outer loop.
     """
+    # Spawn workers re-import the module without re-running the __main__ block
+    # (run_name is "__mp_main__"), so the design-scope assignment in __main__
+    # never runs in the child. Re-bind here based on the pickled args before
+    # any downstream call reads DESIGN_GROUPS / NUM_DESIGN_PARAMS.
+    global DESIGN_GROUPS, NUM_DESIGN_PARAMS
+    DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
+    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
+
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
 
@@ -1877,10 +1962,7 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
 
     # Seed per rank for diverse rollouts
     seed = int(np.uint64(args.seed) + np.uint64(41 * rank))
-    np.random.seed(seed % (2**32))
-    torch.manual_seed(seed)
-    if "cuda" in device:
-        torch.cuda.manual_seed(seed)
+    _seed_all(seed)
 
     # Initialize torch.distributed with backend override
     # (bypasses mp_util.init so we can control the backend via --dist-backend)
@@ -2006,7 +2088,10 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
         )
         # _disc_obs_buf was sized in env __init__ from the OLD compute_disc_obs
         # shape; rebuild it for the morph-invariant shape so _update_disc_obs
-        # writes don't trip a shape mismatch.
+        # writes don't trip a shape mismatch. Preserves dtype + device only —
+        # MimicKit's original allocation uses the same `torch.zeros(..., device,
+        # dtype)` form (no requires_grad / pin_memory / non-default layout), so
+        # this matches the original up to shape.
         new_obs_space = env.get_disc_obs_space()
         env._disc_obs_buf = torch.zeros(
             [env.get_num_envs()] + list(new_obs_space.shape),
@@ -2164,12 +2249,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         for i in range(NUM_DESIGN_PARAMS)
     ]
 
-    # Handle deprecated --use-plateau-convergence flag
+    # Handle deprecated --use-plateau-convergence flag (always routes to plateau,
+    # regardless of --convergence-mode default).
     convergence_mode = args.convergence_mode
-    if args.use_plateau_convergence and convergence_mode == 'composite':
+    if args.use_plateau_convergence:
         convergence_mode = 'plateau'
         if is_root:
-            print("  [WARN] --use-plateau-convergence is deprecated, "
+            print("  [WARN] --use-plateau-convergence is deprecated; "
                   "use --convergence-mode=plateau instead")
 
     inner_ctrl = InnerLoopController(
@@ -2186,7 +2272,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         actor_loss_plateau_threshold=args.actor_loss_plateau_threshold,
         kl_conv_threshold=args.kl_conv_threshold,
         kl_window=args.kl_window,
-        use_kl_convergence=not args.use_plateau_convergence,
+        use_kl_convergence=(convergence_mode == 'kl'),
         ep_len_threshold_frac=args.ep_len_threshold_frac,
         task_plateau_threshold=args.task_plateau_threshold,
         task_plateau_window=args.task_plateau_window,
@@ -2194,6 +2280,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         cot_plateau_window=args.inner_cot_plateau_window,
         ramp_start_iter=args.ramp_start_iter,
         ramp_end_iter=args.ramp_end_iter,
+        ramp_end_task_weight=args.outer_task_weight,
+        ramp_end_disc_weight=args.outer_disc_weight,
         use_wandb=use_wandb,
         viewer=viewer,
         engine=engine,
@@ -2210,8 +2298,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     if args.resume_checkpoint:
         inner_ctrl.ramp_completed = True
         inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
-        agent._task_reward_weight = 0.5
-        agent._disc_reward_weight = 0.5
+        agent._task_reward_weight = inner_ctrl.ramp_end_task_weight
+        agent._disc_reward_weight = inner_ctrl.ramp_end_disc_weight
         if is_root:
             print(f"  [Resume] Skipping kickoff ramp (ramp_completed=True, "
                   f"min_inner_iters={inner_ctrl.min_inner_iters})")
@@ -2225,12 +2313,14 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         "inner_times": [],
     }
 
-    # Adaptive trust region state (1b)
-    trust_radius = np.radians(args.max_step_deg)
-    TRUST_RADIUS_MIN = np.radians(0.05)
-    TRUST_RADIUS_MAX = np.radians(5.0)
-    prev_center_reward = None
-    predicted_improvement = None
+    # Adaptive trust region state (1b) — SPSA only
+    if args.mode == "spsa":
+        trust_radius = np.radians(args.max_step_deg)
+        TRUST_RADIUS_MIN = np.radians(0.05)
+        TRUST_RADIUS_MAX = np.radians(5.0)
+        prev_center_reward = None
+        predicted_improvement = None
+    # Outer-convergence histories (used by both modes)
     reward_history = deque(maxlen=5)
     cot_history = deque(maxlen=args.outer_cot_plateau_window)
 
@@ -2241,10 +2331,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         print(f"  Eval horizon:      {args.eval_horizon} steps "
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner iters:   {args.max_inner_iters}")
-        print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
-        print(f"  Max step size:     {args.max_step_deg} deg/iter initial "
-              f"(adaptive trust region, floor={np.degrees(TRUST_RADIUS_MIN):.2f} deg, "
-              f"ceil={np.degrees(TRUST_RADIUS_MAX):.1f} deg)")
+        if args.mode == "spsa":
+            print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
+            print(f"  Max step size:     {args.max_step_deg} deg/iter initial "
+                  f"(adaptive trust region, floor={np.degrees(TRUST_RADIUS_MIN):.2f} deg, "
+                  f"ceil={np.degrees(TRUST_RADIUS_MAX):.1f} deg)")
+        else:
+            print(f"  Design optimizer:  CMA-ES (no trust region)")
         _scope_label = {
             "lower": "symmetric lower-body (6 leg pairs)",
             "full": "full-body symmetric (6 leg pairs + 3 waist singletons + 7 arm pairs)",
@@ -2254,18 +2347,19 @@ def gbc_worker(rank, num_procs, device, master_port, args):
               f"(+/-{THETA_BOUNDS[1]:.4f} rad)")
         if args.kickoff_min_iters > 0:
             print(f"  Kickoff min iters: {args.kickoff_min_iters} (first outer iter only)")
-        print(f"  Reward ramp:       disc 1.0→0.5, task 0.0→0.5 "
+        print(f"  Reward ramp:       disc 1.0→{args.outer_disc_weight:.2f}, "
+              f"task 0.0→{args.outer_task_weight:.2f} "
               f"(iter {args.ramp_start_iter}→{args.ramp_end_iter})")
         print(f"  Convergence mode:  {convergence_mode}")
         if convergence_mode == 'codesign':
-            print(f"    ep_len gate:     >= {args.ep_len_threshold_frac:.0%} of max episode length")
-            print(f"    task plateau:    {args.task_plateau_threshold:.0%} spread over "
+            print(f"    ep_len gate:     >= {args.ep_len_threshold_frac:.1%} of max episode length")
+            print(f"    task plateau:    {args.task_plateau_threshold:.3%} predicted change over "
                   f"window={args.task_plateau_window}")
-            print(f"    cot plateau:     {args.inner_cot_plateau_threshold:.0%} spread over "
+            print(f"    cot plateau:     {args.inner_cot_plateau_threshold:.3%} predicted change over "
                   f"window={args.inner_cot_plateau_window} (AND'd with task)")
         if args.mode == "spsa":
-            print(f"  Outer convergence: reward {0.05:.0%} AND cot "
-                  f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
+            print(f"  Outer convergence: reward {args.outer_reward_plateau_pct:.3%} AND cot "
+                  f"{args.outer_cot_plateau_pct:.3%} (window={args.outer_cot_plateau_window}) "
                   f"AND weak grad")
             _M = args.spsa_sets * NUM_DESIGN_PARAMS
             _n_pert = 1 + 2 * _M
@@ -2278,8 +2372,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             if args.snr_threshold > 0:
                 print(f"  SNR threshold:     {args.snr_threshold}")
         else:  # cmaes
-            print(f"  Outer convergence: reward {0.05:.0%} AND cot "
-                  f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
+            print(f"  Outer convergence: reward {args.outer_reward_plateau_pct:.3%} AND cot "
+                  f"{args.outer_cot_plateau_pct:.3%} (window={args.outer_cot_plateau_window}) "
                   f"(weak-grad guard skipped in CMA-ES mode)")
             _wpp = per_rank_envs // es.popsize
             print(f"  CMA-ES popsize:    {es.popsize} (library default 4+3*ln(n)), "
@@ -2289,7 +2383,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  CMA-ES seeds:      {args.num_spsa_seeds} (paired-seed averaging, "
                   f"reused from --num-spsa-seeds)")
         print(f"  Vel reward weight: {args.vel_reward_weight} "
-              f"(reward = -CoT + {args.vel_reward_weight}*exp(-|v-{args.vel_cmd}|^2/{args.vel_tracking_sigma}))")
+              f"(reward = -5*CoT + {args.vel_reward_weight}*exp(-|v-{args.vel_cmd}|^2/{args.vel_tracking_sigma}) "
+              f"+ {TERM_PENALTY}*is_failed)")
         if args.mode == "spsa":
             print(f"  Optimizer mode:    orthogonal SPSA (closed-loop, lstsq reconstruction)")
         else:
@@ -2386,7 +2481,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
             spsa_base_seed = args.seed + outer_iter * 1000
 
-            grad_theta, grad_stderr, grad_snr, vel_track, cot, disc_center = \
+            (grad_theta, grad_stderr, grad_snr,
+             vel_track, cot, disc_center, term_rate) = \
                 compute_spsa_gradient_parallel(
                     agent, env, engine, char_id, total_mass,
                     theta.copy(), base_quats_dict, joint_idx_map,
@@ -2398,6 +2494,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     num_spsa_sets=args.spsa_sets,
                     outer_task_weight=args.outer_task_weight,
                     outer_disc_weight=args.outer_disc_weight,
+                    outer_term_penalty=args.outer_term_penalty,
                     eval_disc_reward=eval_disc_in_outer,
                 )
 
@@ -2411,6 +2508,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
                 print(f"    Vel tracking = {vel_track:.4f}")
                 print(f"    Cost of Transport = {cot:.4f}")
+                print(f"    Termination rate = {term_rate:.4f}")
 
                 history["vel_tracking"].append(vel_track)
                 history["cot"].append(cot)
@@ -2423,6 +2521,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     args.outer_task_weight * (
                         -5.0 * cot
                         + args.vel_reward_weight * vel_track
+                        + args.outer_term_penalty * term_rate
                     )
                     + args.outer_disc_weight * disc_center
                 )
@@ -2521,9 +2620,27 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                       f"cond(C)={np.linalg.cond(es.C):.2f}")
 
             candidates = np.array(es.ask())  # (popsize, n_params)
+
+            # Debug: verify CMA-ES candidate determinism across ranks. Library
+            # is expected to be seed-deterministic, but a divergence here would
+            # silently produce different theta on each rank.
+            if args.cmaes_debug and mp_util.enable_mp():
+                h = torch.tensor(
+                    [hash(candidates.tobytes()) & 0xFFFFFFFF],
+                    dtype=torch.int64, device=device,
+                )
+                gathered = [torch.zeros_like(h) for _ in range(num_procs)]
+                torch.distributed.all_gather(gathered, h)
+                root_h = gathered[0].item()
+                assert all(g.item() == root_h for g in gathered), (
+                    f"CMA-ES candidate divergence across ranks "
+                    f"(rank {rank} hash={h.item()}, root hash={root_h})"
+                )
+
             cmaes_base_seed = args.seed + outer_iter * 1000
 
-            fitness, vel_per_cand, cot_per_cand, disc_per_cand = \
+            (fitness, vel_per_cand, cot_per_cand,
+             disc_per_cand, term_per_cand) = \
                 compute_cmaes_fitness_parallel(
                     agent, env, engine, char_id, total_mass,
                     theta.copy(), candidates,
@@ -2535,6 +2652,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
                     outer_task_weight=args.outer_task_weight,
                     outer_disc_weight=args.outer_disc_weight,
+                    outer_term_penalty=args.outer_term_penalty,
                     eval_disc_reward=eval_disc_in_outer,
                 )
 
@@ -2555,8 +2673,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             vel_track = float(np.mean(vel_per_cand))
             cot = float(np.mean(cot_per_cand))
             disc_center = float(np.mean(disc_per_cand)) if eval_disc_in_outer else 0.0
+            term_rate = float(np.mean(term_per_cand))
             center_reward = (
-                args.outer_task_weight * (-5.0 * cot + args.vel_reward_weight * vel_track)
+                args.outer_task_weight * (
+                    -5.0 * cot
+                    + args.vel_reward_weight * vel_track
+                    + args.outer_term_penalty * term_rate
+                )
                 + args.outer_disc_weight * disc_center
             )
 
@@ -2569,6 +2692,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                       f"std={fit_std:.4f}")
                 print(f"    Vel tracking (pop mean) = {vel_track:.4f}")
                 print(f"    Cost of Transport (pop mean) = {cot:.4f}")
+                print(f"    Termination rate (pop mean) = {term_rate:.4f}")
                 print(f"    sigma (post-tell) = {es.sigma:.4f}, "
                       f"cond(C) = {np.linalg.cond(es.C):.2f}")
                 stop_dict = es.stop()
@@ -2578,8 +2702,6 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
                 history["vel_tracking"].append(vel_track)
                 history["cot"].append(cot)
-
-                prev_center_reward = center_reward
 
                 print(f"\n  Design update (CMA-ES, gen {outer_iter + 1}):")
                 for i, name in enumerate(param_names):
@@ -2611,9 +2733,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         # Reward + gradient AND: stop only if the objective has plateaued AND
         # the SPSA gradient signal is weak (noise-dominated or near zero).
         # Prevents false-positive from trust-region throttling.
-        REWARD_PLATEAU_PCT = 0.05   # 5% relative range over window
-        SNR_NOISE_FLOOR    = 5.0    # mean SPSA SNR below this = noise-dominated
-        GRAD_NORM_TOL      = 0.10   # ||grad|| below this = near-zero gradient
+        REWARD_PLATEAU_PCT = args.outer_reward_plateau_pct
+        SNR_NOISE_FLOOR    = args.outer_snr_floor
+        GRAD_NORM_TOL      = args.outer_grad_norm_tol
 
         # Broadcast BEFORE root-only saves to prevent non-root ranks from
         # reaching the broadcast first and hanging while root does slow I/O.
@@ -2700,10 +2822,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     "outer/mode": 0 if args.mode == "spsa" else 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
+                    "outer/term_rate": term_rate,
                     "outer/disc_center": disc_center,
                     "outer/disc_reward_term": args.outer_disc_weight * disc_center,
                     "outer/task_reward_term": args.outer_task_weight * (
-                        -5.0 * cot + args.vel_reward_weight * vel_track
+                        -5.0 * cot
+                        + args.vel_reward_weight * vel_track
+                        + args.outer_term_penalty * term_rate
                     ),
                     "outer/center_reward": center_reward,
                     "outer/inner_time_min": inner_time / 60.0,
@@ -2726,8 +2851,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     bfgs_skip_rate = (
                         bfgs.num_skipped / bfgs_attempted if bfgs_attempted > 0 else 0.0
                     )
+                    # grad_norm_applied = post-SNR-mask norm (what BFGS used)
+                    # grad_norm_raw = pre-mask norm (always-comparable across
+                    # runs that vary --snr-threshold)
                     log_dict.update({
                         "outer/grad_norm": float(np.linalg.norm(grad_theta)),
+                        "outer/grad_norm_applied": float(np.linalg.norm(grad_theta)),
+                        "outer/grad_norm_raw": float(np.linalg.norm(grad_theta_raw)),
                         "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
                         "outer/trust_radius_deg": np.degrees(trust_radius),
                         "outer/trust_ratio_rho": rho if rho is not None else float("nan"),
@@ -2819,6 +2949,9 @@ if __name__ == "__main__":
                         help="Initial CMA-ES step size sigma in radians "
                              "(default: 0.05, matches --spsa-epsilon for fair "
                              "comparison). Ignored unless --mode cmaes.")
+    parser.add_argument("--cmaes-debug", action="store_true",
+                        help="Verify CMA-ES candidate determinism across ranks "
+                             "via per-iteration all_gather hash check. Off by default.")
     parser.add_argument("--baseline", action="store_true",
                         help="Baseline mode: exit after inner-loop convergence on "
                              "the first outer iter. Skips SPSA, BFGS, and all "
@@ -2869,8 +3002,8 @@ if __name__ == "__main__":
                         help="Codesign mode: fraction of max episode length for stage-1 gate "
                              "(default: 0.9 = 90%% of max)")
     parser.add_argument("--task-plateau-threshold", type=float, default=0.02,
-                        help="Codesign mode: relative spread threshold for task_reward plateau "
-                             "(default: 0.02 = 2%%)")
+                        help="Codesign mode: relative slope threshold (predicted change "
+                             "over window) for task_reward plateau. Default 0.02 = 2%%.")
     parser.add_argument("--task-plateau-window", type=int, default=30,
                         help="Codesign mode: window size for task_reward plateau check")
     parser.add_argument("--inner-cot-plateau-threshold", type=float, default=0.0005,
@@ -2884,6 +3017,15 @@ if __name__ == "__main__":
                              "(AND'd with reward plateau and weak-grad). Default 0.002 = 0.2%%")
     parser.add_argument("--outer-cot-plateau-window", type=int, default=5,
                         help="Outer convergence: window size for CoT plateau check")
+    parser.add_argument("--outer-reward-plateau-pct", type=float, default=0.05,
+                        help="Outer convergence: relative range cutoff for center-reward "
+                             "plateau over the trailing 5-iter window. Default 0.05 = 5%%.")
+    parser.add_argument("--outer-snr-floor", type=float, default=5.0,
+                        help="Outer convergence (SPSA-only): mean SPSA SNR below this "
+                             "is considered noise-dominated. Default 5.0.")
+    parser.add_argument("--outer-grad-norm-tol", type=float, default=0.10,
+                        help="Outer convergence (SPSA-only): ||grad|| below this is "
+                             "considered near-zero. Default 0.10.")
     parser.add_argument("--critic-loss-plateau-threshold", type=float, default=0.05,
                         help="Composite gate: critic_loss plateau threshold")
     parser.add_argument("--adv-std-threshold", type=float, default=0.1,
@@ -2915,7 +3057,8 @@ if __name__ == "__main__":
                         help="Min inner iters for convergence after first outer iter")
     parser.add_argument("--vel-reward-weight", type=float, default=5.0,
                         help="Weight for velocity tracking in cost function "
-                             "(reward = -CoT + w * exp(-|v-v_cmd|^2/sigma))")
+                             "(inner per-step reward = -5*CoT + w * exp(-|v-v_cmd|^2/sigma) "
+                             "+ TERM_PENALTY*is_failed; the -5 multiplier on CoT is hardcoded)")
     parser.add_argument("--vel-cmd", type=float, default=1.0,
                         help="Target forward velocity for velocity tracking (m/s)")
     parser.add_argument("--vel-tracking-sigma", type=float, default=0.25,
@@ -2943,6 +3086,13 @@ if __name__ == "__main__":
                              "and outer optimize the same objective. Set 0.0 "
                              "to disable the disc term in the outer loop. "
                              "Only takes effect when --disc-morph-invariant.")
+    parser.add_argument("--outer-term-penalty", type=float, default=-10.0,
+                        help="Termination penalty added to the outer SPSA / "
+                             "CMA-ES reward as outer_task_weight * "
+                             "outer_term_penalty * term_rate, where term_rate "
+                             "is the fraction of completed episodes ending in "
+                             "DoneFlags.FAIL. Default -10.0 mirrors the inner "
+                             "TERM_PENALTY constant. Set 0 to disable.")
     parser.add_argument("--no-video", action="store_true",
                         help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
@@ -2951,7 +3101,7 @@ if __name__ == "__main__":
     parser.add_argument("--devices", nargs="+", default=None,
                         help="CUDA devices (default: auto-detect all GPUs)")
     parser.add_argument("--master-port", type=int, default=None,
-                        help="Port for torch.distributed (default: random 6000-7000)")
+                        help="Port for torch.distributed (default: OS-assigned free port)")
     parser.add_argument("--dist-backend", type=str, default="nccl",
                         choices=["nccl", "gloo", "auto"],
                         help="torch.distributed backend "
@@ -3011,7 +3161,15 @@ if __name__ == "__main__":
         assert "cuda" in d, f"Expected CUDA device, got {d}"
         gpu_indices.append(int(d.split(":")[1]))
 
-    master_port = args.master_port if args.master_port is not None else random.randint(6000, 7000)
+    if args.master_port is not None:
+        master_port = args.master_port
+    else:
+        # OS-assigned free port avoids the prior random.randint(6000, 7000)
+        # collision risk when two jobs land on the same node.
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind(("", 0))
+            master_port = _s.getsockname()[1]
 
     if num_workers > 1:
         # Spawn ALL ranks (including rank 0) as subprocesses so that every

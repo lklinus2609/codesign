@@ -20,6 +20,11 @@ conda activate codesign
 
 SEEDS=(${SEEDS:-7 11 13})
 
+if [ "${#SEEDS[@]}" -eq 0 ]; then
+    echo "[ERROR] SEEDS array is empty (check SEEDS env var)"
+    exit 1
+fi
+
 echo "=== $(date) ==="
 echo "Partition: $SLURM_JOB_PARTITION"
 echo "Seeds:     ${SEEDS[*]}"
@@ -32,7 +37,7 @@ for seed in "${SEEDS[@]}"; do
     echo "=== Seed $seed -- start $(date) ==="
     echo "========================================"
     python codesign/codesign_g1_unified.py \
-        --num-train-envs 16392 \
+        --num-train-envs 16384 \
         --outer-iters 100 \
         --max-inner-iters 10000 \
         --seed "$seed" \

@@ -193,9 +193,12 @@ class G1MJCFModifier:
 
         config["char_file"] = os.path.abspath(mjcf_path)
 
-        # Resolve motion_file if present and relative
-        if "motion_file" in config and not os.path.isabs(config["motion_file"]):
-            config["motion_file"] = os.path.join(mimickit_root, config["motion_file"])
+        # Resolve any known relative-path keys so the config is usable from
+        # any cwd. Add new keys here as the env config schema grows.
+        for key in ("motion_file", "kin_char_file", "terrain_file"):
+            val = config.get(key)
+            if val and isinstance(val, str) and not os.path.isabs(val):
+                config[key] = os.path.join(mimickit_root, val)
 
         with open(output_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False)

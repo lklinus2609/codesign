@@ -117,9 +117,14 @@ class CompositeConvergenceGate:
 
     @staticmethod
     def _is_plateau(values, threshold):
-        """Check if values have plateaued (relative spread < threshold)."""
+        """Check if values have plateaued (relative spread < threshold).
+
+        Uses spread / max(|mean|, 1.0) so the rule is continuous at |mean|=1.0.
+        For |mean| >= 1 this is the standard relative-spread rule; for |mean|
+        below 1 it falls back to absolute spread relative to a unit scale,
+        avoiding the discontinuity present in the original split definition.
+        """
         mean_val = np.mean(values)
         spread = max(values) - min(values)
-        if abs(mean_val) < 1.0:
-            return spread < threshold
-        return (spread / abs(mean_val)) < threshold
+        denom = max(abs(mean_val), 1.0)
+        return (spread / denom) < threshold
