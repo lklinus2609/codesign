@@ -1228,6 +1228,43 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
     wp.synchronize()
 
 
+def apply_population_morphologies(model, candidates, base_quats_dict,
+                                   joint_idx_map, num_worlds, worlds_per_pert):
+    """Apply N candidate morphologies to world partitions in one GPU round-trip.
+
+    Sibling of apply_partitioned_morphologies for CMA-ES population evaluation.
+    No center, no plus/minus pairing — candidate i fills worlds
+    [i*wpp, (i+1)*wpp).
+
+    Args:
+        candidates: (popsize, n_params) array of theta vectors (NOT deltas).
+        Worlds beyond popsize * wpp are left untouched.
+    """
+    popsize = candidates.shape[0]
+    joints_per_world = model.joint_count // num_worlds
+    joint_X_p_np = model.joint_X_p.numpy()
+
+    for p in range(popsize):
+        theta_pert = candidates[p]
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+        world_indices = np.arange(w_start, w_end)
+        for i, group in enumerate(DESIGN_GROUPS):
+            angle = float(theta_pert[i])
+            delta_q = quat_from_x_rotation(angle)
+            for body_name in group:
+                if body_name not in joint_idx_map:
+                    continue
+                base_q = base_quats_dict[body_name]
+                new_q = quat_normalize(quat_multiply(delta_q, base_q))
+                local_idx = joint_idx_map[body_name]
+                global_indices = world_indices * joints_per_world + local_idx
+                joint_X_p_np[global_indices, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
+
+    model.joint_X_p.assign(joint_X_p_np)
+    wp.synchronize()
+
+
 def generate_orthogonal_directions(n_params, num_sets, seed):
     """Generate S orthogonal bases as perturbation directions.
 
@@ -1508,6 +1545,177 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
 
 
 # ---------------------------------------------------------------------------
+# CMA-ES population fitness evaluation
+# ---------------------------------------------------------------------------
+
+def compute_cmaes_fitness_parallel(agent, env, engine, char_id, total_mass,
+                                    theta_np, candidates,
+                                    base_quats_dict, joint_idx_map,
+                                    num_worlds, horizon,
+                                    rank, num_procs, device,
+                                    num_seeds=10, base_seed=42,
+                                    vel_reward_weight=0.1,
+                                    vel_cmd=1.0, vel_tracking_sigma=0.25,
+                                    outer_task_weight=1.0,
+                                    outer_disc_weight=0.0,
+                                    eval_disc_reward=False):
+    """Closed-loop fitness evaluation for a CMA-ES population.
+
+    Mirrors compute_spsa_gradient_parallel but partitions worlds by candidate
+    (no center, no plus/minus pairing) and aggregates per-candidate fitness
+    instead of running lstsq for a gradient. Reward formula matches SPSA:
+        reward = outer_task_weight * (-5.0*CoT + vel_reward_weight * vel_track)
+                 + outer_disc_weight * disc
+    Returns negated reward as fitness (CMA-ES minimizes).
+
+    Args:
+        candidates: (popsize, n_params) array. Each row is a candidate theta.
+        theta_np: pre-population theta (used only to restore the training env
+                  morphology after eval).
+
+    Returns (fitness, vel_track_per_cand, cot_per_cand, disc_per_cand) on all
+    ranks. fitness shape: (popsize,).
+    """
+    popsize, n_params = candidates.shape
+    wpp = num_worlds // popsize
+    assert num_worlds >= popsize, (
+        f"Need >= {popsize} worlds for CMA-ES population, got {num_worlds}")
+
+    if rank == 0:
+        print(f"    [CMA-ES] popsize={popsize}, "
+              f"{wpp} worlds/candidate ({num_worlds} total), "
+              f"{num_procs} GPU(s), {num_seeds} seeds")
+
+    cot_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
+    vel_track_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
+    disc_all = torch.zeros(popsize, num_seeds, dtype=torch.float64, device=device)
+
+    sim_model = engine._sim_model
+
+    apply_population_morphologies(sim_model, candidates, base_quats_dict,
+                                   joint_idx_map, num_worlds, wpp)
+
+    agent.eval()
+    agent.set_mode(base_agent_mod.AgentMode.TEST)
+
+    for seed_idx in range(num_seeds):
+        seed = base_seed + seed_idx
+        torch.manual_seed(seed)
+        np.random.seed(seed % (2**32))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(seed)
+
+        obs, info = env.reset()
+
+        power_sum = torch.zeros(num_worlds, device=device)
+        vel_sum = torch.zeros(num_worlds, device=device)
+        vel_track_sum = torch.zeros(num_worlds, device=device)
+        disc_sum = torch.zeros(num_worlds, device=device)
+        step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        ep_cot_sum = torch.zeros(num_worlds, device=device)
+        ep_vel_track_sum = torch.zeros(num_worlds, device=device)
+        ep_disc_sum = torch.zeros(num_worlds, device=device)
+        ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+
+        with torch.no_grad():
+            for _ in range(horizon):
+                action, _ = agent._decide_action(obs, info)
+                obs, reward, done, info = env.step(action)
+
+                dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
+                dof_vel = engine.get_dof_vel(char_id)
+                root_vel = engine.get_root_vel(char_id)
+
+                power = torch.sum(torch.abs(
+                    dof_forces[:num_worlds] *
+                    dof_vel[:num_worlds]), dim=-1)
+                fwd_vel = root_vel[:num_worlds, 0]
+                power_sum += power
+                vel_sum += fwd_vel
+                vel_track_sum += torch.exp(-torch.square(fwd_vel - vel_cmd) / vel_tracking_sigma)
+                step_count += 1
+
+                if eval_disc_reward:
+                    disc_obs_step = env._disc_obs_buf[:num_worlds]
+                    disc_r_step = compute_disc_reward_for_obs(agent, disc_obs_step)
+                    disc_sum += disc_r_step
+
+                done_mask = (done[:num_worlds] > 0)
+                if done_mask.any():
+                    di = done_mask.nonzero(as_tuple=True)[0]
+                    vs = step_count[di].float()
+                    valid = vs > 0
+                    if valid.any():
+                        vi = di[valid]
+                        vsc = step_count[vi].float()
+                        mp = power_sum[vi] / vsc
+                        mv = vel_sum[vi] / vsc
+                        ep_cot_sum[vi] += compute_cot(mp, mv, total_mass)
+                        ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
+                        if eval_disc_reward:
+                            ep_disc_sum[vi] += disc_sum[vi] / vsc
+                        ep_count[vi] += 1
+                    power_sum[di] = 0
+                    vel_sum[di] = 0
+                    vel_track_sum[di] = 0
+                    disc_sum[di] = 0
+                    step_count[di] = 0
+
+        alive = step_count > 0
+        if alive.any():
+            ai = alive.nonzero(as_tuple=True)[0]
+            vsc = step_count[ai].float()
+            mp = power_sum[ai] / vsc
+            mv = vel_sum[ai] / vsc
+            ep_cot_sum[ai] += compute_cot(mp, mv, total_mass)
+            ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
+            if eval_disc_reward:
+                ep_disc_sum[ai] += disc_sum[ai] / vsc
+            ep_count[ai] += 1
+
+        for p in range(popsize):
+            s, e = p * wpp, (p + 1) * wpp
+            counts = ep_count[s:e].float().clamp(min=1)
+            cot_all[p, seed_idx] = (ep_cot_sum[s:e] / counts).mean().item()
+            vel_track_all[p, seed_idx] = (ep_vel_track_sum[s:e] / counts).mean().item()
+            if eval_disc_reward:
+                disc_all[p, seed_idx] = (ep_disc_sum[s:e] / counts).mean().item()
+
+    agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+    agent.train()
+
+    if num_procs > 1:
+        torch.distributed.all_reduce(cot_all, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(vel_track_all, op=torch.distributed.ReduceOp.SUM)
+        cot_all /= num_procs
+        vel_track_all /= num_procs
+        if eval_disc_reward:
+            torch.distributed.all_reduce(disc_all, op=torch.distributed.ReduceOp.SUM)
+            disc_all /= num_procs
+
+    # Restore training morphology before returning
+    update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
+                               joint_idx_map, num_worlds)
+
+    cot_np = cot_all.cpu().numpy()
+    vt_np = vel_track_all.cpu().numpy()
+    disc_np = disc_all.cpu().numpy()
+
+    # Mean over seeds → per-candidate metrics
+    cot_per_cand = cot_np.mean(axis=1)
+    vel_track_per_cand = vt_np.mean(axis=1)
+    disc_per_cand = disc_np.mean(axis=1) if eval_disc_reward else np.zeros(popsize)
+
+    reward_per_cand = (
+        outer_task_weight * (-5.0 * cot_per_cand + vel_reward_weight * vel_track_per_cand)
+        + outer_disc_weight * disc_per_cand
+    )
+    fitness = -reward_per_cand  # CMA-ES minimizes
+
+    return fitness, vel_track_per_cand, cot_per_cand, disc_per_cand
+
+
+# ---------------------------------------------------------------------------
 # Envelope Theorem validation: policy gradient norm at convergence
 # ---------------------------------------------------------------------------
 
@@ -1719,7 +1927,7 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
         partition = os.environ.get("SLURM_JOB_PARTITION", "local")
         wandb.init(
             project="gbc-codesign",
-            name=f"g1-unified-{partition}-{args.num_train_envs}env-{num_procs}gpu",
+            name=f"g1-unified-{args.mode}-{partition}-{args.num_train_envs}env-{num_procs}gpu",
             config=vars(args),
         )
     elif is_root and args.wandb:
@@ -1934,6 +2142,23 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     bfgs = CautiousBFGS(NUM_DESIGN_PARAMS)
     theta_bounds = THETA_BOUNDS
 
+    # CMA-ES state (only used when --mode cmaes)
+    es = None
+    if args.mode == "cmaes":
+        import cma
+        cmaes_opts = {
+            "seed": args.seed,
+            "verbose": -9,             # silence cma stdout — we log ourselves
+            "tolx": 1e-12,             # disable internal stops; outer plateau owns termination
+            "tolfun": 1e-12,
+            "maxiter": args.outer_iters + 1,
+            "bounds": [float(theta_bounds[0]), float(theta_bounds[1])],
+        }
+        es = cma.CMAEvolutionStrategy(theta.tolist(), args.cmaes_sigma0, cmaes_opts)
+        if is_root:
+            print(f"  [CMA-ES] Initialized: popsize={es.popsize}, sigma0={args.cmaes_sigma0:.4f} rad "
+                  f"({np.degrees(args.cmaes_sigma0):.2f} deg), seed={args.seed}")
+
     param_names = [
         f"theta_{i}_{group_param_name(DESIGN_GROUPS[i])}"
         for i in range(NUM_DESIGN_PARAMS)
@@ -2038,22 +2263,37 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                   f"window={args.task_plateau_window}")
             print(f"    cot plateau:     {args.inner_cot_plateau_threshold:.0%} spread over "
                   f"window={args.inner_cot_plateau_window} (AND'd with task)")
-        print(f"  Outer convergence: reward {0.05:.0%} AND cot "
-              f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
-              f"AND weak grad")
-        _M = args.spsa_sets * NUM_DESIGN_PARAMS
-        _n_pert = 1 + 2 * _M
-        _wpp = per_rank_envs // _n_pert
-        print(f"  SPSA sets:         {args.spsa_sets} ({_M} directions, "
-              f"{_n_pert} perturbations, {_wpp} worlds/pert/GPU)")
-        print(f"  SPSA seeds:        {args.num_spsa_seeds} (paired-seed averaging)")
-        print(f"  SPSA epsilon:      {args.spsa_epsilon} rad "
-              f"({np.degrees(args.spsa_epsilon):.1f} deg)")
-        if args.snr_threshold > 0:
-            print(f"  SNR threshold:     {args.snr_threshold}")
+        if args.mode == "spsa":
+            print(f"  Outer convergence: reward {0.05:.0%} AND cot "
+                  f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
+                  f"AND weak grad")
+            _M = args.spsa_sets * NUM_DESIGN_PARAMS
+            _n_pert = 1 + 2 * _M
+            _wpp = per_rank_envs // _n_pert
+            print(f"  SPSA sets:         {args.spsa_sets} ({_M} directions, "
+                  f"{_n_pert} perturbations, {_wpp} worlds/pert/GPU)")
+            print(f"  SPSA seeds:        {args.num_spsa_seeds} (paired-seed averaging)")
+            print(f"  SPSA epsilon:      {args.spsa_epsilon} rad "
+                  f"({np.degrees(args.spsa_epsilon):.1f} deg)")
+            if args.snr_threshold > 0:
+                print(f"  SNR threshold:     {args.snr_threshold}")
+        else:  # cmaes
+            print(f"  Outer convergence: reward {0.05:.0%} AND cot "
+                  f"{args.outer_cot_plateau_pct:.0%} (window={args.outer_cot_plateau_window}) "
+                  f"(weak-grad guard skipped in CMA-ES mode)")
+            _wpp = per_rank_envs // es.popsize
+            print(f"  CMA-ES popsize:    {es.popsize} (library default 4+3*ln(n)), "
+                  f"{_wpp} worlds/cand/GPU")
+            print(f"  CMA-ES sigma0:     {args.cmaes_sigma0} rad "
+                  f"({np.degrees(args.cmaes_sigma0):.1f} deg)")
+            print(f"  CMA-ES seeds:      {args.num_spsa_seeds} (paired-seed averaging, "
+                  f"reused from --num-spsa-seeds)")
         print(f"  Vel reward weight: {args.vel_reward_weight} "
               f"(reward = -CoT + {args.vel_reward_weight}*exp(-|v-{args.vel_cmd}|^2/{args.vel_tracking_sigma}))")
-        print(f"  Gradient mode:     orthogonal SPSA (closed-loop, lstsq reconstruction)")
+        if args.mode == "spsa":
+            print(f"  Optimizer mode:    orthogonal SPSA (closed-loop, lstsq reconstruction)")
+        else:
+            print(f"  Optimizer mode:    CMA-ES (closed-loop population eval, library defaults)")
 
     # =========================================================
     # Outer loop
@@ -2120,146 +2360,232 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  [Envelope] Policy gradient norm at convergence: "
                   f"{envelope_grad_norm:.6f}")
 
-        # ----- SPSA Gradient Phase (ALL ranks, closed-loop) -----
-        # Clear CoT tracker before SPSA to prevent cross-contamination
-        env._cot_tracker.get_stats()  # drain any accumulated episodes
+        # ----- Optimizer Phase (mode-dependent) -----
+        # Both modes initialize these for downstream consumption (convergence
+        # check, wandb logging, np.save). SPSA-only fields stay None when in
+        # CMA-ES mode and are guarded at their use sites.
+        grad_theta = None
+        grad_snr = None
+        grad_stderr = None
+        rho = None
+
+        # Clear CoT tracker before eval to prevent cross-contamination
+        env._cot_tracker.get_stats()
         env._cot_tracker.reset_accumulators()
-
-        if is_root:
-            print(f"\n  [SPSA] Computing orthogonal SPSA gradient "
-                  f"(S={args.spsa_sets}, {args.num_spsa_seeds} seeds, "
-                  f"{args.eval_horizon} steps)...")
-
-        spsa_base_seed = args.seed + outer_iter * 1000
 
         eval_disc_in_outer = (
             args.disc_morph_invariant and args.outer_disc_weight != 0.0
         )
-        grad_theta, grad_stderr, grad_snr, vel_track, cot, disc_center = \
-            compute_spsa_gradient_parallel(
-                agent, env, engine, char_id, total_mass,
-                theta.copy(), base_quats_dict, joint_idx_map,
-                per_rank_envs, args.eval_horizon,
-                rank, num_procs, device, param_names,
-                num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
-                eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
-                vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
-                num_spsa_sets=args.spsa_sets,
-                outer_task_weight=args.outer_task_weight,
-                outer_disc_weight=args.outer_disc_weight,
-                eval_disc_reward=eval_disc_in_outer,
-            )
 
-        # Clear CoT tracker after SPSA to prevent pollution of inner loop
-        env._cot_tracker.get_stats()
-        env._cot_tracker.reset_accumulators()
+        if args.mode == "spsa":
+            # ----- SPSA Gradient Phase (ALL ranks, closed-loop) -----
+            if is_root:
+                print(f"\n  [SPSA] Computing orthogonal SPSA gradient "
+                      f"(S={args.spsa_sets}, {args.num_spsa_seeds} seeds, "
+                      f"{args.eval_horizon} steps)...")
 
-        if is_root:
-            print(f"    SPSA gradients:")
-            for i, name in enumerate(param_names):
-                print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
-            print(f"    Vel tracking = {vel_track:.4f}")
-            print(f"    Cost of Transport = {cot:.4f}")
+            spsa_base_seed = args.seed + outer_iter * 1000
 
-            history["vel_tracking"].append(vel_track)
-            history["cot"].append(cot)
-            history["gradients"].append(grad_theta.copy())
-            history["grad_snr"].append(grad_snr.copy())
-
-            # ----- Adaptive trust region ratio test (1b) -----
-            # Match SPSA reward formula so trust-region ratio is consistent.
-            center_reward = (
-                args.outer_task_weight * (
-                    -5.0 * cot
-                    + args.vel_reward_weight * vel_track
+            grad_theta, grad_stderr, grad_snr, vel_track, cot, disc_center = \
+                compute_spsa_gradient_parallel(
+                    agent, env, engine, char_id, total_mass,
+                    theta.copy(), base_quats_dict, joint_idx_map,
+                    per_rank_envs, args.eval_horizon,
+                    rank, num_procs, device, param_names,
+                    num_seeds=args.num_spsa_seeds, base_seed=spsa_base_seed,
+                    eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
+                    vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+                    num_spsa_sets=args.spsa_sets,
+                    outer_task_weight=args.outer_task_weight,
+                    outer_disc_weight=args.outer_disc_weight,
+                    eval_disc_reward=eval_disc_in_outer,
                 )
+
+            # Clear CoT tracker after eval
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            if is_root:
+                print(f"    SPSA gradients:")
+                for i, name in enumerate(param_names):
+                    print(f"      d_reward/d_{name} = {grad_theta[i]:+.6f}")
+                print(f"    Vel tracking = {vel_track:.4f}")
+                print(f"    Cost of Transport = {cot:.4f}")
+
+                history["vel_tracking"].append(vel_track)
+                history["cot"].append(cot)
+                history["gradients"].append(grad_theta.copy())
+                history["grad_snr"].append(grad_snr.copy())
+
+                # ----- Adaptive trust region ratio test (1b) -----
+                # Match SPSA reward formula so trust-region ratio is consistent.
+                center_reward = (
+                    args.outer_task_weight * (
+                        -5.0 * cot
+                        + args.vel_reward_weight * vel_track
+                    )
+                    + args.outer_disc_weight * disc_center
+                )
+                if prev_center_reward is not None and predicted_improvement is not None:
+                    actual_improvement = center_reward - prev_center_reward
+                    if abs(predicted_improvement) > 1e-12:
+                        rho = actual_improvement / predicted_improvement
+                    else:
+                        rho = 0.0
+
+                    if rho > 0.75:
+                        trust_radius = min(trust_radius * 1.5, TRUST_RADIUS_MAX)
+                    elif rho < 0.25:
+                        trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
+
+                    print(f"    [Trust Region] rho={rho:.3f}, "
+                          f"actual={actual_improvement:+.6f}, "
+                          f"predicted={predicted_improvement:+.6f}, "
+                          f"radius={np.degrees(trust_radius):.3f} deg")
+
+                prev_center_reward = center_reward
+
+                # ----- Design Update (rank 0 only) -----
+                n_clamped = 0
+                raw_step = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+
+                if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
+                    print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
+                          f"signaling all ranks to stop.")
+                    theta[:] = np.nan
+                    predicted_improvement = None
+                else:
+                    # Save raw gradient before SNR masking (Bug B fix: BFGS
+                    # must receive the true gradient for correct y-vector)
+                    grad_theta_raw = grad_theta.copy()
+
+                    # SNR gating: zero out gradient components with low confidence
+                    # (inf SNR = high confidence from single seed, kept through)
+                    skip_update = False
+                    if args.snr_threshold > 0:
+                        snr_mask = (grad_snr > args.snr_threshold) | ~np.isfinite(grad_snr)
+                        n_masked = NUM_DESIGN_PARAMS - snr_mask.sum()
+                        if n_masked == NUM_DESIGN_PARAMS:
+                            # Bug A fix: actually skip the update instead of
+                            # proceeding with all-zero gradients
+                            print(f"    [SNR gate] WARNING: All {NUM_DESIGN_PARAMS} params "
+                                  f"masked (SNR < {args.snr_threshold}), skipping update")
+                            skip_update = True
+                            predicted_improvement = 0.0
+                        else:
+                            if n_masked > 0:
+                                print(f"    [SNR gate] Masking {n_masked}/{NUM_DESIGN_PARAMS} params "
+                                      f"with SNR < {args.snr_threshold}")
+                            grad_theta = grad_theta * snr_mask.astype(float)
+
+                    if not skip_update:
+                        old_theta = theta.copy()
+                        direction = bfgs.compute_direction(grad_theta)
+                        step = args.design_lr * direction
+
+                        # Adaptive trust-region clamp (1b)
+                        max_step_rad = trust_radius
+                        raw_step = step.copy()
+                        step = np.clip(step, -max_step_rad, max_step_rad)
+                        n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
+                        if n_clamped > 0:
+                            print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
+                                  f"params to +/-{np.degrees(max_step_rad):.3f} deg")
+
+                        theta = old_theta + step
+                        theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
+
+                        # Record actual step (post-clip) for Hessian update
+                        actual_s = theta - old_theta
+                        # Bug B fix: pass raw (un-masked) gradient to BFGS so
+                        # prev_grad reflects the true gradient for y-vector
+                        bfgs.update(actual_s, grad_theta_raw)
+
+                        # Predicted improvement for next iteration's ratio test (1b)
+                        predicted_improvement = grad_theta_raw @ actual_s
+
+                        print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
+                              f"{bfgs.num_skipped} skipped):")
+                        for i, name in enumerate(param_names):
+                            delta = theta[i] - old_theta[i]
+                            print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
+                                  f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
+
+        else:  # args.mode == "cmaes"
+            # ----- CMA-ES Population Phase (ALL ranks, closed-loop) -----
+            # All ranks own identical `es` (same seed, same prior tells), so
+            # ask() / tell() stay in lockstep without broadcasts.
+            if is_root:
+                print(f"\n  [CMA-ES] Generation {outer_iter + 1}: "
+                      f"sigma={es.sigma:.4f} ({np.degrees(es.sigma):.2f} deg), "
+                      f"cond(C)={np.linalg.cond(es.C):.2f}")
+
+            candidates = np.array(es.ask())  # (popsize, n_params)
+            cmaes_base_seed = args.seed + outer_iter * 1000
+
+            fitness, vel_per_cand, cot_per_cand, disc_per_cand = \
+                compute_cmaes_fitness_parallel(
+                    agent, env, engine, char_id, total_mass,
+                    theta.copy(), candidates,
+                    base_quats_dict, joint_idx_map,
+                    per_rank_envs, args.eval_horizon,
+                    rank, num_procs, device,
+                    num_seeds=args.num_spsa_seeds, base_seed=cmaes_base_seed,
+                    vel_reward_weight=args.vel_reward_weight,
+                    vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+                    outer_task_weight=args.outer_task_weight,
+                    outer_disc_weight=args.outer_disc_weight,
+                    eval_disc_reward=eval_disc_in_outer,
+                )
+
+            # Clear CoT tracker after eval
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            # All ranks call tell with identical inputs => identical state.
+            es.tell(candidates.tolist(), fitness.tolist())
+
+            old_theta = theta.copy()
+            theta = np.array(es.mean, dtype=np.float64)
+            theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
+
+            # Aggregate population stats for downstream logging / plateau check.
+            # Use mean over candidates as the iteration's representative reading
+            # (analog of SPSA's center morphology).
+            vel_track = float(np.mean(vel_per_cand))
+            cot = float(np.mean(cot_per_cand))
+            disc_center = float(np.mean(disc_per_cand)) if eval_disc_in_outer else 0.0
+            center_reward = (
+                args.outer_task_weight * (-5.0 * cot + args.vel_reward_weight * vel_track)
                 + args.outer_disc_weight * disc_center
             )
-            rho = None
-            if prev_center_reward is not None and predicted_improvement is not None:
-                actual_improvement = center_reward - prev_center_reward
-                if abs(predicted_improvement) > 1e-12:
-                    rho = actual_improvement / predicted_improvement
-                else:
-                    rho = 0.0
 
-                if rho > 0.75:
-                    trust_radius = min(trust_radius * 1.5, TRUST_RADIUS_MAX)
-                elif rho < 0.25:
-                    trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
+            if is_root:
+                fit_best = float(fitness.min())
+                fit_mean = float(fitness.mean())
+                fit_std = float(fitness.std())
+                print(f"    [CMA-ES] popsize={es.popsize} evaluated. "
+                      f"fitness: best={fit_best:.4f}, mean={fit_mean:.4f}, "
+                      f"std={fit_std:.4f}")
+                print(f"    Vel tracking (pop mean) = {vel_track:.4f}")
+                print(f"    Cost of Transport (pop mean) = {cot:.4f}")
+                print(f"    sigma (post-tell) = {es.sigma:.4f}, "
+                      f"cond(C) = {np.linalg.cond(es.C):.2f}")
+                stop_dict = es.stop()
+                if stop_dict:
+                    print(f"    [CMA-ES] internal stop signal (informational, "
+                          f"not acted upon): {stop_dict}")
 
-                print(f"    [Trust Region] rho={rho:.3f}, "
-                      f"actual={actual_improvement:+.6f}, "
-                      f"predicted={predicted_improvement:+.6f}, "
-                      f"radius={np.degrees(trust_radius):.3f} deg")
+                history["vel_tracking"].append(vel_track)
+                history["cot"].append(cot)
 
-            prev_center_reward = center_reward
+                prev_center_reward = center_reward
 
-            # ----- Design Update (rank 0 only) -----
-            n_clamped = 0
-            raw_step = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
-
-            if np.any(np.isnan(grad_theta)) or np.all(grad_theta == 0):
-                print(f"\n  [FATAL] Degenerate gradient (NaN or all-zero) — "
-                      f"signaling all ranks to stop.")
-                theta[:] = np.nan
-                predicted_improvement = None
-            else:
-                # Save raw gradient before SNR masking (Bug B fix: BFGS
-                # must receive the true gradient for correct y-vector)
-                grad_theta_raw = grad_theta.copy()
-
-                # SNR gating: zero out gradient components with low confidence
-                # (inf SNR = high confidence from single seed, kept through)
-                skip_update = False
-                if args.snr_threshold > 0:
-                    snr_mask = (grad_snr > args.snr_threshold) | ~np.isfinite(grad_snr)
-                    n_masked = NUM_DESIGN_PARAMS - snr_mask.sum()
-                    if n_masked == NUM_DESIGN_PARAMS:
-                        # Bug A fix: actually skip the update instead of
-                        # proceeding with all-zero gradients
-                        print(f"    [SNR gate] WARNING: All {NUM_DESIGN_PARAMS} params "
-                              f"masked (SNR < {args.snr_threshold}), skipping update")
-                        skip_update = True
-                        predicted_improvement = 0.0
-                    else:
-                        if n_masked > 0:
-                            print(f"    [SNR gate] Masking {n_masked}/{NUM_DESIGN_PARAMS} params "
-                                  f"with SNR < {args.snr_threshold}")
-                        grad_theta = grad_theta * snr_mask.astype(float)
-
-                if not skip_update:
-                    old_theta = theta.copy()
-                    direction = bfgs.compute_direction(grad_theta)
-                    step = args.design_lr * direction
-
-                    # Adaptive trust-region clamp (1b)
-                    max_step_rad = trust_radius
-                    raw_step = step.copy()
-                    step = np.clip(step, -max_step_rad, max_step_rad)
-                    n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
-                    if n_clamped > 0:
-                        print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
-                              f"params to +/-{np.degrees(max_step_rad):.3f} deg")
-
-                    theta = old_theta + step
-                    theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
-
-                    # Record actual step (post-clip) for Hessian update
-                    actual_s = theta - old_theta
-                    # Bug B fix: pass raw (un-masked) gradient to BFGS so
-                    # prev_grad reflects the true gradient for y-vector
-                    bfgs.update(actual_s, grad_theta_raw)
-
-                    # Predicted improvement for next iteration's ratio test (1b)
-                    predicted_improvement = grad_theta_raw @ actual_s
-
-                    print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
-                          f"{bfgs.num_skipped} skipped):")
-                    for i, name in enumerate(param_names):
-                        delta = theta[i] - old_theta[i]
-                        print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
-                              f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
+                print(f"\n  Design update (CMA-ES, gen {outer_iter + 1}):")
+                for i, name in enumerate(param_names):
+                    delta = theta[i] - old_theta[i]
+                    print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
+                          f"(delta={delta:+.5f}, {np.degrees(delta):+.3f} deg)")
 
         # ----- Broadcast theta to all ranks -----
         # Non-root ranks block here until root finishes SPSA gradient
@@ -2314,27 +2640,45 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     cot_range_rel = (c.max() - c.min()) / (abs(c_mean) + 1e-8)
                     cot_plateau = cot_range_rel < args.outer_cot_plateau_pct
 
-                finite_snr = grad_snr[np.isfinite(grad_snr)]
-                mean_snr = float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0
-                grad_norm = float(np.linalg.norm(grad_theta))
-                grad_weak = (mean_snr < SNR_NOISE_FLOOR) or (grad_norm < GRAD_NORM_TOL)
+                if args.mode == "spsa":
+                    finite_snr = grad_snr[np.isfinite(grad_snr)]
+                    mean_snr = float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0
+                    grad_norm = float(np.linalg.norm(grad_theta))
+                    grad_weak = (mean_snr < SNR_NOISE_FLOOR) or (grad_norm < GRAD_NORM_TOL)
+                    converge_now = reward_plateau and cot_plateau and grad_weak
+                else:  # cmaes — no gradient, plateau alone owns termination
+                    converge_now = reward_plateau and cot_plateau
 
-                if reward_plateau and cot_plateau and grad_weak:
-                    print(
-                        f"\n  OUTER CONVERGED: reward plateau "
-                        f"(range={reward_range_rel*100:.2f}%) AND CoT plateau "
-                        f"(range={cot_range_rel*100:.2f}%) AND gradient weak "
-                        f"(mean SNR={mean_snr:.2f}, ||grad||={grad_norm:.3f})"
-                    )
+                if converge_now:
+                    if args.mode == "spsa":
+                        print(
+                            f"\n  OUTER CONVERGED: reward plateau "
+                            f"(range={reward_range_rel*100:.2f}%) AND CoT plateau "
+                            f"(range={cot_range_rel*100:.2f}%) AND gradient weak "
+                            f"(mean SNR={mean_snr:.2f}, ||grad||={grad_norm:.3f})"
+                        )
+                    else:
+                        print(
+                            f"\n  OUTER CONVERGED (CMA-ES): reward plateau "
+                            f"(range={reward_range_rel*100:.2f}%) AND CoT plateau "
+                            f"(range={cot_range_rel*100:.2f}%)"
+                        )
                     outer_converged = True
                 else:
-                    print(
-                        f"  [Convergence] not yet: reward_range={reward_range_rel*100:.2f}% "
-                        f"(plateau? {reward_plateau}), "
-                        f"cot_range={cot_range_rel*100:.2f}% (plateau? {cot_plateau}), "
-                        f"||grad||={grad_norm:.3f}, mean SNR={mean_snr:.2f} "
-                        f"(weak? {grad_weak})"
-                    )
+                    if args.mode == "spsa":
+                        print(
+                            f"  [Convergence] not yet: reward_range={reward_range_rel*100:.2f}% "
+                            f"(plateau? {reward_plateau}), "
+                            f"cot_range={cot_range_rel*100:.2f}% (plateau? {cot_plateau}), "
+                            f"||grad||={grad_norm:.3f}, mean SNR={mean_snr:.2f} "
+                            f"(weak? {grad_weak})"
+                        )
+                    else:
+                        print(
+                            f"  [Convergence] not yet: reward_range={reward_range_rel*100:.2f}% "
+                            f"(plateau? {reward_plateau}), "
+                            f"cot_range={cot_range_rel*100:.2f}% (plateau? {cot_plateau})"
+                        )
 
         if mp_util.enable_mp():
             flag = torch.tensor([int(outer_converged)], dtype=torch.int32,
@@ -2347,16 +2691,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         if is_root:
             np.save(str(out_dir / "theta_latest.npy"), theta)
             np.save(str(iter_dir / "theta.npy"), theta)
-            np.save(str(iter_dir / "grad.npy"), grad_theta)
+            if args.mode == "spsa":
+                np.save(str(iter_dir / "grad.npy"), grad_theta)
 
             if use_wandb:
-                finite_snr = grad_snr[np.isfinite(grad_snr)]
-                bfgs_attempted = bfgs.num_updates + bfgs.num_skipped
-                bfgs_skip_rate = (
-                    bfgs.num_skipped / bfgs_attempted if bfgs_attempted > 0 else 0.0
-                )
                 log_dict = {
                     "outer/iteration": outer_iter + 1,
+                    "outer/mode": 0 if args.mode == "spsa" else 1,
                     "outer/vel_tracking": vel_track,
                     "outer/cot": cot,
                     "outer/disc_center": disc_center,
@@ -2366,47 +2707,58 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     ),
                     "outer/center_reward": center_reward,
                     "outer/inner_time_min": inner_time / 60.0,
-                    "outer/grad_norm": np.linalg.norm(grad_theta),
-                    "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
-                    "outer/trust_radius_deg": np.degrees(trust_radius),
-                    # Trust-region ratio: NaN before first update (no prior reward).
-                    # Logged unconditionally so the trace stays continuous.
-                    "outer/trust_ratio_rho": rho if rho is not None else float("nan"),
                     "outer/reward_range_rel": reward_range_rel,
                     "outer/reward_plateau_passed": int(reward_plateau),
                     "outer/cot_range_rel": cot_range_rel,
                     "outer/cot_plateau_passed": int(cot_plateau),
-                    "outer/grad_weak_passed": int(grad_weak),
-                    # Envelope-theorem residual ||grad_theta J|| at policy
-                    # convergence. Only meaningful after the AMP ramp completes;
-                    # None before that -> NaN so wandb trace stays continuous.
                     "outer/envelope_grad_norm": (
                         envelope_grad_norm if envelope_grad_norm is not None
                         else float("nan")
                     ),
-                    # BFGS cautious-filter cumulative stats (skips when sTy<=threshold)
-                    "outer/bfgs_num_updates": bfgs.num_updates,
-                    "outer/bfgs_num_skipped": bfgs.num_skipped,
-                    "outer/bfgs_skip_rate": bfgs_skip_rate,
-                    # Cumulative inner-loop training samples across all ranks
-                    # (agent._sample_count is all-reduced in the inner controller).
                     "outer/inner_samples_cumulative": int(agent._sample_count),
                 }
                 for i, name in enumerate(param_names):
                     log_dict[f"outer/{name}_deg"] = np.degrees(theta[i])
-                    log_dict[f"outer/grad_{name}"] = grad_theta[i]
-                    # Per-parameter SNR: infinite SNR (single-seed, zero stderr)
-                    # logged as NaN to keep traces well-behaved in wandb.
-                    snr_val = grad_snr[i]
-                    log_dict[f"outer/snr_{name}"] = (
-                        float(snr_val) if np.isfinite(snr_val) else float("nan")
+
+                if args.mode == "spsa":
+                    finite_snr = grad_snr[np.isfinite(grad_snr)]
+                    bfgs_attempted = bfgs.num_updates + bfgs.num_skipped
+                    bfgs_skip_rate = (
+                        bfgs.num_skipped / bfgs_attempted if bfgs_attempted > 0 else 0.0
                     )
+                    log_dict.update({
+                        "outer/grad_norm": float(np.linalg.norm(grad_theta)),
+                        "outer/grad_snr_mean": float(np.mean(finite_snr)) if len(finite_snr) > 0 else 0.0,
+                        "outer/trust_radius_deg": np.degrees(trust_radius),
+                        "outer/trust_ratio_rho": rho if rho is not None else float("nan"),
+                        "outer/grad_weak_passed": int(grad_weak),
+                        "outer/bfgs_num_updates": bfgs.num_updates,
+                        "outer/bfgs_num_skipped": bfgs.num_skipped,
+                        "outer/bfgs_skip_rate": bfgs_skip_rate,
+                    })
+                    for i, name in enumerate(param_names):
+                        log_dict[f"outer/grad_{name}"] = grad_theta[i]
+                        snr_val = grad_snr[i]
+                        log_dict[f"outer/snr_{name}"] = (
+                            float(snr_val) if np.isfinite(snr_val) else float("nan")
+                        )
+                else:  # cmaes
+                    log_dict.update({
+                        "outer/cmaes_sigma": float(es.sigma),
+                        "outer/cmaes_cond_C": float(np.linalg.cond(es.C)),
+                        "outer/cmaes_fitness_best": float(fitness.min()),
+                        "outer/cmaes_fitness_mean": float(fitness.mean()),
+                        "outer/cmaes_fitness_std": float(fitness.std()),
+                        "outer/cmaes_popsize": int(es.popsize),
+                    })
+
                 wandb.log(log_dict, step=agent._iter)
 
                 # Save artifacts to wandb files
                 wandb.save(str(iter_dir / "model.pt"), base_path=str(out_dir))
                 wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
-                wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
+                if args.mode == "spsa":
+                    wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
                 wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
 
         if outer_converged:
@@ -2455,6 +2807,18 @@ if __name__ == "__main__":
     parser.add_argument("--no-wandb", action="store_true",
                         help="Disable wandb logging")
     parser.add_argument("--outer-iters", type=int, default=20)
+    parser.add_argument("--mode", type=str, default="spsa",
+                        choices=["spsa", "cmaes"],
+                        help="Outer-loop optimizer. 'spsa' (default): closed-loop "
+                             "orthogonal SPSA with cautious BFGS + adaptive trust "
+                             "region. 'cmaes': CMA-ES baseline (population sampled "
+                             "from N(m, sigma^2 C), evaluated with frozen policy, "
+                             "library default popsize=4+3*ln(n)). For computational-"
+                             "efficiency comparison studies.")
+    parser.add_argument("--cmaes-sigma0", type=float, default=0.05,
+                        help="Initial CMA-ES step size sigma in radians "
+                             "(default: 0.05, matches --spsa-epsilon for fair "
+                             "comparison). Ignored unless --mode cmaes.")
     parser.add_argument("--baseline", action="store_true",
                         help="Baseline mode: exit after inner-loop convergence on "
                              "the first outer iter. Skips SPSA, BFGS, and all "
