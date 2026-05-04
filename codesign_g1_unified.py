@@ -265,6 +265,9 @@ def codesign_task_reward(self):
         r = -5.0*CoT + vel_reward_weight * exp(-|v_x - v_cmd|^2 / sigma)
             + TERM_PENALTY * is_failed
     The -5.0 multiplier on CoT and TERM_PENALTY (-10) are hardcoded.
+    The TERM_PENALTY contribution is added in _make_post_physics_hook
+    (after _update_done) because SimEnv._post_physics_step calls
+    _update_reward before _update_done, so _done_buf is stale here.
     """
     char_id = self._get_char_id()
     root_vel = self._engine.get_root_vel(char_id)   # (num_envs, 3)
@@ -280,20 +283,22 @@ def codesign_task_reward(self):
     vel_tracking = torch.exp(-torch.square(fwd_vel - self._vel_cmd) / self._vel_tracking_sigma)
     vel_reward = self._vel_reward_weight * vel_tracking
 
-    # 3. Termination penalty
-    term_penalty = TERM_PENALTY * (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
-
-    self._reward_buf[:] = -5.0 * cot + vel_reward + term_penalty
+    self._reward_buf[:] = -5.0 * cot + vel_reward
 
 
 def _make_post_physics_hook(original_fn, char_id):
-    """Create a _post_physics_step wrapper that drives the CoT tracker.
+    """Wrap _post_physics_step to apply the termination penalty and drive
+    the CoT tracker.
 
-    Called after the original _post_physics_step (which runs _update_reward
-    then _update_done), so both _reward_buf and _done_buf are current.
+    Both run after original_fn(self) so _done_buf reflects the current
+    step's terminations (SimEnv._post_physics_step calls _update_reward
+    before _update_done — so reading _done_buf inside _update_reward
+    would see the prior step's value).
     """
     def hooked_post_physics_step(self):
         original_fn(self)
+        fail_mask = (self._done_buf == base_env_mod.DoneFlags.FAIL.value).float()
+        self._reward_buf += TERM_PENALTY * fail_mask
         self._cot_tracker.accumulate(self._engine, char_id)
         self._cot_tracker.finalize_episodes(self._done_buf)
     return hooked_post_physics_step
