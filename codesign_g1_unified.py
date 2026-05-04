@@ -2239,10 +2239,21 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             "maxiter": args.outer_iters + 1,
             "bounds": [float(theta_bounds[0]), float(theta_bounds[1])],
         }
+        # Cap per-axis sigma so CSA cannot inflate the candidate spread out of
+        # the envelope-theorem-valid regime. With maxstd=0.0175 rad (1 deg) and
+        # cond(C) <= ~10 in practice, the dominant-axis candidate spread stays
+        # within ~3 deg of the mean — comparable to SPSA's epsilon perturbation.
+        if args.cmaes_maxsigma > 0:
+            cmaes_opts["maxstd"] = [float(args.cmaes_maxsigma)] * NUM_DESIGN_PARAMS
         es = cma.CMAEvolutionStrategy(theta.tolist(), args.cmaes_sigma0, cmaes_opts)
         if is_root:
             print(f"  [CMA-ES] Initialized: popsize={es.popsize}, sigma0={args.cmaes_sigma0:.4f} rad "
                   f"({np.degrees(args.cmaes_sigma0):.2f} deg), seed={args.seed}")
+            if args.cmaes_maxsigma > 0:
+                print(f"  [CMA-ES] maxstd cap:    {args.cmaes_maxsigma:.4f} rad "
+                      f"({np.degrees(args.cmaes_maxsigma):.2f} deg) per axis")
+            else:
+                print(f"  [CMA-ES] maxstd cap:    disabled (sigma growth uncapped)")
 
     param_names = [
         f"theta_{i}_{group_param_name(DESIGN_GROUPS[i])}"
@@ -2379,7 +2390,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  CMA-ES popsize:    {es.popsize} (library default 4+3*ln(n)), "
                   f"{_wpp} worlds/cand/GPU")
             print(f"  CMA-ES sigma0:     {args.cmaes_sigma0} rad "
-                  f"({np.degrees(args.cmaes_sigma0):.1f} deg)")
+                  f"({np.degrees(args.cmaes_sigma0):.2f} deg)")
+            if args.cmaes_maxsigma > 0:
+                print(f"  CMA-ES maxsigma:   {args.cmaes_maxsigma} rad "
+                      f"({np.degrees(args.cmaes_maxsigma):.2f} deg) per axis")
+            else:
+                print(f"  CMA-ES maxsigma:   uncapped")
             print(f"  CMA-ES seeds:      {args.num_spsa_seeds} (paired-seed averaging, "
                   f"reused from --num-spsa-seeds)")
         print(f"  Vel reward weight: {args.vel_reward_weight} "
@@ -2945,10 +2961,19 @@ if __name__ == "__main__":
                              "from N(m, sigma^2 C), evaluated with frozen policy, "
                              "library default popsize=4+3*ln(n)). For computational-"
                              "efficiency comparison studies.")
-    parser.add_argument("--cmaes-sigma0", type=float, default=0.05,
+    parser.add_argument("--cmaes-sigma0", type=float, default=0.0087,
                         help="Initial CMA-ES step size sigma in radians "
-                             "(default: 0.05, matches --spsa-epsilon for fair "
-                             "comparison). Ignored unless --mode cmaes.")
+                             "(default: 0.0087 rad ~= 0.5 deg, matches "
+                             "SPSA --max-step-deg so the per-iter mean update "
+                             "stays in the envelope-theorem-valid regime). "
+                             "Ignored unless --mode cmaes.")
+    parser.add_argument("--cmaes-maxsigma", type=float, default=0.0175,
+                        help="Per-axis upper bound on CMA-ES sigma in radians "
+                             "(default: 0.0175 rad ~= 1.0 deg). Caps cumulative "
+                             "step-size adaptation so sigma cannot inflate the "
+                             "candidate spread beyond the regime where the inner "
+                             "policy is approximately optimal. Pass 0 to disable. "
+                             "Ignored unless --mode cmaes.")
     parser.add_argument("--cmaes-debug", action="store_true",
                         help="Verify CMA-ES candidate determinism across ranks "
                              "via per-iteration all_gather hash check. Off by default.")
