@@ -611,8 +611,9 @@ class CautiousBFGS:
 
     COND_RESET_THRESHOLD = 1e6
 
-    def __init__(self, n_params):
+    def __init__(self, n_params, cautious=True):
         self.n = n_params
+        self.cautious = cautious
         self.H = np.eye(n_params, dtype=np.float64)
         self.prev_grad = None
         self.initialized = False  # first scaling not yet applied
@@ -641,7 +642,10 @@ class CautiousBFGS:
             y = self.prev_grad - grad_new  # negated for ascent→minimization
             sTy = actual_s @ y
 
-            if sTy > 1e-10:
+            # When cautious=False (--ablate-cautious-bfgs), force every update
+            # through regardless of sTy sign. Tests whether the cautious filter
+            # actually prevents Hessian poisoning under SPSA noise.
+            if (not self.cautious) or sTy > 1e-10:
                 # One-time initial scaling (Shanno-Phua): H_0 <- gamma * I
                 # before the very first BFGS update, so the Hessian scale
                 # matches local curvature rather than being identity.
@@ -784,7 +788,8 @@ class InnerLoopController:
                  use_wandb=False, viewer=None, engine=None,
                  video_interval=100, save_interval=100,
                  log_file=None,
-                 is_root=True, device="cuda:0", rank=0):
+                 is_root=True, device="cuda:0", rank=0,
+                 ablate_env_fixed_iters=None):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
@@ -810,6 +815,9 @@ class InnerLoopController:
         self.is_root = is_root
         self.device = device
         self.rank = rank
+        # When set (--ablate-envelope-gate), bypass plateau-based convergence
+        # and run exactly this many inner iters per outer call.
+        self.ablate_env_fixed_iters = ablate_env_fixed_iters
 
         # Codesign convergence: ep_len gate + task_reward plateau AND CoT plateau
         self.ep_len_threshold_frac = ep_len_threshold_frac
@@ -1089,7 +1097,15 @@ class InnerLoopController:
                 # to prevent non-root ranks from reaching the broadcast first
                 # and hanging while root does slow I/O.
                 should_stop = False
-                if self.is_root and inner_iters >= self.min_inner_iters:
+                if self.ablate_env_fixed_iters is not None:
+                    # --ablate-envelope-gate: fixed budget, no plateau check.
+                    # Root decides (matching original "root decides, broadcasts"
+                    # invariant); inner_iters is identical across ranks but the
+                    # decision must remain root-only for future rank-divergent
+                    # logic compatibility.
+                    if self.is_root:
+                        should_stop = (inner_iters >= self.ablate_env_fixed_iters)
+                elif self.is_root and inner_iters >= self.min_inner_iters:
                     if self.convergence_mode == 'codesign':
                         should_stop = (self._ep_len_gate_passed
                                        and self._check_task_plateau()
@@ -2229,7 +2245,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         print("[3/3] Starting GBC outer loop...\n")
 
     theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
-    bfgs = CautiousBFGS(NUM_DESIGN_PARAMS)
+    bfgs = CautiousBFGS(NUM_DESIGN_PARAMS,
+                        cautious=not args.ablate_cautious_bfgs)
     theta_bounds = THETA_BOUNDS
 
     # CMA-ES state (only used when --mode cmaes)
@@ -2248,15 +2265,20 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         # the envelope-theorem-valid regime. With maxstd=0.0175 rad (1 deg) and
         # cond(C) <= ~10 in practice, the dominant-axis candidate spread stays
         # within ~3 deg of the mean — comparable to SPSA's epsilon perturbation.
-        if args.cmaes_maxsigma > 0:
-            cmaes_opts["maxstd"] = [float(args.cmaes_maxsigma)] * NUM_DESIGN_PARAMS
+        # --ablate-trust-region forces uncapped sigma growth.
+        cmaes_maxsigma_eff = 0.0 if args.ablate_trust_region else args.cmaes_maxsigma
+        if cmaes_maxsigma_eff > 0:
+            cmaes_opts["maxstd"] = [float(cmaes_maxsigma_eff)] * NUM_DESIGN_PARAMS
         es = cma.CMAEvolutionStrategy(theta.tolist(), args.cmaes_sigma0, cmaes_opts)
         if is_root:
             print(f"  [CMA-ES] Initialized: popsize={es.popsize}, sigma0={args.cmaes_sigma0:.4f} rad "
                   f"({np.degrees(args.cmaes_sigma0):.2f} deg), seed={args.seed}")
-            if args.cmaes_maxsigma > 0:
-                print(f"  [CMA-ES] maxstd cap:    {args.cmaes_maxsigma:.4f} rad "
-                      f"({np.degrees(args.cmaes_maxsigma):.2f} deg) per axis")
+            if cmaes_maxsigma_eff > 0:
+                print(f"  [CMA-ES] maxstd cap:    {cmaes_maxsigma_eff:.4f} rad "
+                      f"({np.degrees(cmaes_maxsigma_eff):.2f} deg) per axis")
+            elif args.ablate_trust_region:
+                print(f"  [CMA-ES] maxstd cap:    disabled "
+                      f"(forced by --ablate-trust-region)")
             else:
                 print(f"  [CMA-ES] maxstd cap:    disabled (sigma growth uncapped)")
 
@@ -2307,13 +2329,20 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         is_root=is_root,
         device=device,
         rank=rank,
+        ablate_env_fixed_iters=(
+            args.ablate_env_fixed_iters if args.ablate_envelope_gate else None
+        ),
     )
 
     # Skip kickoff ramp when resuming from a checkpoint (the resumed policy
     # was already trained with task reward; re-ramping would destroy it).
     if args.resume_checkpoint:
         inner_ctrl.ramp_completed = True
-        inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
+        # Don't stomp the envelope-ablation override (which uses
+        # ablate_env_fixed_iters as its inner-iter budget regardless of
+        # min_inner_iters).
+        if not args.ablate_envelope_gate:
+            inner_ctrl.min_inner_iters = args.post_kickoff_min_iters
         agent._task_reward_weight = inner_ctrl.ramp_end_task_weight
         agent._disc_reward_weight = inner_ctrl.ramp_end_disc_weight
         if is_root:
@@ -2396,9 +2425,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                   f"{_wpp} worlds/cand/GPU")
             print(f"  CMA-ES sigma0:     {args.cmaes_sigma0} rad "
                   f"({np.degrees(args.cmaes_sigma0):.2f} deg)")
-            if args.cmaes_maxsigma > 0:
-                print(f"  CMA-ES maxsigma:   {args.cmaes_maxsigma} rad "
-                      f"({np.degrees(args.cmaes_maxsigma):.2f} deg) per axis")
+            if cmaes_maxsigma_eff > 0:
+                print(f"  CMA-ES maxsigma:   {cmaes_maxsigma_eff} rad "
+                      f"({np.degrees(cmaes_maxsigma_eff):.2f} deg) per axis")
+            elif args.ablate_trust_region:
+                print(f"  CMA-ES maxsigma:   uncapped "
+                      f"(forced by --ablate-trust-region)")
             else:
                 print(f"  CMA-ES maxsigma:   uncapped")
             print(f"  CMA-ES seeds:      {args.num_spsa_seeds} (paired-seed averaging, "
@@ -2410,6 +2442,18 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  Optimizer mode:    orthogonal SPSA (closed-loop, lstsq reconstruction)")
         else:
             print(f"  Optimizer mode:    CMA-ES (closed-loop population eval, library defaults)")
+
+        if args.ablate_all_spsa_guards:
+            print(f"  [ABLATION] --ablate-all-spsa-guards expanded -> "
+                  f"trust_region+cautious_bfgs disabled, snr_threshold=0, "
+                  f"num_spsa_seeds=1")
+        if args.ablate_trust_region:
+            print(f"  [ABLATION] trust region: DISABLED")
+        if args.ablate_envelope_gate:
+            print(f"  [ABLATION] envelope gate: DISABLED, fixed inner iters="
+                  f"{args.ablate_env_fixed_iters}")
+        if args.ablate_cautious_bfgs:
+            print(f"  [ABLATION] cautious BFGS skip: DISABLED (all updates forced)")
 
     # =========================================================
     # Outer loop
@@ -2462,7 +2506,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         # After kickoff, disable min_inner_iters gate for subsequent iters.
         # Reward weights are now handled by the ramp inside train_until_converged
         # (disc 1.0→0.0, task 0.0→1.0 over ramp_start..ramp_end iters).
-        if outer_iter == 0 and inner_ctrl.min_inner_iters > 0:
+        # Skipped under --ablate-envelope-gate: that override drives stop via
+        # ablate_env_fixed_iters and ignores min_inner_iters entirely.
+        if (outer_iter == 0 and inner_ctrl.min_inner_iters > 0
+                and not args.ablate_envelope_gate):
             if is_root:
                 print(f"  [Kickoff] Disabling min_inner_iters "
                       f"({inner_ctrl.min_inner_iters}) for subsequent iters")
@@ -2536,8 +2583,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 history["gradients"].append(grad_theta.copy())
                 history["grad_snr"].append(grad_snr.copy())
 
-                # ----- Adaptive trust region ratio test (1b) -----
-                # Match SPSA reward formula so trust-region ratio is consistent.
+                # Match SPSA reward formula. center_reward is consumed by the
+                # outer convergence check (reward_history) and wandb logging
+                # downstream, so it is computed unconditionally.
                 center_reward = (
                     args.outer_task_weight * (
                         -5.0 * cot
@@ -2546,24 +2594,29 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     )
                     + args.outer_disc_weight * disc_center
                 )
-                if prev_center_reward is not None and predicted_improvement is not None:
-                    actual_improvement = center_reward - prev_center_reward
-                    if abs(predicted_improvement) > 1e-12:
-                        rho = actual_improvement / predicted_improvement
-                    else:
-                        rho = 0.0
+                # ----- Adaptive trust region ratio test (1b) -----
+                # Skipped under --ablate-trust-region: rho/predicted_improvement
+                # are dead state in that mode, and trust_radius isn't read at
+                # the step clip site (also gated below).
+                if not args.ablate_trust_region:
+                    if prev_center_reward is not None and predicted_improvement is not None:
+                        actual_improvement = center_reward - prev_center_reward
+                        if abs(predicted_improvement) > 1e-12:
+                            rho = actual_improvement / predicted_improvement
+                        else:
+                            rho = 0.0
 
-                    if rho > 0.75:
-                        trust_radius = min(trust_radius * 1.5, TRUST_RADIUS_MAX)
-                    elif rho < 0.25:
-                        trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
+                        if rho > 0.75:
+                            trust_radius = min(trust_radius * 1.5, TRUST_RADIUS_MAX)
+                        elif rho < 0.25:
+                            trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
 
-                    print(f"    [Trust Region] rho={rho:.3f}, "
-                          f"actual={actual_improvement:+.6f}, "
-                          f"predicted={predicted_improvement:+.6f}, "
-                          f"radius={np.degrees(trust_radius):.3f} deg")
+                        print(f"    [Trust Region] rho={rho:.3f}, "
+                              f"actual={actual_improvement:+.6f}, "
+                              f"predicted={predicted_improvement:+.6f}, "
+                              f"radius={np.degrees(trust_radius):.3f} deg")
 
-                prev_center_reward = center_reward
+                    prev_center_reward = center_reward
 
                 # ----- Design Update (rank 0 only) -----
                 n_clamped = 0
@@ -2603,14 +2656,21 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         direction = bfgs.compute_direction(grad_theta)
                         step = args.design_lr * direction
 
-                        # Adaptive trust-region clamp (1b)
-                        max_step_rad = trust_radius
-                        raw_step = step.copy()
-                        step = np.clip(step, -max_step_rad, max_step_rad)
-                        n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
-                        if n_clamped > 0:
-                            print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
-                                  f"params to +/-{np.degrees(max_step_rad):.3f} deg")
+                        # Adaptive trust-region clamp (1b). Skipped under
+                        # --ablate-trust-region; raw_step/n_clamped are still
+                        # populated so the [Trust region] print path stays
+                        # well-defined (just always reports 0 clamped).
+                        if not args.ablate_trust_region:
+                            max_step_rad = trust_radius
+                            raw_step = step.copy()
+                            step = np.clip(step, -max_step_rad, max_step_rad)
+                            n_clamped = np.sum(np.abs(raw_step) > max_step_rad)
+                            if n_clamped > 0:
+                                print(f"    [Trust region] Clamped {n_clamped}/{NUM_DESIGN_PARAMS} "
+                                      f"params to +/-{np.degrees(max_step_rad):.3f} deg")
+                        else:
+                            raw_step = step.copy()
+                            n_clamped = 0
 
                         theta = old_theta + step
                         theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
@@ -2621,8 +2681,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         # prev_grad reflects the true gradient for y-vector
                         bfgs.update(actual_s, grad_theta_raw)
 
-                        # Predicted improvement for next iteration's ratio test (1b)
-                        predicted_improvement = grad_theta_raw @ actual_s
+                        # Predicted improvement for next iteration's ratio test (1b).
+                        # Dead state when trust region is ablated.
+                        if not args.ablate_trust_region:
+                            predicted_improvement = grad_theta_raw @ actual_s
 
                         print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
                               f"{bfgs.num_skipped} skipped):")
@@ -3123,6 +3185,42 @@ if __name__ == "__main__":
                              "is the fraction of completed episodes ending in "
                              "DoneFlags.FAIL. Default -10.0 mirrors the inner "
                              "TERM_PENALTY constant. Set 0 to disable.")
+    parser.add_argument("--ablate-trust-region", action="store_true",
+                        help="ABLATION: disable outer-loop step-size guards. "
+                             "SPSA: skip adaptive radius rho test and per-iter "
+                             "step clip. CMA-ES: drop maxstd cap. Hard +/-30 "
+                             "deg theta bounds and |grad|<=10 per-component "
+                             "clip stay (numeric/physical safety, not trust "
+                             "region). sigma0 left at user value (initial "
+                             "condition).")
+    parser.add_argument("--ablate-envelope-gate", action="store_true",
+                        help="ABLATION: bypass plateau-based inner convergence "
+                             "so policy is NOT trained to near-optimality "
+                             "before each outer step. Combine with "
+                             "--ablate-env-fixed-iters to set the fixed inner "
+                             "budget per outer call.")
+    parser.add_argument("--ablate-env-fixed-iters", type=int, default=200,
+                        help="When --ablate-envelope-gate is set, run exactly "
+                             "this many inner iters per outer call. Must be "
+                             ">= --ramp-end-iter (default 2500) so the "
+                             "AMP->task ramp completes; argparse errors out "
+                             "otherwise. Default 200.")
+    parser.add_argument("--ablate-cautious-bfgs", action="store_true",
+                        help="ABLATION: disable the cautious-skip filter in "
+                             "BFGS update (sTy>0 check). Every update goes "
+                             "through even when SPSA noise makes sTy<=0; "
+                             "tests whether the filter prevents Hessian "
+                             "poisoning. Condition-number reset (cond>1e6) "
+                             "is kept (numeric safety, not noise guard). "
+                             "SPSA-only.")
+    parser.add_argument("--ablate-all-spsa-guards", action="store_true",
+                        help="ABLATION SHORTCUT: enables --ablate-trust-region, "
+                             "--ablate-cautious-bfgs, forces --snr-threshold=0, "
+                             "and forces --num-spsa-seeds=1. Does NOT touch "
+                             "--ablate-envelope-gate (orthogonal concern). "
+                             "For 'is the whole SPSA noise-robustness stack "
+                             "needed?' runs. In CMA-ES mode only the trust-"
+                             "region piece (sigma cap) takes effect.")
     parser.add_argument("--no-video", action="store_true",
                         help="Disable headless viewer (use on HPC nodes without EGL)")
     parser.add_argument("--video-interval", type=int, default=100,
@@ -3137,6 +3235,24 @@ if __name__ == "__main__":
                         help="torch.distributed backend "
                              "(try 'gloo' if nccl hangs, 'auto' for platform default)")
     args = parser.parse_args()
+
+    # Expand --ablate-all-spsa-guards into its components BEFORE downstream
+    # validation and code paths so they see fully-resolved flags (no "is
+    # shortcut set?" branches scattered around).
+    if args.ablate_all_spsa_guards:
+        args.ablate_trust_region = True
+        args.ablate_cautious_bfgs = True
+        args.snr_threshold = 0.0
+        args.num_spsa_seeds = 1
+
+    if args.ablate_envelope_gate and args.ablate_env_fixed_iters < args.ramp_end_iter:
+        parser.error(
+            f"--ablate-env-fixed-iters ({args.ablate_env_fixed_iters}) must "
+            f"be >= --ramp-end-iter ({args.ramp_end_iter}) so the AMP->task "
+            f"ramp completes within the fixed inner budget; envelope "
+            f"diagnostic is gated on ramp_completed and would never fire "
+            f"otherwise."
+        )
 
     # Resolve design-parameter scope from CLI flag. The three functions that
     # iterate over the design groups (extract_joint_info,
