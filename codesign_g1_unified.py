@@ -3245,13 +3245,17 @@ if __name__ == "__main__":
         args.snr_threshold = 0.0
         args.num_spsa_seeds = 1
 
-    if args.ablate_envelope_gate and args.ablate_env_fixed_iters < args.ramp_end_iter:
+    if (args.ablate_envelope_gate
+            and args.ablate_env_fixed_iters < args.ramp_end_iter
+            and not args.resume_checkpoint):
         parser.error(
             f"--ablate-env-fixed-iters ({args.ablate_env_fixed_iters}) must "
             f"be >= --ramp-end-iter ({args.ramp_end_iter}) so the AMP->task "
             f"ramp completes within the fixed inner budget; envelope "
             f"diagnostic is gated on ramp_completed and would never fire "
-            f"otherwise."
+            f"otherwise. (Skipped when --resume-checkpoint is set: ramp_completed "
+            f"is force-set True at line 2340 on resume, so the inner budget "
+            f"need not cover the ramp.)"
         )
 
     # Resolve design-parameter scope from CLI flag. The three functions that
