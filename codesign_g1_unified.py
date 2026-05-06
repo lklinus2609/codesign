@@ -680,6 +680,24 @@ class CautiousBFGS:
 
         self.prev_grad = grad_new.copy()
 
+    def mask_axis(self, idx):
+        """Soft-drop axis `idx` from the BFGS update.
+
+        Zero row `idx` and col `idx` of H, set H[idx, idx] = 1.0, and zero
+        prev_grad[idx]. Idempotent.
+
+        After masking, the BFGS update on a step with s[idx] = 0 and y[idx] = 0
+        leaves the identity entry in slot (idx, idx) unchanged, and
+        compute_direction = H @ grad with grad[idx] = 0 yields a zero step
+        component on that axis. Curvature on the active sub-block evolves
+        unaffected.
+        """
+        self.H[idx, :] = 0.0
+        self.H[:, idx] = 0.0
+        self.H[idx, idx] = 1.0
+        if self.prev_grad is not None:
+            self.prev_grad[idx] = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Joint info extraction + in-place update
@@ -1319,29 +1337,46 @@ def apply_population_morphologies(model, candidates, base_quats_dict,
     wp.synchronize()
 
 
-def generate_orthogonal_directions(n_params, num_sets, seed):
+def generate_orthogonal_directions(n_params, num_sets, seed, active_mask=None):
     """Generate S orthogonal bases as perturbation directions.
 
-    Returns an (S*N, N) matrix where each block of N rows is a
-    Haar-random orthogonal matrix (via QR of Gaussian).  Rows are
-    unit vectors, so eps scaling gives consistent perturbation magnitude.
+    Returns an (S*k, N) matrix where k = number of active params (= N when
+    active_mask is None / all-True). Each block of k rows is a Haar-random
+    orthogonal matrix in the active subspace, embedded into N-dim space with
+    zero columns on inactive axes. Rows have unit norm in the active subspace.
 
     Args:
-        n_params: N, number of design parameters (6)
+        n_params: N, total number of design parameters
         num_sets: S, number of orthogonal basis sets
         seed: RNG seed (should vary per outer iteration)
+        active_mask: optional (N,) bool array. None or all-True → return
+                     (S*N, N). Otherwise generate (S*k, N) with zeros on
+                     inactive columns. Caller must ensure k > 0.
 
     Returns:
-        directions: (S*N, N) numpy array of perturbation directions
+        directions: (S*k, N) numpy array of perturbation directions
     """
     rng = np.random.RandomState(seed)
+    if active_mask is None or bool(active_mask.all()):
+        blocks = []
+        for _ in range(num_sets):
+            A = rng.standard_normal((n_params, n_params))
+            Q, R = np.linalg.qr(A)
+            Q *= np.sign(np.diag(R))  # Haar-uniform over O(N)
+            blocks.append(Q)
+        return np.vstack(blocks)  # (S*N, N)
+
+    k = int(active_mask.sum())
+    assert k > 0, "generate_orthogonal_directions called with all-False mask"
     blocks = []
     for _ in range(num_sets):
-        A = rng.standard_normal((n_params, n_params))
+        A = rng.standard_normal((k, k))
         Q, R = np.linalg.qr(A)
-        Q *= np.sign(np.diag(R))  # Haar-uniform over O(N)
-        blocks.append(Q)
-    return np.vstack(blocks)  # (S*N, N)
+        Q *= np.sign(np.diag(R))  # Haar-uniform over O(k), shape (k, k)
+        block = np.zeros((k, n_params), dtype=Q.dtype)
+        block[:, active_mask] = Q
+        blocks.append(block)
+    return np.vstack(blocks)  # (S*k, N)
 
 
 def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
@@ -1355,13 +1390,16 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
                                   outer_task_weight=1.0,
                                   outer_disc_weight=0.0,
                                   outer_term_penalty=-10.0,
-                                  eval_disc_reward=False):
+                                  eval_disc_reward=False,
+                                  active_mask=None):
     """Compute closed-loop gradient with orthogonal SPSA world-partitioned perturbations.
 
-    Generates S random orthogonal bases (S*N directions total), partitions
-    worlds into 1+2*S*N groups — each running a different morphology
-    simultaneously. The seed loop (K iterations) remains sequential.
-    Gradient reconstructed via least-squares solve per seed.
+    Generates S random orthogonal bases (S*k directions total, where k =
+    number of active params), partitions worlds into 1+2*S*k groups — each
+    running a different morphology simultaneously. The seed loop (K iterations)
+    remains sequential. Gradient reconstructed via least-squares solve per
+    seed in the active subspace, then padded to N-dim with zeros on inactive
+    axes.
 
     Cost function matches inner loop blended reward (post-AMP-ramp):
         reward = outer_task_weight * (
@@ -1381,10 +1419,19 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     n_params = len(theta_np)
     assert num_spsa_sets >= 1, f"num_spsa_sets must be >= 1, got {num_spsa_sets}"
 
-    # Generate orthogonal perturbation directions (deterministic across ranks)
+    # Active mask: which axes are still being optimized? None = all active.
+    if active_mask is None:
+        active_mask = np.ones(n_params, dtype=bool)
+    n_active = int(active_mask.sum())
+    assert n_active > 0, "compute_spsa_gradient_parallel called with no active axes"
+
+    # Generate orthogonal perturbation directions (deterministic across ranks).
+    # When axes are dropped, basis is generated in the (n_active)-dim subspace
+    # and embedded back to (S*n_active, N) with zero columns on inactive axes.
     directions = generate_orthogonal_directions(n_params, num_spsa_sets,
-                                                 seed=base_seed + 9999)
-    M = directions.shape[0]  # S*N total directions
+                                                 seed=base_seed + 9999,
+                                                 active_mask=active_mask)
+    M = directions.shape[0]  # S*n_active total directions
     n_pert = 1 + 2 * M
     wpp = num_worlds // n_pert  # worlds per perturbation
     assert num_worlds >= n_pert, (
@@ -1392,7 +1439,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
         f"(M={M} directions), got {num_worlds}")
 
     if rank == 0:
-        print(f"    [SPSA] {num_spsa_sets} orthogonal sets x {n_params} params "
+        active_str = (f"{n_active}/{n_params}"
+                      if n_active < n_params else f"{n_params}")
+        print(f"    [SPSA] {num_spsa_sets} orthogonal sets x {active_str} active params "
               f"= {M} directions, n_pert={n_pert}, "
               f"{wpp} worlds/perturbation ({num_worlds} total), "
               f"{num_procs} GPU(s), {num_seeds} seeds")
@@ -1566,6 +1615,9 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
     )  # (n_pert, num_seeds)
 
     # Per-seed: compute directional finite differences, then solve for gradient
+    # in the active subspace (n_active-dim). Restrict directions to active
+    # columns so lstsq is well-conditioned even when columns are dropped.
+    directions_active = directions[:, active_mask]  # (M, n_active)
     grad_per_seed = []
     for k in range(num_seeds):
         dJ = np.array([
@@ -1577,21 +1629,27 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
         if np.any(np.isnan(dJ)):
             continue
 
-        # Solve: directions @ grad_k = dJ  (M equations, N unknowns, M >= N)
-        grad_k, _, _, _ = np.linalg.lstsq(directions, dJ, rcond=None)
-        grad_per_seed.append(grad_k)
+        # Solve in active subspace: directions_active @ grad_k_active = dJ
+        # (M equations, n_active unknowns, M >= n_active by construction)
+        grad_k_active, _, _, _ = np.linalg.lstsq(directions_active, dJ, rcond=None)
+        grad_per_seed.append(grad_k_active)
 
     if len(grad_per_seed) == 0:
         # All seeds produced NaN — degenerate
         grad = np.zeros(n_params, dtype=np.float64)
         grad_stderr = np.full(n_params, float('inf'), dtype=np.float64)
     else:
-        grad_samples = np.stack(grad_per_seed)  # (K_valid, N)
-        grad = grad_samples.mean(axis=0)
+        grad_samples = np.stack(grad_per_seed)  # (K_valid, n_active)
+        grad_active_mean = grad_samples.mean(axis=0)
+        # Pad to N-dim with zeros on inactive axes
+        grad = np.zeros(n_params, dtype=np.float64)
+        grad[active_mask] = grad_active_mean
+        grad_stderr = np.zeros(n_params, dtype=np.float64)  # 0 on inactive
         if len(grad_per_seed) > 1:
-            grad_stderr = grad_samples.std(axis=0, ddof=1) / np.sqrt(len(grad_per_seed))
+            stderr_active = grad_samples.std(axis=0, ddof=1) / np.sqrt(len(grad_per_seed))
+            grad_stderr[active_mask] = stderr_active
         else:
-            grad_stderr = np.full(n_params, float('inf'), dtype=np.float64)
+            grad_stderr[active_mask] = float('inf')
 
     # Per-parameter SNR: |gradient| / standard_error (computed before clipping)
     snr = np.zeros(n_params, dtype=np.float64)
@@ -2365,6 +2423,35 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         TRUST_RADIUS_MAX = np.radians(5.0)
         prev_center_reward = None
         predicted_improvement = None
+
+    # Soft-drop state (SPSA-only). active_mask is created always-True for both
+    # modes so downstream code (saves, broadcasts) is uniform; CMA-ES never
+    # mutates it. Only --mode spsa consults snr_history / dropped_iters.
+    active_mask = np.ones(NUM_DESIGN_PARAMS, dtype=bool)
+    snr_history = deque(maxlen=max(args.drop_window, 1))
+    dropped_iters = {}                  # {axis_idx: outer_iter when dropped}
+    morphology_converged_flag = False   # set True when all axes drop
+
+    if args.mode == "spsa" and args.resume_mask is not None:
+        loaded_mask = np.load(args.resume_mask)
+        assert loaded_mask.shape == (NUM_DESIGN_PARAMS,), (
+            f"--resume-mask shape {loaded_mask.shape} does not match "
+            f"NUM_DESIGN_PARAMS ({NUM_DESIGN_PARAMS},)"
+        )
+        active_mask = loaded_mask.astype(bool)
+        # Make BFGS Hessian consistent with the loaded mask: pre-drop axes
+        # in BFGS state so subsequent updates respect the reduced subspace.
+        for _i in range(NUM_DESIGN_PARAMS):
+            if not active_mask[_i]:
+                bfgs.mask_axis(_i)
+                dropped_iters[_i] = -1   # sentinel: pre-dropped from prior run
+        if is_root:
+            n_active = int(active_mask.sum())
+            dropped_names = [param_names[_i] for _i in range(NUM_DESIGN_PARAMS)
+                             if not active_mask[_i]]
+            print(f"  [Resume mask] {n_active}/{NUM_DESIGN_PARAMS} active. "
+                  f"Pre-dropped: {dropped_names}")
+
     # Outer-convergence histories (used by both modes)
     reward_history = deque(maxlen=5)
     cot_history = deque(maxlen=args.outer_cot_plateau_window)
@@ -2415,7 +2502,16 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  SPSA epsilon:      {args.spsa_epsilon} rad "
                   f"({np.degrees(args.spsa_epsilon):.1f} deg)")
             if args.snr_threshold > 0:
-                print(f"  SNR threshold:     {args.snr_threshold}")
+                if args.ablate_soft_drop:
+                    print(f"  SNR threshold:     {args.snr_threshold} "
+                          f"(per-iter mask only — soft-drop ablated)")
+                else:
+                    print(f"  SNR threshold:     {args.snr_threshold} "
+                          f"(per-iter mask + soft-drop after W={args.drop_window} iters)")
+            else:
+                print(f"  SNR threshold:     0 (per-iter mask + soft-drop disabled)")
+            if args.resume_mask:
+                print(f"  Resume mask:       {args.resume_mask}")
         else:  # cmaes
             print(f"  Outer convergence: reward {args.outer_reward_plateau_pct:.3%} AND cot "
                   f"{args.outer_cot_plateau_pct:.3%} (window={args.outer_cot_plateau_window}) "
@@ -2454,6 +2550,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                   f"{args.ablate_env_fixed_iters}")
         if args.ablate_cautious_bfgs:
             print(f"  [ABLATION] cautious BFGS skip: DISABLED (all updates forced)")
+        if args.ablate_soft_drop and args.mode == "spsa":
+            print(f"  [ABLATION] soft-drop: DISABLED (per-iter SNR mask still active)")
 
     # =========================================================
     # Outer loop
@@ -2564,6 +2662,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     outer_disc_weight=args.outer_disc_weight,
                     outer_term_penalty=args.outer_term_penalty,
                     eval_disc_reward=eval_disc_in_outer,
+                    active_mask=active_mask,
                 )
 
             # Clear CoT tracker after eval
@@ -2628,6 +2727,52 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     theta[:] = np.nan
                     predicted_improvement = None
                 else:
+                    # ----- Soft-drop decision (SPSA-only, rank 0) -----
+                    # Append per-axis SNR to history and check whether any
+                    # currently-active axis has been chronically low-SNR
+                    # (median over W=drop_window iters < snr_threshold). If
+                    # so, permanently drop it from future SPSA evals: zero
+                    # its gradient components everywhere, mask its row/col
+                    # in BFGS (preserves curvature on remaining axes), and
+                    # log the event. Skipped under --ablate-soft-drop.
+                    newly_dropped = []
+                    snr_history.append(grad_snr.copy())
+                    if (args.mode == "spsa"
+                            and not args.ablate_soft_drop
+                            and args.snr_threshold > 0
+                            and len(snr_history) >= args.drop_window):
+                        snr_stack = np.stack(list(snr_history))   # (W, N)
+                        # inf SNR (single-seed or zero stderr) is "definitely
+                        # above threshold" — treat as inf for median.
+                        snr_stack_finite = np.where(
+                            np.isfinite(snr_stack), snr_stack, np.inf
+                        )
+                        median_snr = np.nanmedian(snr_stack_finite, axis=0)  # (N,)
+                        for _i in range(NUM_DESIGN_PARAMS):
+                            if active_mask[_i] and median_snr[_i] < args.snr_threshold:
+                                active_mask[_i] = False
+                                dropped_iters[_i] = outer_iter
+                                bfgs.mask_axis(_i)
+                                newly_dropped.append(_i)
+                                print(f"    [Soft-drop] {param_names[_i]}: median SNR "
+                                      f"{median_snr[_i]:.3f} < {args.snr_threshold} "
+                                      f"over W={args.drop_window} iters -> DROPPED")
+                        if newly_dropped:
+                            print(f"    [Soft-drop] {int(active_mask.sum())}/"
+                                  f"{NUM_DESIGN_PARAMS} axes remain active")
+
+                    # Safety termination: all axes dropped -> morphology converged.
+                    # Don't break here — fall through, let the existing skip-update
+                    # path zero out the design step, and let the convergence check
+                    # at the bottom of the outer loop carry the converged flag to
+                    # all ranks via the existing broadcast.
+                    if args.mode == "spsa" and not active_mask.any():
+                        morphology_converged_flag = True
+                        print(f"\n  MORPHOLOGY CONVERGED: all {NUM_DESIGN_PARAMS} "
+                              f"axes dropped (median SNR < {args.snr_threshold} "
+                              f"over W={args.drop_window} iters). No remaining "
+                              f"design DOFs to optimize.")
+
                     # Save raw gradient before SNR masking (Bug B fix: BFGS
                     # must receive the true gradient for correct y-vector)
                     grad_theta_raw = grad_theta.copy()
@@ -2800,6 +2945,15 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             theta_tensor = mp_util.broadcast(theta_tensor)
         theta = theta_tensor.cpu().double().numpy()
 
+        # ----- Broadcast active_mask to all ranks (SPSA only) -----
+        # Soft-drop decision is rank-0-authoritative; non-root ranks need the
+        # updated mask before the next SPSA eval so partition layouts stay in
+        # lockstep across ranks. CMA-ES path: active_mask never mutates.
+        if args.mode == "spsa" and mp_util.enable_mp():
+            mask_tensor = torch.from_numpy(active_mask.astype(np.uint8)).to(device)
+            mask_tensor = mp_util.broadcast(mask_tensor)
+            active_mask = mask_tensor.cpu().numpy().astype(bool)
+
         # Check for NaN signal (degenerate gradient on root)
         if np.any(np.isnan(theta)):
             break
@@ -2822,7 +2976,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         # Broadcast BEFORE root-only saves to prevent non-root ranks from
         # reaching the broadcast first and hanging while root does slow I/O.
-        outer_converged = False
+        # Soft-drop safety termination: morphology_converged_flag was set in the
+        # SPSA branch when all axes drop. Carry it into outer_converged so the
+        # broadcast-and-break path below fires uniformly across ranks.
+        outer_converged = bool(morphology_converged_flag)
         reward_range_rel = 0.0
         reward_plateau = False
         cot_range_rel = 0.0
@@ -2898,6 +3055,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             np.save(str(iter_dir / "theta.npy"), theta)
             if args.mode == "spsa":
                 np.save(str(iter_dir / "grad.npy"), grad_theta)
+                np.save(str(iter_dir / "active_mask.npy"), active_mask)
+                np.save(str(out_dir / "active_mask_latest.npy"), active_mask)
 
             if use_wandb:
                 log_dict = {
@@ -2948,6 +3107,11 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         "outer/bfgs_num_updates": bfgs.num_updates,
                         "outer/bfgs_num_skipped": bfgs.num_skipped,
                         "outer/bfgs_skip_rate": bfgs_skip_rate,
+                        # Soft-drop metrics
+                        "outer/n_active_params": int(active_mask.sum()),
+                        "outer/n_dropped_params": int((~active_mask).sum()),
+                        "outer/morphology_converged": int(morphology_converged_flag),
+                        "outer/n_drop_event": len(newly_dropped),
                     })
                     for i, name in enumerate(param_names):
                         log_dict[f"outer/grad_{name}"] = grad_theta[i]
@@ -2955,6 +3119,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         log_dict[f"outer/snr_{name}"] = (
                             float(snr_val) if np.isfinite(snr_val) else float("nan")
                         )
+                        log_dict[f"outer/active_axis_{name}"] = int(active_mask[i])
+                        if i in dropped_iters:
+                            # Sticky: log the iter at which axis i was dropped
+                            log_dict[f"outer/dropped_at_iter_{name}"] = dropped_iters[i]
                 else:  # cmaes
                     log_dict.update({
                         "outer/cmaes_sigma": float(es.sigma),
@@ -2972,6 +3140,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 wandb.save(str(iter_dir / "theta.npy"), base_path=str(out_dir))
                 if args.mode == "spsa":
                     wandb.save(str(iter_dir / "grad.npy"), base_path=str(out_dir))
+                    wandb.save(str(iter_dir / "active_mask.npy"), base_path=str(out_dir))
                 wandb.save(str(out_dir / "theta_latest.npy"), base_path=str(out_dir))
 
         if outer_converged:
@@ -3072,9 +3241,22 @@ if __name__ == "__main__":
     parser.add_argument("--spsa-sets", type=int, default=3,
                         help="Number of orthogonal basis sets S for SPSA gradient "
                              "(M=S*N directions, n_pert=1+2*S*N). Default: 3")
-    parser.add_argument("--snr-threshold", type=float, default=0.0,
-                        help="SNR gating threshold (0=disabled). Mask gradient components "
-                             "where SNR < threshold before BFGS update. Recommended: 2.0")
+    parser.add_argument("--snr-threshold", type=float, default=2.0,
+                        help="SNR gating threshold. Drives both per-iter SNR mask AND "
+                             "soft-drop trigger (axis dropped when median SNR over the "
+                             "last --drop-window iters falls below this). Set to 0 to "
+                             "disable both. SPSA-only. Default: 2.0")
+    parser.add_argument("--drop-window", type=int, default=3,
+                        help="Window W for soft-drop median SNR check. An axis is "
+                             "permanently dropped from SPSA evaluation when median "
+                             "SNR over the last W per-axis evaluations is below "
+                             "--snr-threshold. Set very high to effectively disable "
+                             "drop while keeping the per-iter mask. SPSA-only. Default: 3")
+    parser.add_argument("--resume-mask", type=str, default=None,
+                        help="Path to active_mask.npy from a prior run. When set, "
+                             "the soft-drop mask is loaded at outer-loop start so "
+                             "SPSA evals begin in the reduced subspace from iter 0. "
+                             "Independent of --resume-checkpoint. SPSA-only. Default: None")
     parser.add_argument("--max-step-deg", type=float, default=0.5,
                         help="Max per-parameter step size in degrees per outer iteration. "
                              "Ensures policy stability across morphology updates. Default: 0.5")
@@ -3213,6 +3395,12 @@ if __name__ == "__main__":
                              "poisoning. Condition-number reset (cond>1e6) "
                              "is kept (numeric safety, not noise guard). "
                              "SPSA-only.")
+    parser.add_argument("--ablate-soft-drop", action="store_true",
+                        help="ABLATION: disable permanent soft-drop of low-SNR "
+                             "axes, but keep the per-iter SNR mask active. "
+                             "Lets you A/B against drop while preserving "
+                             "threshold-based zeroing of low-confidence "
+                             "gradient components. SPSA-only.")
     parser.add_argument("--ablate-all-spsa-guards", action="store_true",
                         help="ABLATION SHORTCUT: enables --ablate-trust-region, "
                              "--ablate-cautious-bfgs, forces --snr-threshold=0, "
