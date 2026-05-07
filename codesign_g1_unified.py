@@ -699,6 +699,85 @@ class CautiousBFGS:
             self.prev_grad[idx] = 0.0
 
 
+class AdamOuter:
+    """Adam outer optimizer for SPSA design gradient (ASCENT semantics).
+
+    Per-axis adaptive scaling + momentum smoothing. Better-suited than BFGS
+    to the noisy bilevel setting where the quadratic-landscape assumption
+    fails (BFGS skip rate observed at 100% post-Fix-A across multiple runs).
+    Uses ASCENT semantics: step direction is +grad (smoothed by m, scaled by
+    1/sqrt(v)), NOT -grad.
+
+    API contract matches CautiousBFGS for drop-in interchange:
+      - compute_step(grad) -> unclipped, lr-scaled step ready for trust clip
+      - update(actual_s, grad_new) -> no-op (gradient folded into m/v inside
+        compute_step; no use for actual_s)
+      - mask_axis(idx) -> zero m[idx] and v[idx] (soft-drop integration)
+
+    Hyperparameters default to lr=0.05 (radians), beta1=0.9, beta2=0.999,
+    eps=1e-8. lr=0.05 chosen so pre-clip step magnitudes are comparable to
+    BFGS pre-clip steps under typical SPSA gradients (||grad|| ~ 0.2-0.5);
+    the trust-region clip at --max-step-deg typically dominates.
+    """
+
+    def __init__(self, n_params, lr=0.05, beta1=0.9, beta2=0.999, eps=1e-8):
+        self.n = n_params
+        self.lr = lr
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.eps = eps
+        self.m = np.zeros(n_params, dtype=np.float64)   # first moment
+        self.v = np.zeros(n_params, dtype=np.float64)   # second moment
+        self.t = 0
+        # Mirror BFGS counters so log-key shape stays uniform across optimizers
+        self.num_updates = 0
+        self.num_skipped = 0   # always 0 -- Adam has no skip semantics
+        # Diagnostics for wandb / banner
+        self.last_step_norm = 0.0
+        self.last_m_norm = 0.0
+        self.last_v_norm = 0.0
+
+    def compute_step(self, grad):
+        """Return the unclipped Adam step (already lr-scaled).
+
+        ASCENT: step is in direction of grad (smoothed by m, scaled per-axis
+        by 1/sqrt(v)). Caller applies trust-region clip + bounds clip.
+        """
+        self.t += 1
+        self.m = self.beta1 * self.m + (1.0 - self.beta1) * grad
+        self.v = self.beta2 * self.v + (1.0 - self.beta2) * (grad * grad)
+        m_hat = self.m / (1.0 - self.beta1 ** self.t)
+        v_hat = self.v / (1.0 - self.beta2 ** self.t)
+        # ASCENT: + sign (we maximize reward). Standard Adam minimization
+        # would have - sign; sign flip mirrors gradient-ascent vs descent.
+        step = self.lr * m_hat / (np.sqrt(v_hat) + self.eps)
+        # Stash diagnostics
+        self.last_step_norm = float(np.linalg.norm(step))
+        self.last_m_norm = float(np.linalg.norm(self.m))
+        self.last_v_norm = float(np.linalg.norm(np.sqrt(self.v)))
+        self.num_updates += 1
+        return step
+
+    def update(self, actual_s, grad_new):
+        """No-op. Adam folds the gradient into m/v inside compute_step, so it
+        has no use for actual_s (the post-clip step). Method exists so the
+        outer-loop call site is uniform across optimizer kinds (BFGS uses
+        actual_s for its rank-2 Hessian update; Adam doesn't need it)."""
+        pass
+
+    def mask_axis(self, idx):
+        """Soft-drop axis idx: zero its first and second moments.
+
+        Prevents stale momentum from nudging the dropped axis after future
+        gradients on it are zeroed by the SNR mask. Idempotent.
+
+        Note: do NOT reset self.t -- bias correction is global; resetting
+        would alter every other axis's effective step size.
+        """
+        self.m[idx] = 0.0
+        self.v[idx] = 0.0
+
+
 # ---------------------------------------------------------------------------
 # Joint info extraction + in-place update
 # ---------------------------------------------------------------------------
@@ -2468,8 +2547,19 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         print("[3/3] Starting GBC outer loop...\n")
 
     theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
-    bfgs = CautiousBFGS(NUM_DESIGN_PARAMS,
-                        cautious=not args.ablate_cautious_bfgs)
+    if args.design_optimizer == "bfgs":
+        design_opt = CautiousBFGS(NUM_DESIGN_PARAMS,
+                                  cautious=not args.ablate_cautious_bfgs)
+    else:  # adam
+        design_opt = AdamOuter(NUM_DESIGN_PARAMS,
+                               lr=args.adam_lr,
+                               beta1=args.adam_beta1,
+                               beta2=args.adam_beta2,
+                               eps=args.adam_eps)
+        if is_root and args.ablate_cautious_bfgs:
+            print(f"  [WARN] --ablate-cautious-bfgs has no effect under "
+                  f"--design-optimizer adam (Adam has no curvature filter); "
+                  f"flag is ignored.")
     theta_bounds = THETA_BOUNDS
 
     # CMA-ES state (only used when --mode cmaes)
@@ -2604,11 +2694,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             f"NUM_DESIGN_PARAMS ({NUM_DESIGN_PARAMS},)"
         )
         active_mask = loaded_mask.astype(bool)
-        # Make BFGS Hessian consistent with the loaded mask: pre-drop axes
-        # in BFGS state so subsequent updates respect the reduced subspace.
+        # Make optimizer state consistent with the loaded mask: pre-drop axes
+        # so subsequent updates respect the reduced subspace. Both BFGS and
+        # Adam expose mask_axis (zero row/col vs zero m/v).
         for _i in range(NUM_DESIGN_PARAMS):
             if not active_mask[_i]:
-                bfgs.mask_axis(_i)
+                design_opt.mask_axis(_i)
                 dropped_iters[_i] = -1   # sentinel: pre-dropped from prior run
         if is_root:
             n_active = int(active_mask.sum())
@@ -2629,7 +2720,14 @@ def gbc_worker(rank, num_procs, device, master_port, args):
               f"({args.eval_horizon / 30:.1f}s)")
         print(f"  Max inner iters:   {args.max_inner_iters}")
         if args.mode == "spsa":
-            print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, lr={args.design_lr})")
+            if args.design_optimizer == "bfgs":
+                cautious_str = "True" if not args.ablate_cautious_bfgs else "False"
+                print(f"  Design optimizer:  Cautious BFGS (n={NUM_DESIGN_PARAMS}, "
+                      f"lr={args.design_lr}, cautious={cautious_str})")
+            else:  # adam
+                print(f"  Design optimizer:  Adam (n={NUM_DESIGN_PARAMS}, "
+                      f"lr={args.adam_lr}, beta1={args.adam_beta1}, "
+                      f"beta2={args.adam_beta2}, eps={args.adam_eps})")
             print(f"  Max step size:     {args.max_step_deg} deg/iter initial "
                   f"(adaptive trust region, floor={np.degrees(TRUST_RADIUS_MIN):.2f} deg, "
                   f"ceil={np.degrees(TRUST_RADIUS_MAX):.1f} deg)")
@@ -2722,7 +2820,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         if args.ablate_envelope_gate:
             print(f"  [ABLATION] envelope gate: DISABLED, fixed inner iters="
                   f"{args.ablate_env_fixed_iters}")
-        if args.ablate_cautious_bfgs:
+        if args.ablate_cautious_bfgs and args.design_optimizer == "bfgs":
             print(f"  [ABLATION] cautious BFGS skip: DISABLED (all updates forced)")
         if args.ablate_soft_drop and args.mode == "spsa":
             print(f"  [ABLATION] soft-drop: DISABLED (per-iter SNR mask still active)")
@@ -3010,7 +3108,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                             if active_mask[_i] and median_snr[_i] < args.snr_threshold:
                                 active_mask[_i] = False
                                 dropped_iters[_i] = outer_iter
-                                bfgs.mask_axis(_i)
+                                design_opt.mask_axis(_i)
                                 newly_dropped.append(_i)
                                 print(f"    [Soft-drop] {param_names[_i]}: median SNR "
                                       f"{median_snr[_i]:.3f} < {args.snr_threshold} "
@@ -3056,8 +3154,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
                     if not skip_update:
                         old_theta = theta.copy()
-                        direction = bfgs.compute_direction(grad_theta)
-                        step = args.design_lr * direction
+                        if args.design_optimizer == "bfgs":
+                            direction = design_opt.compute_direction(grad_theta)
+                            step = args.design_lr * direction
+                        else:  # adam
+                            step = design_opt.compute_step(grad_theta)
+                            # adam_lr already folded in inside compute_step
 
                         # Adaptive trust-region clamp (1b). Skipped under
                         # --ablate-trust-region; raw_step/n_clamped are still
@@ -3078,19 +3180,30 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         theta = old_theta + step
                         theta = np.clip(theta, theta_bounds[0], theta_bounds[1])
 
-                        # Record actual step (post-clip) for Hessian update
+                        # Record actual step (post-clip) for optimizer update.
+                        # BFGS uses actual_s + raw grad for its rank-2 Hessian
+                        # update; Adam's update is a no-op (folds grad into
+                        # m/v inside compute_step). Bug B fix: pass raw
+                        # (un-masked) gradient so prev_grad reflects the true
+                        # gradient for y-vector (BFGS-only behavior; harmless
+                        # for Adam which discards both args).
                         actual_s = theta - old_theta
-                        # Bug B fix: pass raw (un-masked) gradient to BFGS so
-                        # prev_grad reflects the true gradient for y-vector
-                        bfgs.update(actual_s, grad_theta_raw)
+                        design_opt.update(actual_s, grad_theta_raw)
 
                         # Predicted improvement for next iteration's ratio test (1b).
                         # Dead state when trust region is ablated.
                         if not args.ablate_trust_region:
                             predicted_improvement = grad_theta_raw @ actual_s
 
-                        print(f"\n  Design update (BFGS, {bfgs.num_updates} H updates, "
-                              f"{bfgs.num_skipped} skipped):")
+                        if args.design_optimizer == "bfgs":
+                            print(f"\n  Design update (BFGS, "
+                                  f"{design_opt.num_updates} H updates, "
+                                  f"{design_opt.num_skipped} skipped):")
+                        else:  # adam
+                            print(f"\n  Design update (Adam, t={design_opt.t}, "
+                                  f"step_norm={design_opt.last_step_norm:.5f}, "
+                                  f"||m||={design_opt.last_m_norm:.5f}, "
+                                  f"||sqrt(v)||={design_opt.last_v_norm:.5f}):")
                         for i, name in enumerate(param_names):
                             delta = theta[i] - old_theta[i]
                             print(f"    {name}: {old_theta[i]:+.4f} -> {theta[i]:+.4f} "
@@ -3347,11 +3460,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
                 if args.mode == "spsa":
                     finite_snr = grad_snr[np.isfinite(grad_snr)]
-                    bfgs_attempted = bfgs.num_updates + bfgs.num_skipped
-                    bfgs_skip_rate = (
-                        bfgs.num_skipped / bfgs_attempted if bfgs_attempted > 0 else 0.0
-                    )
-                    # grad_norm_applied = post-SNR-mask norm (what BFGS used)
+                    # grad_norm_applied = post-SNR-mask norm (what optimizer used)
                     # grad_norm_raw = pre-mask norm (always-comparable across
                     # runs that vary --snr-threshold)
                     log_dict.update({
@@ -3362,9 +3471,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         "outer/trust_radius_deg": np.degrees(trust_radius),
                         "outer/trust_ratio_rho": rho if rho is not None else float("nan"),
                         "outer/grad_weak_passed": int(grad_weak),
-                        "outer/bfgs_num_updates": bfgs.num_updates,
-                        "outer/bfgs_num_skipped": bfgs.num_skipped,
-                        "outer/bfgs_skip_rate": bfgs_skip_rate,
+                        # Always-on key for dashboard filtering
+                        "outer/design_optimizer_kind": (
+                            0 if args.design_optimizer == "bfgs" else 1
+                        ),
                         # Soft-drop metrics
                         "outer/n_active_params": int(active_mask.sum()),
                         "outer/n_dropped_params": int((~active_mask).sum()),
@@ -3397,6 +3507,27 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                             and not args.ablate_frozen_rho
                         ),
                     })
+                    # Optimizer-specific metrics (mutually exclusive)
+                    if args.design_optimizer == "bfgs":
+                        bfgs_attempted = (design_opt.num_updates
+                                          + design_opt.num_skipped)
+                        bfgs_skip_rate = (
+                            design_opt.num_skipped / bfgs_attempted
+                            if bfgs_attempted > 0 else 0.0
+                        )
+                        log_dict.update({
+                            "outer/bfgs_num_updates": design_opt.num_updates,
+                            "outer/bfgs_num_skipped": design_opt.num_skipped,
+                            "outer/bfgs_skip_rate": bfgs_skip_rate,
+                        })
+                    else:  # adam
+                        log_dict.update({
+                            "outer/adam_t": design_opt.t,
+                            "outer/adam_step_norm": design_opt.last_step_norm,
+                            "outer/adam_m_norm": design_opt.last_m_norm,
+                            "outer/adam_v_norm": design_opt.last_v_norm,
+                            "outer/adam_num_updates": design_opt.num_updates,
+                        })
                     for i, name in enumerate(param_names):
                         log_dict[f"outer/grad_{name}"] = grad_theta[i]
                         snr_val = grad_snr[i]
@@ -3503,7 +3634,30 @@ if __name__ == "__main__":
                              "further outer iterations. For fixed-morphology "
                              "PPO/AMP baseline runs.")
     parser.add_argument("--design-lr", type=float, default=1.0,
-                        help="Step size scaling on BFGS direction (default: 1.0, BFGS self-scales)")
+                        help="Step size scaling on BFGS direction (default: 1.0, "
+                             "BFGS self-scales). BFGS-only -- "
+                             "--design-optimizer adam uses --adam-lr instead.")
+    parser.add_argument("--design-optimizer", type=str, default="bfgs",
+                        choices=["bfgs", "adam"],
+                        help="Outer-loop design optimizer. 'bfgs' (default): "
+                             "cautious-BFGS with curvature-conditioned ascent; "
+                             "uses --design-lr as multiplier on H @ grad. "
+                             "'adam': per-axis Adam with momentum and adaptive "
+                             "scaling; uses --adam-lr (ignores --design-lr). "
+                             "SPSA-only -- CMA-ES has its own update.")
+    parser.add_argument("--adam-lr", type=float, default=0.05,
+                        help="Adam outer learning rate (radians). Default 0.05 "
+                             "chosen so pre-clip step magnitudes are comparable "
+                             "to BFGS pre-clip steps under typical SPSA gradients "
+                             "(||grad|| ~ 0.2-0.5); trust-region clip at "
+                             "--max-step-deg typically dominates. Ignored unless "
+                             "--design-optimizer adam.")
+    parser.add_argument("--adam-beta1", type=float, default=0.9,
+                        help="Adam first-moment EMA decay. Default 0.9.")
+    parser.add_argument("--adam-beta2", type=float, default=0.999,
+                        help="Adam second-moment EMA decay. Default 0.999.")
+    parser.add_argument("--adam-eps", type=float, default=1e-8,
+                        help="Adam denominator epsilon for numerical stability.")
     parser.add_argument("--num-train-envs", type=int, default=4096,
                         help="Total training envs (divided across GPUs)")
     parser.add_argument("--eval-horizon", type=int, default=300,
@@ -3678,7 +3832,9 @@ if __name__ == "__main__":
                              "tests whether the filter prevents Hessian "
                              "poisoning. Condition-number reset (cond>1e6) "
                              "is kept (numeric safety, not noise guard). "
-                             "SPSA-only.")
+                             "SPSA-only. Ignored under --design-optimizer "
+                             "adam (Adam has no curvature filter); a warning "
+                             "is printed if both are set.")
     parser.add_argument("--ablate-soft-drop", action="store_true",
                         help="ABLATION: disable permanent soft-drop of low-SNR "
                              "axes, but keep the per-iter SNR mask active. "
