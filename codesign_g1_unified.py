@@ -1681,6 +1681,171 @@ def compute_spsa_gradient_parallel(agent, env, engine, char_id, total_mass,
 
 
 # ---------------------------------------------------------------------------
+# Single-morphology evaluation (frozen-policy rho test, Fix A)
+# ---------------------------------------------------------------------------
+
+def evaluate_single_morphology_parallel(agent, env, engine, char_id, total_mass,
+                                        theta_np, base_quats_dict, joint_idx_map,
+                                        num_worlds, horizon,
+                                        rank, num_procs, device,
+                                        num_seeds=10, base_seed=42,
+                                        vel_reward_weight=0.1,
+                                        vel_cmd=1.0, vel_tracking_sigma=0.25,
+                                        outer_task_weight=1.0,
+                                        outer_disc_weight=0.0,
+                                        outer_term_penalty=-10.0,
+                                        eval_disc_reward=False):
+    """Closed-loop reward eval at a single morphology with the current policy.
+
+    Used by the bilevel codesign loop to provide an unbiased actual-improvement
+    reference for the trust-region rho test (Fix A): at outer iter K+1 start,
+    after theta_{K+1} is applied to the env but BEFORE inner training touches
+    the policy, this measures reward(theta_{K+1}, policy_K). Pairs with
+    prev_center_reward = reward(theta_K, policy_K) so both rho-test endpoints
+    use the same (frozen) policy_K, isolating the design effect from the
+    policy-improvement effect that pollutes the naive rho.
+
+    Mirrors compute_spsa_gradient_parallel structure but with a single
+    morphology applied to ALL worlds (no perturbations, no partition slicing).
+    Reads agent state in TEST mode under torch.no_grad() — does not touch
+    agent._sample_count.
+
+    Caller is responsible for ensuring theta_np is the eval theta. The env
+    morphology is left at theta_np on return (no restore step), since the
+    typical caller proceeds directly to inner-loop training at theta_np.
+
+    Returns (cot_center, vel_track_center, disc_center, term_center) as
+    scalars. Caller computes scalar reward outside the helper to keep the
+    formula in exactly one place (matches the SPSA center reward formula).
+    """
+    sim_model = engine._sim_model
+
+    # Apply morphology to ALL worlds (single round-trip).
+    update_training_joint_X_p(sim_model, theta_np, base_quats_dict,
+                               joint_idx_map, num_worlds)
+
+    # Per-seed result tensors (1-D over seeds, no partition dim)
+    cot_per_seed = torch.zeros(num_seeds, dtype=torch.float64, device=device)
+    vel_track_per_seed = torch.zeros(num_seeds, dtype=torch.float64, device=device)
+    disc_per_seed = torch.zeros(num_seeds, dtype=torch.float64, device=device)
+    term_per_seed = torch.zeros(num_seeds, dtype=torch.float64, device=device)
+
+    agent.eval()
+    agent.set_mode(base_agent_mod.AgentMode.TEST)
+
+    fail_value = base_env_mod.DoneFlags.FAIL.value
+
+    for seed_idx in range(num_seeds):
+        seed = base_seed + seed_idx
+        _seed_all(seed)
+
+        obs, info = env.reset()
+
+        # Per-world episode-aware accumulators (mirror SPSA helper).
+        power_sum = torch.zeros(num_worlds, device=device)
+        vel_sum = torch.zeros(num_worlds, device=device)
+        vel_track_sum = torch.zeros(num_worlds, device=device)
+        disc_sum = torch.zeros(num_worlds, device=device)
+        step_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        ep_cot_sum = torch.zeros(num_worlds, device=device)
+        ep_vel_track_sum = torch.zeros(num_worlds, device=device)
+        ep_disc_sum = torch.zeros(num_worlds, device=device)
+        ep_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+        fail_count = torch.zeros(num_worlds, device=device, dtype=torch.long)
+
+        with torch.no_grad():
+            for _ in range(horizon):
+                action, _ = agent._decide_action(obs, info)
+                obs, reward, done, info = env.step(action)
+
+                dof_forces = EpisodeCoTTracker.get_dof_forces_safe(engine, char_id)
+                dof_vel = engine.get_dof_vel(char_id)
+                root_vel = engine.get_root_vel(char_id)
+
+                power = torch.sum(torch.abs(
+                    dof_forces[:num_worlds] *
+                    dof_vel[:num_worlds]), dim=-1)
+                fwd_vel = root_vel[:num_worlds, 0]
+                power_sum += power
+                vel_sum += fwd_vel
+                vel_track_sum += torch.exp(-torch.square(fwd_vel - vel_cmd) / vel_tracking_sigma)
+                step_count += 1
+
+                if eval_disc_reward:
+                    disc_obs_step = env._disc_obs_buf[:num_worlds]
+                    disc_r_step = compute_disc_reward_for_obs(agent, disc_obs_step)
+                    disc_sum += disc_r_step
+
+                done_buf = env._done_buf[:num_worlds]
+                done_mask = (done_buf > 0)
+                if done_mask.any():
+                    di = done_mask.nonzero(as_tuple=True)[0]
+                    vs = step_count[di].float()
+                    valid = vs > 0
+                    if valid.any():
+                        vi = di[valid]
+                        vsc = step_count[vi].float()
+                        mp = power_sum[vi] / vsc
+                        mv = vel_sum[vi] / vsc
+                        ep_cot_sum[vi] += compute_cot(mp, mv, total_mass)
+                        ep_vel_track_sum[vi] += vel_track_sum[vi] / vsc
+                        if eval_disc_reward:
+                            ep_disc_sum[vi] += disc_sum[vi] / vsc
+                        ep_count[vi] += 1
+                        fail_count[vi] += (done_buf[vi] == fail_value).long()
+                    power_sum[di] = 0
+                    vel_sum[di] = 0
+                    vel_track_sum[di] = 0
+                    disc_sum[di] = 0
+                    step_count[di] = 0
+
+        # Trailing partial episodes
+        alive = step_count > 0
+        if alive.any():
+            ai = alive.nonzero(as_tuple=True)[0]
+            vsc = step_count[ai].float()
+            mp = power_sum[ai] / vsc
+            mv = vel_sum[ai] / vsc
+            ep_cot_sum[ai] += compute_cot(mp, mv, total_mass)
+            ep_vel_track_sum[ai] += vel_track_sum[ai] / vsc
+            if eval_disc_reward:
+                ep_disc_sum[ai] += disc_sum[ai] / vsc
+            ep_count[ai] += 1
+
+        # Aggregate over all worlds (no partition slicing)
+        counts = ep_count.float().clamp(min=1)
+        cot_per_seed[seed_idx] = (ep_cot_sum / counts).mean().item()
+        vel_track_per_seed[seed_idx] = (ep_vel_track_sum / counts).mean().item()
+        tot_ep = ep_count.float().sum().clamp(min=1.0)
+        term_per_seed[seed_idx] = (fail_count.float().sum() / tot_ep).item()
+        if eval_disc_reward:
+            disc_per_seed[seed_idx] = (ep_disc_sum / counts).mean().item()
+
+    agent.set_mode(base_agent_mod.AgentMode.TRAIN)
+    agent.train()
+
+    # Multi-GPU: average across ranks (mirror SPSA helper)
+    if num_procs > 1:
+        torch.distributed.all_reduce(cot_per_seed, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(vel_track_per_seed, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(term_per_seed, op=torch.distributed.ReduceOp.SUM)
+        cot_per_seed /= num_procs
+        vel_track_per_seed /= num_procs
+        term_per_seed /= num_procs
+        if eval_disc_reward:
+            torch.distributed.all_reduce(disc_per_seed, op=torch.distributed.ReduceOp.SUM)
+            disc_per_seed /= num_procs
+
+    # Reduce to scalars (mean over seeds)
+    cot_center = float(cot_per_seed.mean().item())
+    vel_track_center = float(vel_track_per_seed.mean().item())
+    term_center = float(term_per_seed.mean().item())
+    disc_center = float(disc_per_seed.mean().item()) if eval_disc_reward else 0.0
+
+    return (cot_center, vel_track_center, disc_center, term_center)
+
+
+# ---------------------------------------------------------------------------
 # CMA-ES population fitness evaluation
 # ---------------------------------------------------------------------------
 
@@ -2512,6 +2677,15 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 print(f"  SNR threshold:     0 (per-iter mask + soft-drop disabled)")
             if args.resume_mask:
                 print(f"  Resume mask:       {args.resume_mask}")
+            # Frozen-policy rho test (Fix A)
+            if args.ablate_frozen_rho:
+                print(f"  Frozen rho:        DISABLED (--ablate-frozen-rho) "
+                      f"-- old buggy rho test")
+            elif args.ablate_trust_region:
+                print(f"  Frozen rho:        n/a (trust region disabled)")
+            else:
+                print(f"  Frozen rho:        ENABLED -- actual = "
+                      f"reward(theta_K+1, policy_K) - reward(theta_K, policy_K)")
         else:  # cmaes
             print(f"  Outer convergence: reward {args.outer_reward_plateau_pct:.3%} AND cot "
                   f"{args.outer_cot_plateau_pct:.3%} (window={args.outer_cot_plateau_window}) "
@@ -2541,8 +2715,8 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         if args.ablate_all_spsa_guards:
             print(f"  [ABLATION] --ablate-all-spsa-guards expanded -> "
-                  f"trust_region+cautious_bfgs disabled, snr_threshold=0, "
-                  f"num_spsa_seeds=1")
+                  f"trust_region+cautious_bfgs+frozen_rho disabled, "
+                  f"snr_threshold=0, num_spsa_seeds=1")
         if args.ablate_trust_region:
             print(f"  [ABLATION] trust region: DISABLED")
         if args.ablate_envelope_gate:
@@ -2552,6 +2726,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  [ABLATION] cautious BFGS skip: DISABLED (all updates forced)")
         if args.ablate_soft_drop and args.mode == "spsa":
             print(f"  [ABLATION] soft-drop: DISABLED (per-iter SNR mask still active)")
+        if args.ablate_frozen_rho and args.mode == "spsa":
+            print(f"  [ABLATION] frozen rho: DISABLED (rho test uses iter-K+1's "
+                  f"converged policy on both sides)")
 
     # =========================================================
     # Outer loop
@@ -2579,6 +2756,71 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 "outer/iteration": outer_iter + 1,
                 "outer/boundary": 1,
             }, step=agent._iter)
+
+        # ----- Fix A: frozen-policy rho baseline -----
+        # Evaluate reward at the new theta with the carry-over (un-trained)
+        # policy from iter K-1. Provides the actual-improvement reference
+        # for this iter's trust-region rho test, isolating the design effect
+        # from the policy improvement that happens during inner training
+        # below. Skipped on outer_iter=0 (no prior step), under
+        # --ablate-trust-region (rho dead state), and under --ablate-frozen-rho
+        # (forces old buggy behavior). CMA-ES branch never reads
+        # frozen_baseline_reward.
+        frozen_baseline_reward = None
+        frozen_baseline_cot = None
+        frozen_baseline_vel_track = None
+        # frozen_actual_improvement_for_log captured later in rho block
+        frozen_actual_improvement_for_log = None
+        if (args.mode == "spsa"
+                and outer_iter > 0
+                and not args.ablate_trust_region
+                and not args.ablate_frozen_rho):
+            if is_root:
+                print(f"\n  [Frozen rho] Evaluating reward at new theta with "
+                      f"un-retrained policy_{outer_iter - 1}-converged "
+                      f"({args.num_spsa_seeds} seeds, {args.eval_horizon} steps)...")
+
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            eval_disc_in_outer = (
+                args.disc_morph_invariant and args.outer_disc_weight != 0.0
+            )
+            frozen_base_seed = args.seed + outer_iter * 1000 + 500_000
+
+            (frozen_cot, frozen_vel_track, frozen_disc, frozen_term) = \
+                evaluate_single_morphology_parallel(
+                    agent, env, engine, char_id, total_mass,
+                    theta.copy(), base_quats_dict, joint_idx_map,
+                    per_rank_envs, args.eval_horizon,
+                    rank, num_procs, device,
+                    num_seeds=args.num_spsa_seeds, base_seed=frozen_base_seed,
+                    vel_reward_weight=args.vel_reward_weight,
+                    vel_cmd=args.vel_cmd,
+                    vel_tracking_sigma=args.vel_tracking_sigma,
+                    outer_task_weight=args.outer_task_weight,
+                    outer_disc_weight=args.outer_disc_weight,
+                    outer_term_penalty=args.outer_term_penalty,
+                    eval_disc_reward=eval_disc_in_outer,
+                )
+
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            if is_root:
+                frozen_baseline_reward = (
+                    args.outer_task_weight * (
+                        -5.0 * frozen_cot
+                        + args.vel_reward_weight * frozen_vel_track
+                        + args.outer_term_penalty * frozen_term
+                    )
+                    + args.outer_disc_weight * frozen_disc
+                )
+                frozen_baseline_cot = frozen_cot
+                frozen_baseline_vel_track = frozen_vel_track
+                print(f"  [Frozen rho] reward={frozen_baseline_reward:+.6f}, "
+                      f"CoT={frozen_cot:.4f}, vel_track={frozen_vel_track:.4f}, "
+                      f"term={frozen_term:.4f}")
 
         converged, disc_rewards, final_actor_loss = inner_ctrl.train_until_converged(
             iter_dir
@@ -2699,7 +2941,21 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                 # the step clip site (also gated below).
                 if not args.ablate_trust_region:
                     if prev_center_reward is not None and predicted_improvement is not None:
-                        actual_improvement = center_reward - prev_center_reward
+                        # Fix A: use frozen-policy baseline as actual-improvement
+                        # reference. Both endpoints share policy_(K-1), isolating
+                        # the design effect from the policy improvement that
+                        # happens during this iter's PPO. Falls back to old
+                        # (broken) behavior under --ablate-frozen-rho.
+                        if (not args.ablate_frozen_rho
+                                and frozen_baseline_reward is not None):
+                            actual_improvement = (frozen_baseline_reward
+                                                  - prev_center_reward)
+                            rho_label = "frozen"
+                        else:
+                            actual_improvement = center_reward - prev_center_reward
+                            rho_label = "mixed"
+                        frozen_actual_improvement_for_log = actual_improvement
+
                         if abs(predicted_improvement) > 1e-12:
                             rho = actual_improvement / predicted_improvement
                         else:
@@ -2710,11 +2966,13 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         elif rho < 0.25:
                             trust_radius = max(trust_radius * 0.5, TRUST_RADIUS_MIN)
 
-                        print(f"    [Trust Region] rho={rho:.3f}, "
+                        print(f"    [Trust Region] rho={rho:.3f} ({rho_label}), "
                               f"actual={actual_improvement:+.6f}, "
                               f"predicted={predicted_improvement:+.6f}, "
                               f"radius={np.degrees(trust_radius):.3f} deg")
 
+                    # prev_center_reward stores reward(theta_K, policy_K-converged)
+                    # = the OLD endpoint for next iter's frozen rho comparison.
                     prev_center_reward = center_reward
 
                 # ----- Design Update (rank 0 only) -----
@@ -3112,6 +3370,32 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         "outer/n_dropped_params": int((~active_mask).sum()),
                         "outer/morphology_converged": int(morphology_converged_flag),
                         "outer/n_drop_event": len(newly_dropped),
+                        # Fix A frozen-policy rho diagnostics
+                        "outer/frozen_baseline_reward": (
+                            frozen_baseline_reward
+                            if frozen_baseline_reward is not None
+                            else float("nan")
+                        ),
+                        "outer/frozen_baseline_cot": (
+                            frozen_baseline_cot
+                            if frozen_baseline_cot is not None
+                            else float("nan")
+                        ),
+                        "outer/frozen_baseline_vel_track": (
+                            frozen_baseline_vel_track
+                            if frozen_baseline_vel_track is not None
+                            else float("nan")
+                        ),
+                        "outer/frozen_actual_improvement": (
+                            frozen_actual_improvement_for_log
+                            if frozen_actual_improvement_for_log is not None
+                            else float("nan")
+                        ),
+                        "outer/frozen_rho_active": int(
+                            outer_iter > 0
+                            and not args.ablate_trust_region
+                            and not args.ablate_frozen_rho
+                        ),
                     })
                     for i, name in enumerate(param_names):
                         log_dict[f"outer/grad_{name}"] = grad_theta[i]
@@ -3401,6 +3685,16 @@ if __name__ == "__main__":
                              "Lets you A/B against drop while preserving "
                              "threshold-based zeroing of low-confidence "
                              "gradient components. SPSA-only.")
+    parser.add_argument("--ablate-frozen-rho", action="store_true",
+                        help="ABLATION: revert to the buggy rho test that "
+                             "compares reward(theta_K+1, policy_K+1-converged) "
+                             "against reward(theta_K, policy_K-converged) -- "
+                             "mixes design effect with policy improvement "
+                             "during iter K+1's PPO. Default (off) = "
+                             "frozen-policy rho: extra single-morphology eval "
+                             "at iter boundary using the carry-over policy. "
+                             "SPSA-only; no effect under --ablate-trust-region "
+                             "or --mode cmaes.")
     parser.add_argument("--ablate-all-spsa-guards", action="store_true",
                         help="ABLATION SHORTCUT: enables --ablate-trust-region, "
                              "--ablate-cautious-bfgs, forces --snr-threshold=0, "
@@ -3430,6 +3724,7 @@ if __name__ == "__main__":
     if args.ablate_all_spsa_guards:
         args.ablate_trust_region = True
         args.ablate_cautious_bfgs = True
+        args.ablate_frozen_rho = True   # also disable Fix A frozen-policy rho
         args.snr_threshold = 0.0
         args.num_spsa_seeds = 1
 
