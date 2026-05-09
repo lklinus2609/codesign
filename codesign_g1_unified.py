@@ -779,6 +779,72 @@ class AdamOuter:
 
 
 # ---------------------------------------------------------------------------
+# Graceful early-stop machinery
+# ---------------------------------------------------------------------------
+# Three triggers funnel through one mechanism -- a sentinel file on disk -- so
+# distributed ranks see the same decision via filesystem visibility (no
+# broadcast races, no NCCL deadlocks from mid-collective signal raising):
+#   1. SIGINT (Ctrl-C) -> rank 0's signal handler creates the stop file
+#   2. External `touch <stop_file>` -> any process can request graceful exit
+#   3. --max-wallclock-min N -> rank 0 creates the stop file when exceeded
+#
+# All ranks check the file at every output_iter inside the inner loop. When
+# detected, the inner loop exits via the existing should_stop broadcast path;
+# the outer loop then runs a deterministic CoT eval at the current theta and
+# policy, saves the final checkpoint, and exits cleanly.
+
+def should_stop_early(stop_file_path, wallclock_start, max_wallclock_min, is_root):
+    """Return True if any early-stop trigger fired.
+
+    File-existence check runs on all ranks (TACC scratch filesystem is shared
+    across ranks within a node). Wallclock check runs on rank 0 only and
+    creates the stop file when triggered, so subsequent rank checks see it
+    via the unified file-existence path.
+    """
+    if stop_file_path is None:
+        return False
+    if (is_root and max_wallclock_min is not None and max_wallclock_min > 0
+            and wallclock_start is not None):
+        elapsed_min = (time.time() - wallclock_start) / 60.0
+        if elapsed_min >= max_wallclock_min:
+            try:
+                stop_file_path.touch(exist_ok=True)
+            except Exception:
+                pass
+    try:
+        return stop_file_path.exists()
+    except Exception:
+        return False
+
+
+def _install_sigint_handler(stop_file_path, is_root):
+    """Install a root-only SIGINT handler that requests graceful early-stop.
+
+    Avoids in-process raise/exit (which would deadlock NCCL collectives mid-
+    iteration). The handler just creates the stop file; the inner loop polls
+    the file at output_iter boundaries. After the first Ctrl-C, the default
+    SIGINT handler is restored so a second Ctrl-C forces a hard exit (escape
+    hatch if the deterministic eval block hangs).
+    """
+    if not is_root or stop_file_path is None:
+        return
+    import signal as _signal
+
+    def _handler(signum, frame):
+        try:
+            stop_file_path.touch(exist_ok=True)
+            print(f"\n  [SIGINT] caught -- stop file created at "
+                  f"{stop_file_path}. Inner loop exits at next output_iter, "
+                  f"then deterministic CoT eval runs before final save + exit. "
+                  f"Press Ctrl-C again to hard-kill.")
+        except Exception as e:
+            print(f"\n  [SIGINT] failed to create stop file: {e}")
+        _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+
+    _signal.signal(_signal.SIGINT, _handler)
+
+
+# ---------------------------------------------------------------------------
 # Joint info extraction + in-place update
 # ---------------------------------------------------------------------------
 
@@ -886,7 +952,10 @@ class InnerLoopController:
                  video_interval=100, save_interval=100,
                  log_file=None,
                  is_root=True, device="cuda:0", rank=0,
-                 ablate_env_fixed_iters=None):
+                 ablate_env_fixed_iters=None,
+                 stop_file_path=None,
+                 wallclock_start=None,
+                 max_wallclock_min=None):
         self.agent = agent
         self.plateau_threshold = plateau_threshold
         self.plateau_window = plateau_window
@@ -915,6 +984,16 @@ class InnerLoopController:
         # When set (--ablate-envelope-gate), bypass plateau-based convergence
         # and run exactly this many inner iters per outer call.
         self.ablate_env_fixed_iters = ablate_env_fixed_iters
+
+        # Graceful early-stop wiring. stop_file_path is a Path; the file is
+        # checked at every output_iter on all ranks (filesystem visibility
+        # avoids broadcast races). _early_stopped is a sticky bit set when
+        # the stop trigger fires inside the inner loop; the outer loop reads
+        # it to switch to the deterministic-eval-and-exit path.
+        self.stop_file_path = stop_file_path
+        self.wallclock_start = wallclock_start
+        self.max_wallclock_min = max_wallclock_min
+        self._early_stopped = False
 
         # Codesign convergence: ep_len gate + task_reward plateau AND CoT plateau
         self.ep_len_threshold_frac = ep_len_threshold_frac
@@ -1194,7 +1273,17 @@ class InnerLoopController:
                 # to prevent non-root ranks from reaching the broadcast first
                 # and hanging while root does slow I/O.
                 should_stop = False
-                if self.ablate_env_fixed_iters is not None:
+                early_stop_triggered = False
+                # Graceful early-stop check (runs on all ranks; filesystem
+                # visibility makes the file-existence check broadcast-free).
+                # Wallclock check is rank-0 only and creates the stop file
+                # to propagate the trigger to other ranks via the same path.
+                if self.stop_file_path is not None and should_stop_early(
+                        self.stop_file_path, self.wallclock_start,
+                        self.max_wallclock_min, self.is_root):
+                    early_stop_triggered = True
+                    should_stop = True
+                elif self.ablate_env_fixed_iters is not None:
                     # --ablate-envelope-gate: fixed budget, no plateau check.
                     # Root decides (matching original "root decides, broadcasts"
                     # invariant); inner_iters is identical across ranks but the
@@ -1215,10 +1304,18 @@ class InnerLoopController:
                         should_stop = self._check_plateau(convergence_values)
 
                 if mp_util.enable_mp():
-                    flag = torch.tensor([int(should_stop)], dtype=torch.int32,
-                                        device=self.device)
+                    # Broadcast both flags from root so non-root ranks adopt
+                    # root's view of (a) whether to stop and (b) whether the
+                    # stop was a graceful early-stop (which routes the outer
+                    # loop into deterministic-eval-and-exit instead of the
+                    # normal SPSA/CMA-ES path).
+                    flag = torch.tensor(
+                        [int(should_stop), int(early_stop_triggered)],
+                        dtype=torch.int32, device=self.device,
+                    )
                     flag = mp_util.broadcast(flag)
-                    should_stop = flag.item() == 1
+                    should_stop = flag[0].item() == 1
+                    early_stop_triggered = flag[1].item() == 1
 
                 # Root-only I/O: save, wandb, video (after broadcast)
                 if self.is_root:
@@ -1280,7 +1377,15 @@ class InnerLoopController:
                     torch.distributed.barrier()
 
                 if should_stop:
-                    if self.is_root:
+                    if early_stop_triggered:
+                        self._early_stopped = True
+                        if self.is_root:
+                            print(f"    [Inner] EARLY STOP requested "
+                                  f"({inner_iters} iters) -- stop file "
+                                  f"detected at {self.stop_file_path}. "
+                                  f"Exiting inner loop; outer loop will run "
+                                  f"deterministic CoT eval.")
+                    elif self.is_root:
                         actor_loss_str = (f", actor_loss={last_actor_loss:.6f}"
                                           if last_actor_loss is not None else "")
                         if self.convergence_mode == 'codesign':
@@ -2609,6 +2714,39 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print("  [WARN] --use-plateau-convergence is deprecated; "
                   "use --convergence-mode=plateau instead")
 
+    # ----- Graceful early-stop wiring -----
+    # Default stop file is <out_dir>/STOP. SIGINT handler installs only on
+    # rank 0 (other ranks would deadlock NCCL on signal); the file mediates
+    # cross-rank visibility. Wallclock timer also runs on rank 0 and
+    # creates the file when triggered.
+    if args.stop_file is not None:
+        stop_file_path = Path(args.stop_file).resolve()
+    else:
+        stop_file_path = out_dir / "STOP"
+    # Pre-existing stale stop file from a prior run would terminate this run
+    # on the first output_iter. Remove on rank 0 with a warning so the user
+    # knows; other ranks see the file disappear via filesystem.
+    if is_root and stop_file_path.exists():
+        try:
+            stop_file_path.unlink()
+            print(f"  [Early stop] Removed stale stop file at "
+                  f"{stop_file_path} from a prior run.")
+        except Exception as e:
+            print(f"  [Early stop] WARNING: could not remove stale stop file "
+                  f"{stop_file_path}: {e}")
+    if not args.no_sigint_handler:
+        _install_sigint_handler(stop_file_path, is_root)
+    if is_root:
+        print(f"  [Early stop] Stop file: {stop_file_path} "
+              f"(touch to request graceful exit)")
+        if not args.no_sigint_handler:
+            print(f"  [Early stop] SIGINT (Ctrl-C) -> graceful exit "
+                  f"(second Ctrl-C = hard kill)")
+        if args.max_wallclock_min is not None:
+            print(f"  [Early stop] Wallclock cap: "
+                  f"{args.max_wallclock_min:.1f} min")
+    wallclock_start = time.time()
+
     inner_ctrl = InnerLoopController(
         agent,
         plateau_threshold=args.plateau_threshold,
@@ -2645,6 +2783,9 @@ def gbc_worker(rank, num_procs, device, master_port, args):
         ablate_env_fixed_iters=(
             args.ablate_env_fixed_iters if args.ablate_envelope_gate else None
         ),
+        stop_file_path=stop_file_path,
+        wallclock_start=wallclock_start,
+        max_wallclock_min=args.max_wallclock_min,
     )
 
     # Skip kickoff ramp when resuming from a checkpoint (the resumed policy
@@ -2930,6 +3071,104 @@ def gbc_worker(rank, num_procs, device, master_port, args):
             print(f"  [Inner Loop] Done in {inner_time / 60:.1f} min{actor_loss_str}")
 
         history["inner_times"].append(inner_time)
+
+        # ----- Graceful early-stop: deterministic eval + save + exit -----
+        # Triggered when the user / SIGINT handler / wallclock timer created
+        # the stop file. Inner loop already exited at output_iter; we now run
+        # one paired-seed evaluation at the current (theta, policy) so the
+        # user gets a deterministic CoT/reward number with the same noise
+        # control as a regular SPSA center evaluation. Mirrors the baseline-
+        # exit path below: all ranks run the eval (it is a collective), root
+        # writes outputs, all ranks break.
+        if inner_ctrl._early_stopped:
+            if is_root:
+                print(f"\n  [Early stop] Running deterministic eval at "
+                      f"current theta with {args.num_spsa_seeds} seeds, "
+                      f"{args.eval_horizon} steps...")
+
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            eval_disc_in_outer = (
+                args.disc_morph_invariant and args.outer_disc_weight != 0.0
+            )
+            es_base_seed = args.seed + outer_iter * 1000 + 700_000
+
+            (es_cot, es_vel_track, es_disc, es_term) = \
+                evaluate_single_morphology_parallel(
+                    agent, env, engine, char_id, total_mass,
+                    theta.copy(), base_quats_dict, joint_idx_map,
+                    per_rank_envs, args.eval_horizon,
+                    rank, num_procs, device,
+                    num_seeds=args.num_spsa_seeds, base_seed=es_base_seed,
+                    vel_reward_weight=args.vel_reward_weight,
+                    vel_cmd=args.vel_cmd,
+                    vel_tracking_sigma=args.vel_tracking_sigma,
+                    outer_task_weight=args.outer_task_weight,
+                    outer_disc_weight=args.outer_disc_weight,
+                    outer_term_penalty=args.outer_term_penalty,
+                    eval_disc_reward=eval_disc_in_outer,
+                )
+
+            env._cot_tracker.get_stats()
+            env._cot_tracker.reset_accumulators()
+
+            if is_root:
+                es_reward = (
+                    args.outer_task_weight * (
+                        -5.0 * es_cot
+                        + args.vel_reward_weight * es_vel_track
+                        + args.outer_term_penalty * es_term
+                    )
+                    + args.outer_disc_weight * es_disc
+                )
+                print(f"  [Early stop] Deterministic eval at theta:")
+                print(f"    CoT          = {es_cot:.6f}")
+                print(f"    vel_tracking = {es_vel_track:.6f}")
+                print(f"    term_rate    = {es_term:.6f}")
+                print(f"    disc_center  = {es_disc:.6f}")
+                print(f"    center_reward= {es_reward:+.6f}")
+                print(f"    seeds={args.num_spsa_seeds}, horizon="
+                      f"{args.eval_horizon}, base_seed={es_base_seed}")
+
+                # Save deterministic eval to a stable filename for downstream
+                # paper-table consumption + final checkpoint at iter_dir.
+                eval_npz = out_dir / "early_stop_eval.npz"
+                np.savez(
+                    str(eval_npz),
+                    cot=es_cot, vel_tracking=es_vel_track,
+                    term_rate=es_term, disc_center=es_disc,
+                    center_reward=es_reward,
+                    theta=theta,
+                    num_seeds=args.num_spsa_seeds,
+                    eval_horizon=args.eval_horizon,
+                    base_seed=es_base_seed,
+                    outer_iter=outer_iter,
+                )
+                np.save(str(out_dir / "theta_latest.npy"), theta)
+                print(f"  [Early stop] Saved {eval_npz}, "
+                      f"checkpoint at {iter_dir / 'model.pt'}")
+
+                if use_wandb:
+                    wandb.log({
+                        "outer/early_stop_cot": es_cot,
+                        "outer/early_stop_vel_tracking": es_vel_track,
+                        "outer/early_stop_term_rate": es_term,
+                        "outer/early_stop_disc_center": es_disc,
+                        "outer/early_stop_reward": es_reward,
+                        "outer/early_stop_outer_iter": outer_iter,
+                        "outer/early_stop_seeds": args.num_spsa_seeds,
+                    }, step=agent._iter)
+                    wandb.save(str(eval_npz), base_path=str(out_dir))
+                    wandb.save(str(iter_dir / "model.pt"),
+                               base_path=str(out_dir))
+                    wandb.save(str(out_dir / "theta_latest.npy"),
+                               base_path=str(out_dir))
+
+            # All ranks break together (train_until_converged was a barrier
+            # and evaluate_single_morphology_parallel runs collectives on
+            # all ranks, so they reach this point in lockstep).
+            break
 
         # Baseline mode: exit after inner convergence on first outer iter.
         # All ranks break together — train_until_converged is a barrier, so
@@ -3703,6 +3942,31 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
+    parser.add_argument("--stop-file", type=str, default=None,
+                        help="Path to a sentinel file that requests graceful "
+                             "early-stop. When the file exists, the inner "
+                             "loop exits at its next output_iter, the outer "
+                             "loop runs a deterministic CoT eval at current "
+                             "(theta, policy), saves a final checkpoint and "
+                             "an early_stop_eval.npz, then exits cleanly. "
+                             "Default: <out_dir>/STOP. Touch this file from "
+                             "any shell to request graceful exit (e.g. "
+                             "`touch <out_dir>/STOP`).")
+    parser.add_argument("--max-wallclock-min", type=float, default=None,
+                        help="If set, automatically request graceful early-"
+                             "stop after this many minutes of wallclock "
+                             "time. Useful for SLURM jobs to ensure a clean "
+                             "deterministic-eval + final checkpoint before "
+                             "the time limit terminates the job. Default: "
+                             "None (no timeout).")
+    parser.add_argument("--no-sigint-handler", action="store_true",
+                        help="Disable the rank-0 SIGINT (Ctrl-C) handler "
+                             "that requests graceful early-stop. Without "
+                             "this flag, the first Ctrl-C creates the stop "
+                             "file (clean shutdown with deterministic eval); "
+                             "a second Ctrl-C falls back to default Python "
+                             "SIGINT (hard exit). Pass this flag to fall "
+                             "back to default behavior on the first signal.")
     parser.add_argument("--convergence-mode", type=str, default="codesign",
                         choices=["codesign", "composite", "kl", "plateau"],
                         help="Inner convergence mode: 'codesign' (ep_len gate + task_reward plateau), "
