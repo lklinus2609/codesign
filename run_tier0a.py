@@ -1,18 +1,30 @@
 #!/usr/bin/env python3
-"""Tier 0a launcher: CMA-ES + SPSA-no-softdrop arms, 3 seeds each.
+"""Tier 0 + Tier 0a paper-runs launcher: 4 conditions x 3 seeds = 12 runs.
 
 Sequential runs (one at a time on the local node's GPUs). Each run uses
 fresh kickoff (no --resume-checkpoint) so the experimental claim is
 end-to-end. Bounded by --max-wallclock-min so deterministic CoT eval lands
-in <out_dir>/early_stop_eval.npz even if wallclock cap fires before the
-outer loop completes all iters.
+in <out_dir>/early_stop_eval.npz even if wallclock cap fires first.
+
+The four conditions:
+    spsa_full     - HEADLINE: full GBC method (SPSA + Adam + soft-drop ON)
+    cmaes         - COMPARISON: derivative-free baseline (constrained CMA-ES)
+    spsa_nodrop   - ABLATION:  GBC with soft-drop disabled (isolates the
+                               soft-drop contribution from the gradient)
+    baseline      - REFERENCE: PPO at theta=0, no co-design at all
+
+Reading the result table:
+    spsa_full vs baseline   -> "co-design beats no co-design"  (the claim)
+    spsa_full vs cmaes      -> "gradient beats derivative-free" (the novelty)
+    spsa_full vs spsa_nodrop-> "soft-drop is/isn't needed"     (the ablation)
 
 Usage (from the codesign_workspace dir):
-    python codesign/run_tier0a.py                       # all 6 runs (default)
-    python codesign/run_tier0a.py --only-cond cmaes     # 3 cmaes runs
-    python codesign/run_tier0a.py --only-seeds 7 5      # 4 runs (2 cond x 2 seeds)
-    python codesign/run_tier0a.py --max-wallclock-min 240
-    python codesign/run_tier0a.py --dry-run             # print commands, run nothing
+    python codesign/run_tier0a.py                          # all 12 runs
+    python codesign/run_tier0a.py --only-cond spsa_full    # headline only (3 runs)
+    python codesign/run_tier0a.py --only-cond spsa_full cmaes  # 6 runs
+    python codesign/run_tier0a.py --only-seeds 7           # 4 runs (1 per cond)
+    python codesign/run_tier0a.py --max-wallclock-min 240  # shorter per run
+    python codesign/run_tier0a.py --dry-run                # preview commands
 
 Per-run output dir: output_g1_unified/tier0a_fresh_<cond>_seed<seed>/
 Each contains model.pt, theta_latest.npy, early_stop_eval.npz.
@@ -37,22 +49,36 @@ from pathlib import Path
 REPO_DIR = Path(__file__).resolve().parent  # codesign/
 SCRIPT = REPO_DIR / "codesign_g1_unified.py"
 
-CONDITIONS = ["cmaes", "spsa_nodrop"]
+# Order matters: spsa_full first so a one-seed run gives the headline number.
+CONDITIONS = ["spsa_full", "cmaes", "spsa_nodrop", "baseline"]
 DEFAULT_SEEDS = [7, 5, 10]
 
 
 def cond_flags(cond):
     """Mode-specific CLI args."""
+    if cond == "spsa_full":
+        # HEADLINE GBC arm: SPSA + Adam outer optimizer + soft-drop ON
+        # (--snr-threshold 2.0 default + drop-window 3 default = permanent
+        # axis drop kicks in when median SNR over 3 iters < 2.0). This is
+        # the actual proposed method.
+        return [
+            "--mode", "spsa",
+            "--spsa-sets", "3",
+            "--spsa-epsilon", "0.05",
+            "--max-step-deg", "0.5",
+            "--design-optimizer", "adam",
+            "--adam-lr", "0.05",
+            # NOTE: no --ablate-soft-drop -> soft-drop is ON
+        ]
     if cond == "cmaes":
         # Constrained CMA-ES (sigma0=0.0087 rad ~0.5deg, maxsigma=0.0175 rad
         # ~1deg per axis -- per-script defaults). Reuses --num-spsa-seeds for
         # paired-seed averaging on each candidate.
         return ["--mode", "cmaes"]
     if cond == "spsa_nodrop":
-        # Adam optimizer (winner of BFGS vs Adam A/B). --ablate-soft-drop
-        # disables permanent axis dropping but keeps per-iter SNR mask, so
-        # the gain is attributable to the gradient signal, not the drop
-        # mechanism.
+        # ABLATION arm: same as spsa_full but --ablate-soft-drop disables
+        # permanent axis dropping (per-iter SNR mask still active). Tells us
+        # whether the gain comes from the gradient signal or from soft-drop.
         return [
             "--mode", "spsa",
             "--spsa-sets", "3",
@@ -61,6 +87,15 @@ def cond_flags(cond):
             "--design-optimizer", "adam",
             "--adam-lr", "0.05",
             "--ablate-soft-drop",
+        ]
+    if cond == "baseline":
+        # REFERENCE: --baseline exits after first inner convergence at
+        # theta=0. Outer loop never fires. Final inner CoT (visible in
+        # wandb) is the "no co-design" answer. SPSA flags below are
+        # ignored because outer loop never runs.
+        return [
+            "--mode", "spsa",
+            "--baseline",
         ]
     raise ValueError(f"Unknown cond: {cond}")
 
