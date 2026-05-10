@@ -3072,17 +3072,41 @@ def gbc_worker(rank, num_procs, device, master_port, args):
 
         history["inner_times"].append(inner_time)
 
-        # ----- Graceful early-stop: deterministic eval + save + exit -----
-        # Triggered when the user / SIGINT handler / wallclock timer created
-        # the stop file. Inner loop already exited at output_iter; we now run
-        # one paired-seed evaluation at the current (theta, policy) so the
-        # user gets a deterministic CoT/reward number with the same noise
-        # control as a regular SPSA center evaluation. Mirrors the baseline-
-        # exit path below: all ranks run the eval (it is a collective), root
-        # writes outputs, all ranks break.
+        # ----- Deterministic eval at exit (early-stop OR baseline path) -----
+        # Both exit paths run the same paired-seed evaluation at the current
+        # (theta, policy) so the user gets a deterministic CoT/reward number
+        # with the same noise control regardless of how the run terminated.
+        # All ranks run the eval (it is a collective via
+        # evaluate_single_morphology_parallel); root writes outputs; all
+        # ranks break together (train_until_converged was a barrier, so
+        # every rank reaches this point in lockstep).
+        #
+        # Output schema is shared across exit paths so downstream analysis
+        # uses one file/key set regardless of cause:
+        #   - <out_dir>/early_stop_eval.npz   (file kept named this way for
+        #                                      backward compat with seeds
+        #                                      already run before option B)
+        #   - wandb keys outer/early_stop_*   (same reason)
+        #   - outer/early_stop_exit_cause     {0=early_stop, 1=baseline}
+        exit_label = None
+        exit_cause_id = None
         if inner_ctrl._early_stopped:
+            exit_label = "Early stop"
+            exit_cause_id = 0
+        elif args.baseline:
+            # Baseline mode: exit after first inner convergence (no outer
+            # loop). Run a deterministic eval at theta=0 so the baseline
+            # CoT is comparable to SPSA/CMA-ES early_stop_eval.npz numbers.
+            exit_label = "Baseline"
+            exit_cause_id = 1
             if is_root:
-                print(f"\n  [Early stop] Running deterministic eval at "
+                print(f"\n  [Baseline] Inner loop converged in "
+                      f"{inner_time / 60:.1f} min. Running deterministic "
+                      f"eval at theta before exit...")
+
+        if exit_label is not None:
+            if is_root:
+                print(f"\n  [{exit_label}] Running deterministic eval at "
                       f"current theta with {args.num_spsa_seeds} seeds, "
                       f"{args.eval_horizon} steps...")
 
@@ -3122,17 +3146,18 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     )
                     + args.outer_disc_weight * es_disc
                 )
-                print(f"  [Early stop] Deterministic eval at theta:")
+                print(f"  [{exit_label}] Deterministic eval at theta:")
                 print(f"    CoT          = {es_cot:.6f}")
                 print(f"    vel_tracking = {es_vel_track:.6f}")
                 print(f"    term_rate    = {es_term:.6f}")
                 print(f"    disc_center  = {es_disc:.6f}")
                 print(f"    center_reward= {es_reward:+.6f}")
                 print(f"    seeds={args.num_spsa_seeds}, horizon="
-                      f"{args.eval_horizon}, base_seed={es_base_seed}")
+                      f"{args.eval_horizon}, base_seed={es_base_seed}, "
+                      f"exit_cause={exit_label}")
 
-                # Save deterministic eval to a stable filename for downstream
-                # paper-table consumption + final checkpoint at iter_dir.
+                # Save deterministic eval. Filename + key prefix kept as
+                # `early_stop_eval` for backward compat with prior seeds.
                 eval_npz = out_dir / "early_stop_eval.npz"
                 np.savez(
                     str(eval_npz),
@@ -3144,9 +3169,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     eval_horizon=args.eval_horizon,
                     base_seed=es_base_seed,
                     outer_iter=outer_iter,
+                    exit_cause=exit_cause_id,
                 )
                 np.save(str(out_dir / "theta_latest.npy"), theta)
-                print(f"  [Early stop] Saved {eval_npz}, "
+                print(f"  [{exit_label}] Saved {eval_npz}, "
                       f"checkpoint at {iter_dir / 'model.pt'}")
 
                 if use_wandb:
@@ -3158,6 +3184,7 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                         "outer/early_stop_reward": es_reward,
                         "outer/early_stop_outer_iter": outer_iter,
                         "outer/early_stop_seeds": args.num_spsa_seeds,
+                        "outer/early_stop_exit_cause": exit_cause_id,
                     }, step=agent._iter)
                     wandb.save(str(eval_npz), base_path=str(out_dir))
                     wandb.save(str(iter_dir / "model.pt"),
@@ -3165,19 +3192,6 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                     wandb.save(str(out_dir / "theta_latest.npy"),
                                base_path=str(out_dir))
 
-            # All ranks break together (train_until_converged was a barrier
-            # and evaluate_single_morphology_parallel runs collectives on
-            # all ranks, so they reach this point in lockstep).
-            break
-
-        # Baseline mode: exit after inner convergence on first outer iter.
-        # All ranks break together — train_until_converged is a barrier, so
-        # every rank reaches this point at the same time.
-        if args.baseline:
-            if is_root:
-                print(f"\n  [Baseline] Inner loop converged in "
-                      f"{inner_time / 60:.1f} min. Final checkpoint at "
-                      f"{iter_dir / 'model.pt'}. Exiting without SPSA.")
             break
 
         # After kickoff, disable min_inner_iters gate for subsequent iters.
