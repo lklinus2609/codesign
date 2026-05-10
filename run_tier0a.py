@@ -162,9 +162,10 @@ def main():
                     help="Per-run max inner iters (default: 40000 -- "
                          "essentially uncapped; plateau detector + wallclock "
                          "cap own termination)")
-    ap.add_argument("--max-wallclock-min", type=float, default=460,
-                    help="Per-run wallclock cap in minutes (default: 460 = "
-                         "7h40m, leaving ~20m for graceful eval)")
+    ap.add_argument("--max-wallclock-min", type=float, default=820,
+                    help="Per-run wallclock cap in minutes (default: 820 = "
+                         "13h40m, leaving ~20m for graceful eval inside a "
+                         "14h idev/SLURM allocation)")
     ap.add_argument("--dry-run", action="store_true",
                     help="Print commands without executing")
     args = ap.parse_args()
