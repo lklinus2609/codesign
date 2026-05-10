@@ -818,30 +818,54 @@ def should_stop_early(stop_file_path, wallclock_start, max_wallclock_min, is_roo
 
 
 def _install_sigint_handler(stop_file_path, is_root):
-    """Install a root-only SIGINT handler that requests graceful early-stop.
+    """Install per-rank SIGINT handlers that cooperate on graceful early-stop.
 
-    Avoids in-process raise/exit (which would deadlock NCCL collectives mid-
-    iteration). The handler just creates the stop file; the inner loop polls
-    the file at output_iter boundaries. After the first Ctrl-C, the default
-    SIGINT handler is restored so a second Ctrl-C forces a hard exit (escape
-    hatch if the deterministic eval block hangs).
+    Multi-GPU correctness: in spawn-mode multi-process runs, all worker
+    processes share the foreground process group, so Ctrl-C in the terminal
+    delivers SIGINT to every rank. Without a custom handler, non-root ranks
+    raise KeyboardInterrupt and crash mid-collective, killing the TCPStore
+    and producing a flood of "Broken pipe" / NCCL heartbeat errors while
+    rank 0 hangs at the next collective.
+
+    Behavior:
+      - Rank 0: first SIGINT creates the stop file (the inner loop polls
+        for it at output_iter boundaries) and restores SIG_DFL so a second
+        Ctrl-C is a hard kill (escape hatch if the deterministic eval block
+        hangs).
+      - Non-root ranks: first SIGINT is absorbed (no-op) so the rank stays
+        alive long enough to reach the next collective and follow rank 0's
+        broadcast into the deterministic eval + clean exit. A second SIGINT
+        on the non-root rank also restores SIG_DFL (double Ctrl-C still
+        works as a hard-kill across all ranks).
     """
-    if not is_root or stop_file_path is None:
+    if stop_file_path is None:
         return
     import signal as _signal
 
-    def _handler(signum, frame):
-        try:
-            stop_file_path.touch(exist_ok=True)
-            print(f"\n  [SIGINT] caught -- stop file created at "
-                  f"{stop_file_path}. Inner loop exits at next output_iter, "
-                  f"then deterministic CoT eval runs before final save + exit. "
-                  f"Press Ctrl-C again to hard-kill.")
-        except Exception as e:
-            print(f"\n  [SIGINT] failed to create stop file: {e}")
-        _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
-
-    _signal.signal(_signal.SIGINT, _handler)
+    if is_root:
+        def _root_handler(signum, frame):
+            try:
+                stop_file_path.touch(exist_ok=True)
+                print(f"\n  [SIGINT rank 0] stop file created at "
+                      f"{stop_file_path}. Inner loop exits at next "
+                      f"output_iter; deterministic CoT eval runs, then "
+                      f"clean exit. Press Ctrl-C again to hard-kill.",
+                      flush=True)
+            except Exception as e:
+                print(f"\n  [SIGINT rank 0] failed to create stop file: {e}",
+                      flush=True)
+            _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+        _signal.signal(_signal.SIGINT, _root_handler)
+    else:
+        def _nonroot_handler(signum, frame):
+            # Absorb first SIGINT silently. Rank 0 owns the stop signal via
+            # the file; we just need to stay alive long enough to reach the
+            # next collective and adopt rank 0's broadcast decision.
+            print(f"\n  [SIGINT non-root] absorbed; waiting for rank 0 "
+                  f"to broadcast graceful-exit decision. Press Ctrl-C "
+                  f"again to hard-kill.", flush=True)
+            _signal.signal(_signal.SIGINT, _signal.SIG_DFL)
+        _signal.signal(_signal.SIGINT, _nonroot_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -2715,10 +2739,12 @@ def gbc_worker(rank, num_procs, device, master_port, args):
                   "use --convergence-mode=plateau instead")
 
     # ----- Graceful early-stop wiring -----
-    # Default stop file is <out_dir>/STOP. SIGINT handler installs only on
-    # rank 0 (other ranks would deadlock NCCL on signal); the file mediates
-    # cross-rank visibility. Wallclock timer also runs on rank 0 and
-    # creates the file when triggered.
+    # Default stop file is <out_dir>/STOP. SIGINT handler installs on every
+    # rank: rank 0 creates the file, non-root absorbs and waits for the
+    # broadcast (otherwise non-root ranks crash with KeyboardInterrupt mid-
+    # collective and the TCPStore dies, producing a flood of broken-pipe
+    # errors while rank 0 hangs). The file mediates cross-rank visibility.
+    # Wallclock timer also runs on rank 0 and creates the file when triggered.
     if args.stop_file is not None:
         stop_file_path = Path(args.stop_file).resolve()
     else:
