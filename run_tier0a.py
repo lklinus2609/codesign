@@ -89,13 +89,19 @@ def cond_flags(cond):
             "--ablate-soft-drop",
         ]
     if cond == "baseline":
-        # REFERENCE: --baseline exits after first inner convergence at
-        # theta=0. Outer loop never fires. Final inner CoT (visible in
-        # wandb) is the "no co-design" answer. SPSA flags below are
-        # ignored because outer loop never runs.
+        # REFERENCE: --baseline exits after the inner loop terminates at
+        # theta=0. Outer loop never fires. Setting the plateau threshold
+        # absurdly small (1e-7) prevents plateau-based exit so inner PPO
+        # trains until the wallclock cap fires (--max-wallclock-min). This
+        # is the compute-matched comparator for SPSA -- baseline gets the
+        # same wallclock budget for inner training as the SPSA arm. The
+        # graceful early-stop machinery then runs the deterministic eval
+        # at theta=0 with paired seeds and saves early_stop_eval.npz.
+        # SPSA flags below are ignored because the outer loop never runs.
         return [
             "--mode", "spsa",
             "--baseline",
+            "--inner-cot-plateau-threshold", "0.0000001",
         ]
     raise ValueError(f"Unknown cond: {cond}")
 
@@ -124,10 +130,13 @@ def common_flags(seed, max_inner_iters, max_wallclock_min, out_dir):
 
 def run_one(cond, seed, max_inner_iters, max_wallclock_min, dry_run):
     out_dir = Path("output_g1_unified") / f"tier0a_fresh_{cond}_seed{seed}"
+    # common_flags first, cond_flags last so cond can override common values
+    # (e.g. baseline overrides --inner-cot-plateau-threshold to disable
+    # plateau-based exit). argparse keeps the last value for duplicate flags.
     cmd = (
         ["python", str(SCRIPT)]
-        + cond_flags(cond)
         + common_flags(seed, max_inner_iters, max_wallclock_min, out_dir)
+        + cond_flags(cond)
     )
     print()
     print("=" * 70)
