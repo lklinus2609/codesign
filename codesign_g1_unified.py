@@ -2475,7 +2475,24 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     modified_mjcf = out_dir / "g1_modified.xml"
     modified_env_config = out_dir / "env_config.yaml"
 
+    # Load --init-theta if provided, else start at theta=0. The MJCF generated
+    # from this theta is what gets baked into the env at build time; the outer
+    # loop's theta variable is also initialised to the same value below so
+    # SPSA / CMA-ES start from this morphology rather than from zero.
     theta_init = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+    if args.init_theta is not None:
+        loaded = np.load(args.init_theta)
+        assert loaded.shape == (NUM_DESIGN_PARAMS,), (
+            f"--init-theta file shape {loaded.shape} does not match "
+            f"NUM_DESIGN_PARAMS ({NUM_DESIGN_PARAMS},). Check --design-scope "
+            f"matches the run that produced the theta file."
+        )
+        theta_init = loaded.astype(np.float64)
+        if is_root:
+            theta_deg = np.degrees(theta_init)
+            print(f"  [Init theta] loaded from {args.init_theta}")
+            print(f"               mean |theta| = {np.mean(np.abs(theta_deg)):.3f} deg, "
+                  f"max |theta| = {np.max(np.abs(theta_deg)):.3f} deg")
     if is_root:
         mjcf_modifier.generate(theta_init, str(modified_mjcf))
 
@@ -2646,6 +2663,7 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
         char_id=char_id, total_mass=total_mass,
         base_quats_dict=base_quats_dict, joint_idx_map=joint_idx_map,
         viewer=viewer, use_wandb=use_wandb, out_dir=out_dir, log_file=log_file,
+        theta_init=theta_init,
     )
 
 
@@ -2675,7 +2693,10 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     if is_root:
         print("[3/3] Starting GBC outer loop...\n")
 
-    theta = np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+    # Initialise outer-loop theta to match the env's morphology. theta_init
+    # was set above from --init-theta (or zeros). The outer loop must start
+    # here so the SPSA / CMA-ES starting point matches the env build.
+    theta = ws.theta_init.copy() if hasattr(ws, "theta_init") else np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
     if args.design_optimizer == "bfgs":
         design_opt = CautiousBFGS(NUM_DESIGN_PARAMS,
                                   cautious=not args.ablate_cautious_bfgs)
@@ -3982,6 +4003,15 @@ if __name__ == "__main__":
     parser.add_argument("--out-dir", type=str, default="output_g1_unified")
     parser.add_argument("--resume-checkpoint", type=str, default=None,
                         help="MimicKit checkpoint to resume from")
+    parser.add_argument("--init-theta", type=str, default=None,
+                        help="Path to a .npy file containing an initial theta "
+                             "vector (radians, shape (NUM_DESIGN_PARAMS,)). "
+                             "Loaded at env-build time so the MJCF is generated "
+                             "with this morphology, and the outer-loop theta "
+                             "variable is initialised to match. Use with "
+                             "--baseline to validate a discovered morphology "
+                             "with fresh PPO at fixed theta. Default: None "
+                             "(theta=0 = unmodified G1).")
     parser.add_argument("--stop-file", type=str, default=None,
                         help="Path to a sentinel file that requests graceful "
                              "early-stop. When the file exists, the inner "
