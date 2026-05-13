@@ -382,7 +382,6 @@ def main():
     # =========================================================
     # TEST A: eval-only sweep (5 evals, ~25 min)
     # =========================================================
-    a_cots, a_rewards = [None] * len(TEST_A_DEGREES), [None] * len(TEST_A_DEGREES)
     if not args.skip_test_a:
         for i, deg in enumerate(TEST_A_DEGREES):
             sub = out_root / f"test_a_{deg:+d}"
@@ -401,7 +400,9 @@ def main():
             rc = run_subprocess(cmd, f"TEST A axis={axis_name} theta={deg:+d}deg", args.dry_run)
             if rc != 0:
                 print(f"[WARN] TEST A theta={deg:+d} exited {rc}; continuing")
-        a_cots, a_rewards = test_a_analyze(out_root, TEST_A_DEGREES) if not args.dry_run else ([None]*5, [None]*5)
+    # Always try to read existing TEST A results (lets a follow-up run that
+    # passes --skip-test-a still include this test in the final report).
+    a_cots, a_rewards = test_a_analyze(out_root, TEST_A_DEGREES) if not args.dry_run else ([None]*5, [None]*5)
 
     # =========================================================
     # TEST C: SPSA gradient cosine similarity (2 runs, ~10 min)
@@ -424,14 +425,18 @@ def main():
             rc = run_subprocess(cmd, f"TEST C gradient seed={s}", args.dry_run)
             if rc != 0:
                 print(f"[WARN] TEST C seed={s} exited {rc}; continuing")
-        c_cos, c_status = test_c_analyze(out_root, c_seeds) if not args.dry_run else (None, "dry-run")
-    else:
+    # Always try to read existing TEST C gradients (lets follow-up runs that
+    # pass --skip-test-c still include cosine similarity in the final report).
+    if not args.dry_run:
+        c_cos, c_status = test_c_analyze(out_root, c_seeds)
+    elif args.skip_test_c:
         c_cos, c_status = None, "skipped"
+    else:
+        c_cos, c_status = None, "dry-run"
 
     # =========================================================
     # TEST B: fresh-PPO sweep (conditional, 3 runs, ~12h)
     # =========================================================
-    b_cots, b_rewards = [None] * len(TEST_B_DEGREES), [None] * len(TEST_B_DEGREES)
     skipped_b = args.skip_test_b
     if not args.skip_test_b and not args.dry_run:
         # Auto-skip if TEST A clearly showed F1
@@ -462,18 +467,25 @@ def main():
             rc = run_subprocess(cmd, f"TEST B axis={axis_name} theta={deg:+d}deg (fresh PPO)", args.dry_run)
             if rc != 0:
                 print(f"[WARN] TEST B theta={deg:+d} exited {rc}; continuing")
-        if not args.dry_run:
-            b_cots = []
-            b_rewards = []
-            for deg in TEST_B_DEGREES:
-                npz = out_root / f"test_b_{deg:+d}" / "early_stop_eval.npz"
-                if npz.exists():
-                    d = np.load(str(npz))
-                    b_cots.append(float(d["cot"]))
-                    b_rewards.append(float(d["center_reward"]))
-                else:
-                    b_cots.append(None)
-                    b_rewards.append(None)
+    # Always try to read existing TEST B results (so follow-up runs that
+    # pass --skip-test-b can still include B in the report if it ran prior).
+    b_cots, b_rewards = [], []
+    if not args.dry_run:
+        for deg in TEST_B_DEGREES:
+            npz = out_root / f"test_b_{deg:+d}" / "early_stop_eval.npz"
+            if npz.exists():
+                d = np.load(str(npz))
+                b_cots.append(float(d["cot"]))
+                b_rewards.append(float(d["center_reward"]))
+            else:
+                b_cots.append(None)
+                b_rewards.append(None)
+    else:
+        b_cots = [None] * len(TEST_B_DEGREES)
+        b_rewards = [None] * len(TEST_B_DEGREES)
+    # Flag whether B is genuinely absent (so the report says "skipped" only
+    # if no B data exists on disk).
+    skipped_b = skipped_b and all(c is None for c in b_cots)
 
     # =========================================================
     # Report
