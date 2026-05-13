@@ -2697,6 +2697,117 @@ def gbc_worker(rank, num_procs, device, master_port, args):
     # was set above from --init-theta (or zeros). The outer loop must start
     # here so the SPSA / CMA-ES starting point matches the env build.
     theta = ws.theta_init.copy() if hasattr(ws, "theta_init") else np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+
+    # =========================================================
+    # Diagnostic modes (--eval-only / --diagnostic-gradient)
+    # =========================================================
+    # These short-circuit the outer loop entirely. They are used by the
+    # diagnostic orchestrator (run_diagnostics.py) to probe the loss
+    # landscape and SPSA gradient quality without paying for a full GBC
+    # run. Both require --resume-checkpoint (a trained policy) and
+    # optionally --init-theta (a starting morphology).
+
+    if args.eval_only:
+        if is_root:
+            print(f"\n[DIAGNOSTIC] --eval-only: paired-seed eval at theta, "
+                  f"then exit.")
+            theta_deg = np.degrees(theta)
+            for i in range(NUM_DESIGN_PARAMS):
+                if abs(theta_deg[i]) > 1e-3:
+                    print(f"  theta[{i}] = {theta_deg[i]:+.4f} deg")
+
+        env._cot_tracker.get_stats()
+        env._cot_tracker.reset_accumulators()
+        eval_disc = args.disc_morph_invariant and args.outer_disc_weight != 0.0
+        es_base_seed = args.seed + 900_000  # offset so seeds don't collide with SPSA evals
+        (es_cot, es_vt, es_disc, es_term) = evaluate_single_morphology_parallel(
+            agent, env, engine, char_id, total_mass,
+            theta.copy(), base_quats_dict, joint_idx_map,
+            per_rank_envs, args.eval_horizon,
+            rank, num_procs, device,
+            num_seeds=args.num_spsa_seeds, base_seed=es_base_seed,
+            vel_reward_weight=args.vel_reward_weight,
+            vel_cmd=args.vel_cmd,
+            vel_tracking_sigma=args.vel_tracking_sigma,
+            outer_task_weight=args.outer_task_weight,
+            outer_disc_weight=args.outer_disc_weight,
+            outer_term_penalty=args.outer_term_penalty,
+            eval_disc_reward=eval_disc,
+        )
+        if is_root:
+            es_reward = (
+                args.outer_task_weight * (
+                    -5.0 * es_cot + args.vel_reward_weight * es_vt
+                    + args.outer_term_penalty * es_term)
+                + args.outer_disc_weight * es_disc
+            )
+            print(f"\n  [DIAGNOSTIC] CoT={es_cot:.6f}  vel={es_vt:.6f}  "
+                  f"term={es_term:.6f}  disc={es_disc:.6f}  reward={es_reward:+.6f}")
+            eval_npz = out_dir / "early_stop_eval.npz"
+            np.savez(str(eval_npz), cot=es_cot, vel_tracking=es_vt,
+                     term_rate=es_term, disc_center=es_disc,
+                     center_reward=es_reward, theta=theta,
+                     num_seeds=args.num_spsa_seeds,
+                     eval_horizon=args.eval_horizon,
+                     base_seed=es_base_seed,
+                     outer_iter=0, exit_cause=2)   # 2 = eval-only diagnostic
+            np.save(str(out_dir / "theta_latest.npy"), theta)
+            print(f"  [DIAGNOSTIC] Saved {eval_npz}")
+            if use_wandb:
+                wandb.log({"outer/early_stop_cot": es_cot,
+                           "outer/early_stop_reward": es_reward,
+                           "outer/early_stop_exit_cause": 2})
+                wandb.save(str(eval_npz), base_path=str(out_dir))
+        if use_wandb:
+            wandb.finish()
+        return {"eval_only_cot": es_cot if is_root else None}
+
+    if args.diagnostic_gradient:
+        if is_root:
+            print(f"\n[DIAGNOSTIC] --diagnostic-gradient: compute SPSA "
+                  f"gradient at theta, save, exit.")
+        env._cot_tracker.get_stats()
+        env._cot_tracker.reset_accumulators()
+        eval_disc = args.disc_morph_invariant and args.outer_disc_weight != 0.0
+        param_names = [
+            f"theta_{i}_{group_param_name(DESIGN_GROUPS[i])}"
+            for i in range(NUM_DESIGN_PARAMS)
+        ]
+        active_mask = np.ones(NUM_DESIGN_PARAMS, dtype=bool)
+        # Use args.seed directly as the SPSA base_seed so two runs with
+        # different --seed produce independently-sampled gradient estimates
+        # at the same theta (this enables the cosine-similarity check).
+        (grad, stderr, snr, vt, cot, disc, term) = compute_spsa_gradient_parallel(
+            agent, env, engine, char_id, total_mass,
+            theta.copy(), base_quats_dict, joint_idx_map,
+            per_rank_envs, args.eval_horizon,
+            rank, num_procs, device, param_names,
+            num_seeds=args.num_spsa_seeds, base_seed=args.seed,
+            eps=args.spsa_epsilon, vel_reward_weight=args.vel_reward_weight,
+            vel_cmd=args.vel_cmd, vel_tracking_sigma=args.vel_tracking_sigma,
+            num_spsa_sets=args.spsa_sets,
+            outer_task_weight=args.outer_task_weight,
+            outer_disc_weight=args.outer_disc_weight,
+            outer_term_penalty=args.outer_term_penalty,
+            eval_disc_reward=eval_disc, active_mask=active_mask,
+        )
+        if is_root:
+            grad_npz = out_dir / "diagnostic_gradient.npz"
+            np.savez(str(grad_npz), grad=grad, stderr=stderr, snr=snr,
+                     vel_tracking=vt, cot=cot, disc_center=disc, term_rate=term,
+                     theta=theta, seed=args.seed,
+                     num_spsa_seeds=args.num_spsa_seeds,
+                     spsa_sets=args.spsa_sets, spsa_epsilon=args.spsa_epsilon)
+            print(f"\n  [DIAGNOSTIC] Saved {grad_npz}")
+            print(f"  ||grad||={np.linalg.norm(grad):.4f}  "
+                  f"mean SNR={np.mean(snr[np.isfinite(snr)]):.2f}  "
+                  f"CoT={cot:.5f}  reward={cot:.5f}")
+            if use_wandb:
+                wandb.save(str(grad_npz), base_path=str(out_dir))
+        if use_wandb:
+            wandb.finish()
+        return {"gradient": grad if is_root else None}
+
     if args.design_optimizer == "bfgs":
         design_opt = CautiousBFGS(NUM_DESIGN_PARAMS,
                                   cautious=not args.ablate_cautious_bfgs)
@@ -4012,6 +4123,23 @@ if __name__ == "__main__":
                              "--baseline to validate a discovered morphology "
                              "with fresh PPO at fixed theta. Default: None "
                              "(theta=0 = unmodified G1).")
+    parser.add_argument("--eval-only", action="store_true",
+                        help="DIAGNOSTIC: skip all PPO training and the outer "
+                             "loop. After loading --resume-checkpoint and "
+                             "applying --init-theta, run only the paired-seed "
+                             "deterministic eval at the current theta + "
+                             "policy and save early_stop_eval.npz. Used by "
+                             "run_diagnostics.py to probe the loss landscape "
+                             "(CoT vs theta) at fixed policy.")
+    parser.add_argument("--diagnostic-gradient", action="store_true",
+                        help="DIAGNOSTIC: skip all PPO training and the outer "
+                             "loop. After loading --resume-checkpoint and "
+                             "applying --init-theta, run only the SPSA "
+                             "gradient computation at the current theta + "
+                             "policy and save diagnostic_gradient.npz. Used "
+                             "by run_diagnostics.py to probe SPSA gradient "
+                             "quality (cosine similarity between independent "
+                             "estimates at the same theta).")
     parser.add_argument("--stop-file", type=str, default=None,
                         help="Path to a sentinel file that requests graceful "
                              "early-stop. When the file exists, the inner "
