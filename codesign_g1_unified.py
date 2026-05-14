@@ -120,6 +120,21 @@ from g1_mjcf_modifier import (
 # main() overwrites these based on --design-scope before any use.
 DESIGN_GROUPS = LOWER_SYMMETRIC_GROUPS
 NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
+
+# Phase 1: design-space interpretation. "angles" = body-quaternion X-rotation
+# in radians (joint-angle co-design, original behaviour). "ke"/"kd"/"effort" =
+# log-space multiplier on joint_target_ke / joint_target_kd / joint_effort_limit
+# per DESIGN_GROUPS joint (actuator co-design). Same DESIGN_GROUPS structure
+# regardless. main() and _init_gbc_worker overwrite this from args.design_space.
+DESIGN_SPACE = "angles"
+# Actuator-mode state populated by extract_joint_info() when DESIGN_SPACE !=
+# "angles". Held as module globals so the existing helpers (apply_partitioned_*,
+# update_training_*) can dispatch without changing their public signatures.
+_DOF_IDX_MAP = None         # {body_name: [DOF local indices within one env]}
+_BASE_KE = None             # full numpy array (num_worlds * dofs_per_env,)
+_BASE_KD = None             # ditto
+_BASE_EFFORT = None         # ditto, or None if joint_effort_limit missing
+_DOFS_PER_WORLD = None      # DOFs per env (e.g. 35 for G1)
 from convergence_gate import CompositeConvergenceGate
 try:
     import wandb
@@ -875,10 +890,17 @@ def _install_sigint_handler(stop_file_path, is_root):
 def extract_joint_info(model, num_worlds):
     """Extract base quaternions and joint index map from Newton model.
 
+    Also populates module-level actuator state (_DOF_IDX_MAP, _BASE_KE/_KD/_EFFORT,
+    _DOFS_PER_WORLD) when DESIGN_SPACE != "angles", so the dispatch helpers
+    (apply_partitioned_morphologies / update_training_joint_X_p / etc.) can
+    route into the actuator path with no signature changes.
+
     Returns:
         base_quats_dict: {body_name: (w,x,y,z)} for parameterized bodies
         joint_idx_map:   {body_name: local_joint_index}
     """
+    global _DOF_IDX_MAP, _BASE_KE, _BASE_KD, _BASE_EFFORT, _DOFS_PER_WORLD
+
     joint_keys = model.joint_key
     joints_per_world = model.joint_count // num_worlds
 
@@ -911,17 +933,47 @@ def extract_joint_info(model, num_worlds):
 
     print(f"  [JointInfo] Found {len(joint_idx_map)} parameterized joints "
           f"(expected {expected_joint_count})")
+
+    if DESIGN_SPACE != "angles":
+        # Phase 1: also stash actuator perturbation state. We always extract
+        # ke/kd/effort baselines so a future restart can introspect, but only
+        # the array matching DESIGN_SPACE is actually written each iter.
+        _DOF_IDX_MAP, _DOFS_PER_WORLD = _compute_dof_idx_map(model, num_worlds)
+        _BASE_KE = (model.joint_target_ke.numpy().copy()
+                    if hasattr(model, "joint_target_ke") else None)
+        _BASE_KD = (model.joint_target_kd.numpy().copy()
+                    if hasattr(model, "joint_target_kd") else None)
+        _BASE_EFFORT = (model.joint_effort_limit.numpy().copy()
+                        if hasattr(model, "joint_effort_limit") else None)
+        active_base = _base_for(DESIGN_SPACE)
+        if active_base is None:
+            raise ValueError(
+                f"--design-space={DESIGN_SPACE} requires model.joint_target_"
+                f"{DESIGN_SPACE} (or joint_effort_limit) but it is missing.")
+        print(f"  [ActuatorInfo] design_space={DESIGN_SPACE}, "
+              f"{len(_DOF_IDX_MAP)} parameterized joints, "
+              f"{_DOFS_PER_WORLD} DOFs/env, "
+              f"base range=[{active_base.min():.3f}, {active_base.max():.3f}]")
+
     return base_quats_dict, joint_idx_map
 
 
 def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
                                num_worlds):
-    """Update training model joint_X_p in-place for new theta.
+    """Update training model design in-place for new theta.
 
-    Uses numpy round-trip (one per outer iter, negligible cost).
-    model.joint_X_p.assign() writes to the same device pointer, so the
-    CUDA graph picks up the new values without recapture.
+    Dispatches on DESIGN_SPACE:
+      - "angles" (default): write joint_X_p (body quaternion X-rotation)
+      - "ke"/"kd"/"effort": write joint_target_ke/kd/joint_effort_limit
+        as log-space multiplier of original baseline.
+
+    Uses numpy round-trip (one per outer iter, negligible cost). .assign()
+    writes to the same device pointer so the CUDA graph picks up new values
+    without recapture.
     """
+    if DESIGN_SPACE != "angles":
+        return _apply_actuator_uniform(model, theta_np, num_worlds, DESIGN_SPACE)
+
     joints_per_world = model.joint_count // num_worlds
     joint_X_p_np = model.joint_X_p.numpy()
 
@@ -940,6 +992,169 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
             joint_X_p_np[global_indices, 3:7] = [new_q[1], new_q[2], new_q[3], new_q[0]]
 
     model.joint_X_p.assign(joint_X_p_np)
+    wp.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1: actuator-parameter perturbation (joint_target_ke/kd/joint_effort_limit)
+# ---------------------------------------------------------------------------
+# Probed in probe_newton_arrays.py (Phase 0): joint_target_ke / joint_target_kd
+# and joint_effort_limit all propagate in-place via .assign(), exactly like
+# joint_X_p. theta in these modes is interpreted as a log-space multiplier:
+#     new_value[dof] = base[dof] * exp(theta[group_of_dof])
+# Bounds default to +/-0.7 (factor ~0.5x to ~2.0x).
+
+def _resolve_actuator_target(model, kind):
+    if kind == "ke":
+        return model.joint_target_ke
+    if kind == "kd":
+        return model.joint_target_kd
+    if kind == "effort":
+        return model.joint_effort_limit
+    raise ValueError(f"Unknown actuator kind: {kind}")
+
+
+def _base_for(kind):
+    if kind == "ke":
+        return _BASE_KE
+    if kind == "kd":
+        return _BASE_KD
+    if kind == "effort":
+        return _BASE_EFFORT
+    raise ValueError(f"Unknown actuator kind: {kind}")
+
+
+def _compute_dof_idx_map(model, num_worlds):
+    """Build {body_name: [DOF local indices within one env]} for DESIGN_GROUPS.
+
+    Uses model.joint_qd_start (cumulative DOF start per joint) when available,
+    else falls back to a free-base + 1-DOF-revolute heuristic.
+
+    Returns (dof_idx_map, dofs_per_world).
+    """
+    joint_keys = model.joint_key
+    joints_per_world = model.joint_count // num_worlds
+    joint_name_to_idx = {joint_keys[i]: i for i in range(joints_per_world)}
+
+    # Infer total DOFs per env from joint_target_ke shape (used as truth).
+    ke_arr = model.joint_target_ke.numpy()
+    total_dofs = ke_arr.shape[0]
+    dofs_per_world = total_dofs // num_worlds
+
+    if hasattr(model, "joint_qd_start"):
+        qd_start_np = np.asarray(model.joint_qd_start.numpy())
+        def dofs_for_joint(j_local):
+            return list(range(int(qd_start_np[j_local]),
+                              int(qd_start_np[j_local + 1])))
+    else:
+        # Fallback: joint 0 = free-base (6 DOFs), joints 1..N-1 = revolute (1 DOF).
+        def dofs_for_joint(j_local):
+            if j_local == 0:
+                return list(range(6))
+            return [5 + j_local]
+
+    dof_idx_map = {}
+    for group in DESIGN_GROUPS:
+        for body_name in group:
+            joint_name = body_to_joint_name(body_name)
+            j = joint_name_to_idx.get(joint_name)
+            if j is None:
+                raise ValueError(
+                    f"Joint not found in Newton model: {joint_name} "
+                    f"(body: {body_name}). Cannot build DOF index map.")
+            dof_idx_map[body_name] = dofs_for_joint(j)
+
+    return dof_idx_map, dofs_per_world
+
+
+def _apply_actuator_partitioned(model, theta_log, eps, n_params, num_worlds,
+                                 worlds_per_pert, directions, kind):
+    """Per-partition in-place write of joint_target_{kind}.
+
+    Same partition layout as apply_partitioned_morphologies:
+      partition 0:           theta_log (center)
+      partition 2*m+1:       theta_log + eps * directions[m]
+      partition 2*m+2:       theta_log - eps * directions[m]
+    Each partition occupies worlds_per_pert worlds. Factor applied per partition
+    = exp(theta_pert[group_idx]) on each DOF belonging to the group.
+    """
+    if directions is None:
+        directions = np.eye(n_params)
+    M = directions.shape[0]
+    n_pert = 1 + 2 * M
+    base = _base_for(kind)
+    if base is None:
+        raise ValueError(f"Base array for kind={kind} not populated; "
+                         f"call extract_joint_info under DESIGN_SPACE={kind} "
+                         f"first")
+    new_full = base.copy()
+
+    for p in range(n_pert):
+        if p == 0:
+            theta_pert = theta_log
+        else:
+            m = (p - 1) // 2
+            sign = 1.0 if (p % 2 == 1) else -1.0
+            theta_pert = theta_log + sign * eps * directions[m]
+
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+        world_indices = np.arange(w_start, w_end)
+
+        for i, group in enumerate(DESIGN_GROUPS):
+            factor = float(np.exp(theta_pert[i]))
+            for body_name in group:
+                if body_name not in _DOF_IDX_MAP:
+                    continue
+                for ld in _DOF_IDX_MAP[body_name]:
+                    global_indices = world_indices * _DOFS_PER_WORLD + ld
+                    new_full[global_indices] = base[global_indices] * factor
+
+    _resolve_actuator_target(model, kind).assign(new_full)
+    wp.synchronize()
+
+
+def _apply_actuator_uniform(model, theta_log, num_worlds, kind):
+    """All-worlds in-place write of joint_target_{kind} for current theta_log."""
+    base = _base_for(kind)
+    if base is None:
+        return
+    new_full = base.copy()
+    world_indices = np.arange(num_worlds)
+    for i, group in enumerate(DESIGN_GROUPS):
+        factor = float(np.exp(theta_log[i]))
+        for body_name in group:
+            if body_name not in _DOF_IDX_MAP:
+                continue
+            for ld in _DOF_IDX_MAP[body_name]:
+                global_indices = world_indices * _DOFS_PER_WORLD + ld
+                new_full[global_indices] = base[global_indices] * factor
+    _resolve_actuator_target(model, kind).assign(new_full)
+    wp.synchronize()
+
+
+def _apply_actuator_population(model, candidates, num_worlds, worlds_per_pert,
+                                kind):
+    """Per-candidate in-place write for CMA-ES population eval."""
+    base = _base_for(kind)
+    if base is None:
+        raise ValueError(f"Base array for kind={kind} not populated")
+    new_full = base.copy()
+    popsize = candidates.shape[0]
+    for p in range(popsize):
+        theta_pert = candidates[p]
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+        world_indices = np.arange(w_start, w_end)
+        for i, group in enumerate(DESIGN_GROUPS):
+            factor = float(np.exp(theta_pert[i]))
+            for body_name in group:
+                if body_name not in _DOF_IDX_MAP:
+                    continue
+                for ld in _DOF_IDX_MAP[body_name]:
+                    global_indices = world_indices * _DOFS_PER_WORLD + ld
+                    new_full[global_indices] = base[global_indices] * factor
+    _resolve_actuator_target(model, kind).assign(new_full)
     wp.synchronize()
 
 
@@ -1456,7 +1671,11 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
                                    base_quats_dict, joint_idx_map,
                                    num_worlds, worlds_per_pert,
                                    directions=None):
-    """Apply perturbed morphologies to world partitions in one GPU round-trip.
+    """Apply perturbed designs to world partitions in one GPU round-trip.
+
+    Dispatches on DESIGN_SPACE: "angles" writes joint_X_p quaternions;
+    "ke"/"kd"/"effort" writes joint_target_ke / joint_target_kd /
+    joint_effort_limit as log-space multipliers via _apply_actuator_partitioned.
 
     Partition layout (n_pert = 1 + 2*M, where M = number of directions):
         partition 0:              center (theta)
@@ -1469,6 +1688,11 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
     Each partition spans worlds [p * wpp, (p+1) * wpp).
     Worlds beyond n_pert * wpp are left untouched (they won't be read).
     """
+    if DESIGN_SPACE != "angles":
+        return _apply_actuator_partitioned(model, theta_np, eps, n_params,
+                                            num_worlds, worlds_per_pert,
+                                            directions, DESIGN_SPACE)
+
     if directions is None:
         directions = np.eye(n_params)
     M = directions.shape[0]
@@ -1510,8 +1734,9 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
 
 def apply_population_morphologies(model, candidates, base_quats_dict,
                                    joint_idx_map, num_worlds, worlds_per_pert):
-    """Apply N candidate morphologies to world partitions in one GPU round-trip.
+    """Apply N candidate designs to world partitions in one GPU round-trip.
 
+    Dispatches on DESIGN_SPACE (see apply_partitioned_morphologies).
     Sibling of apply_partitioned_morphologies for CMA-ES population evaluation.
     No center, no plus/minus pairing — candidate i fills worlds
     [i*wpp, (i+1)*wpp).
@@ -1520,6 +1745,10 @@ def apply_population_morphologies(model, candidates, base_quats_dict,
         candidates: (popsize, n_params) array of theta vectors (NOT deltas).
         Worlds beyond popsize * wpp are left untouched.
     """
+    if DESIGN_SPACE != "angles":
+        return _apply_actuator_population(model, candidates, num_worlds,
+                                           worlds_per_pert, DESIGN_SPACE)
+
     popsize = candidates.shape[0]
     joints_per_world = model.joint_count // num_worlds
     joint_X_p_np = model.joint_X_p.numpy()
@@ -2399,10 +2628,17 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     # Spawn workers re-import the module without re-running the __main__ block
     # (run_name is "__mp_main__"), so the design-scope assignment in __main__
     # never runs in the child. Re-bind here based on the pickled args before
-    # any downstream call reads DESIGN_GROUPS / NUM_DESIGN_PARAMS.
-    global DESIGN_GROUPS, NUM_DESIGN_PARAMS
+    # any downstream call reads DESIGN_GROUPS / NUM_DESIGN_PARAMS / DESIGN_SPACE.
+    global DESIGN_GROUPS, NUM_DESIGN_PARAMS, DESIGN_SPACE, THETA_BOUNDS
     DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
     NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
+    DESIGN_SPACE = args.design_space
+    # Bounds depend on space: angles in radians (+/-30 deg), actuator
+    # multipliers in log space (+/-0.7 ~ factor 0.5x..2x).
+    if DESIGN_SPACE == "angles":
+        THETA_BOUNDS = (-np.radians(30), np.radians(30))
+    else:
+        THETA_BOUNDS = (-0.7, 0.7)
 
     is_root = (rank == 0)
     per_rank_envs = args.num_train_envs // num_procs
@@ -2489,12 +2725,23 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
         )
         theta_init = loaded.astype(np.float64)
         if is_root:
-            theta_deg = np.degrees(theta_init)
             print(f"  [Init theta] loaded from {args.init_theta}")
-            print(f"               mean |theta| = {np.mean(np.abs(theta_deg)):.3f} deg, "
-                  f"max |theta| = {np.max(np.abs(theta_deg)):.3f} deg")
+            if DESIGN_SPACE == "angles":
+                theta_deg = np.degrees(theta_init)
+                print(f"               mean |theta| = {np.mean(np.abs(theta_deg)):.3f} deg, "
+                      f"max |theta| = {np.max(np.abs(theta_deg)):.3f} deg")
+            else:
+                factors = np.exp(theta_init)
+                print(f"               design_space={DESIGN_SPACE} (log multiplier); "
+                      f"mean factor = {np.mean(factors):.3f}, "
+                      f"range = [{factors.min():.3f}, {factors.max():.3f}]")
     if is_root:
-        mjcf_modifier.generate(theta_init, str(modified_mjcf))
+        # MJCF is generated with body-quat rotations only. In actuator mode
+        # theta_init is a log multiplier (not an angle) and must NOT modify the
+        # MJCF — the perturbation lands on the live model arrays at runtime.
+        mjcf_theta = theta_init if DESIGN_SPACE == "angles" else \
+            np.zeros(NUM_DESIGN_PARAMS, dtype=np.float64)
+        mjcf_modifier.generate(mjcf_theta, str(modified_mjcf))
 
         # Mesh directory symlink for MJCF relative paths
         mesh_src = BASE_MJCF_PATH.parent / "meshes"
@@ -2627,6 +2874,17 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     base_quats_dict, joint_idx_map = extract_joint_info(
         sim_model, per_rank_envs
     )
+    # For actuator-space modes, the MJCF carries no actuator info — the
+    # env was built with baseline ke/kd/effort. If --init-theta is non-zero,
+    # apply it to the live model now so kickoff training sees the requested
+    # initial actuator params. For angle mode this is redundant (MJCF already
+    # encodes theta_init) but harmless.
+    if DESIGN_SPACE != "angles" and np.any(theta_init != 0.0):
+        update_training_joint_X_p(sim_model, theta_init, base_quats_dict,
+                                   joint_idx_map, per_rank_envs)
+        if is_root:
+            print(f"  [Init theta] Applied to live model "
+                  f"(design_space={DESIGN_SPACE})")
     if is_root:
         print(f"  Robot mass: {total_mass:.2f} kg")
 
@@ -4083,6 +4341,20 @@ if __name__ == "__main__":
                              "groups covering all 29 G1 joints (6 leg pairs + 3 waist "
                              "singletons + 7 arm pairs). Going to 'full' multiplies "
                              "SPSA cost per gradient estimate ~2.7x. Default: lower.")
+    parser.add_argument("--design-space",
+                        choices=["angles", "ke", "kd", "effort"],
+                        default="angles",
+                        help="Design-parameter interpretation. 'angles' (default): "
+                             "theta is body-quaternion X-axis rotation in radians "
+                             "(joint-angle co-design). 'ke'/'kd'/'effort': theta is "
+                             "log-space multiplier on joint_target_ke / "
+                             "joint_target_kd / joint_effort_limit, applied per "
+                             "DESIGN_GROUPS joint (actuator co-design). Same "
+                             "--design-scope group structure regardless. Bounds "
+                             "auto-switch to +/-0.7 (factor ~0.5x..2x). MJCF "
+                             "morphology is NOT modified in non-angle modes; "
+                             "perturbations are applied to live model arrays "
+                             "(verified in probe_newton_arrays.py).")
     parser.add_argument("--num-spsa-seeds", type=int, default=30,
                         help="Number of paired seeds per SPSA evaluation (K)")
     parser.add_argument("--spsa-epsilon", type=float, default=0.05,
@@ -4363,9 +4635,14 @@ if __name__ == "__main__":
     # iterate over the design groups (extract_joint_info,
     # update_training_joint_X_p, apply_partitioned_morphologies) read these
     # module-level names at call time, so setting them here — before any call
-    # — is sufficient.
+    # — is sufficient. Spawned workers re-bind in _init_gbc_worker.
     DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
     NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
+    DESIGN_SPACE = args.design_space
+    if DESIGN_SPACE == "angles":
+        THETA_BOUNDS = (-np.radians(30), np.radians(30))
+    else:
+        THETA_BOUNDS = (-0.7, 0.7)
 
     # Auto-detect GPUs if --devices not specified
     if args.devices is None:
