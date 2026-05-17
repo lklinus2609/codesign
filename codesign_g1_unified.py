@@ -113,6 +113,7 @@ from g1_mjcf_modifier import (
     G1MJCFModifier,
     DESIGN_GROUPS_BY_SCOPE, group_param_name, body_to_joint_name,
     LOWER_SYMMETRIC_GROUPS,
+    LINK_LENGTH_GROUPS_BY_SCOPE, LINK_CHILD_JOINT_FOR_BODY,
     quat_from_x_rotation, quat_multiply, quat_normalize,
 )
 
@@ -127,14 +128,30 @@ NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
 # per DESIGN_GROUPS joint (actuator co-design). Same DESIGN_GROUPS structure
 # regardless. main() and _init_gbc_worker overwrite this from args.design_space.
 DESIGN_SPACE = "angles"
-# Actuator-mode state populated by extract_joint_info() when DESIGN_SPACE !=
-# "angles". Held as module globals so the existing helpers (apply_partitioned_*,
-# update_training_*) can dispatch without changing their public signatures.
+# Actuator-mode state populated by extract_joint_info() when DESIGN_SPACE in
+# {"ke","kd","effort"}. Held as module globals so the existing helpers
+# (apply_partitioned_*, update_training_*) can dispatch without changing their
+# public signatures.
 _DOF_IDX_MAP = None         # {body_name: [DOF local indices within one env]}
 _BASE_KE = None             # full numpy array (num_worlds * dofs_per_env,)
 _BASE_KD = None             # ditto
 _BASE_EFFORT = None         # ditto, or None if joint_effort_limit missing
 _DOFS_PER_WORLD = None      # DOFs per env (e.g. 35 for G1)
+
+# Length-mode state populated by extract_joint_info() when DESIGN_SPACE ==
+# "length". Holds baseline snapshots of every physically-coupled field so
+# perturbations are always multiplicative on the original baseline (theta=0
+# always means factor 1.0 exactly).
+_LENGTH_BODY_IDX = None          # {body_name: local body idx within one env}
+_LENGTH_CHILD_JOINT_IDX = None   # {body_name: local idx of child joint}
+_BASE_JOINT_X_P = None           # full snapshot (n_joints_total, 7)
+_BASE_BODY_MASS = None           # (n_bodies_total,)
+_BASE_BODY_INERTIA = None        # element-wise; shape varies
+_BASE_BODY_COM = None            # (n_bodies_total, 3) or None
+_BASE_BODY_INV_MASS = None       # or None
+_BASE_BODY_INV_INERTIA = None    # or None
+_LENGTH_BODIES_PER_WORLD = None
+_LENGTH_JOINTS_PER_WORLD = None
 from convergence_gate import CompositeConvergenceGate
 try:
     import wandb
@@ -934,7 +951,7 @@ def extract_joint_info(model, num_worlds):
     print(f"  [JointInfo] Found {len(joint_idx_map)} parameterized joints "
           f"(expected {expected_joint_count})")
 
-    if DESIGN_SPACE != "angles":
+    if DESIGN_SPACE in ("ke", "kd", "effort"):
         # Phase 1: also stash actuator perturbation state. We always extract
         # ke/kd/effort baselines so a future restart can introspect, but only
         # the array matching DESIGN_SPACE is actually written each iter.
@@ -954,6 +971,39 @@ def extract_joint_info(model, num_worlds):
               f"{len(_DOF_IDX_MAP)} parameterized joints, "
               f"{_DOFS_PER_WORLD} DOFs/env, "
               f"base range=[{active_base.min():.3f}, {active_base.max():.3f}]")
+    elif DESIGN_SPACE == "length":
+        # Phase 2: stash baseline snapshots of every physically-coupled field
+        # so perturbations stay relative to original (theta=0 -> factor 1.0
+        # exactly even after many iters).
+        global _LENGTH_BODY_IDX, _LENGTH_CHILD_JOINT_IDX
+        global _BASE_JOINT_X_P, _BASE_BODY_MASS, _BASE_BODY_INERTIA
+        global _BASE_BODY_COM, _BASE_BODY_INV_MASS, _BASE_BODY_INV_INERTIA
+        global _LENGTH_BODIES_PER_WORLD, _LENGTH_JOINTS_PER_WORLD
+        (_LENGTH_BODY_IDX, _LENGTH_CHILD_JOINT_IDX,
+         _LENGTH_BODIES_PER_WORLD, _LENGTH_JOINTS_PER_WORLD) = \
+            _compute_length_info(model, num_worlds)
+        _BASE_JOINT_X_P    = model.joint_X_p.numpy().copy()
+        _BASE_BODY_MASS    = model.body_mass.numpy().copy()
+        _BASE_BODY_INERTIA = model.body_inertia.numpy().copy()
+        _BASE_BODY_COM = (model.body_com.numpy().copy()
+                          if hasattr(model, "body_com") else None)
+        _BASE_BODY_INV_MASS = (model.body_inv_mass.numpy().copy()
+                                if hasattr(model, "body_inv_mass") else None)
+        _BASE_BODY_INV_INERTIA = (model.body_inv_inertia.numpy().copy()
+                                   if hasattr(model, "body_inv_inertia") else None)
+        # Probe the thigh baseline as a sanity-check value for the print.
+        probe_body = "left_hip_yaw_link"
+        probe_norm = float("nan")
+        if probe_body in _LENGTH_CHILD_JOINT_IDX:
+            j_local = _LENGTH_CHILD_JOINT_IDX[probe_body]
+            probe_norm = float(np.linalg.norm(_BASE_JOINT_X_P[j_local, 0:3]))
+        print(f"  [LengthInfo] design_space=length, "
+              f"{len(_LENGTH_BODY_IDX)} link bodies, "
+              f"{_LENGTH_BODIES_PER_WORLD} bodies/env, "
+              f"{_LENGTH_JOINTS_PER_WORLD} joints/env, "
+              f"baseline |thigh offset|={probe_norm:.4f} m, "
+              f"body_inertia shape={_BASE_BODY_INERTIA.shape}, "
+              f"body_com={'present' if _BASE_BODY_COM is not None else 'missing'}")
 
     return base_quats_dict, joint_idx_map
 
@@ -971,8 +1021,10 @@ def update_training_joint_X_p(model, theta_np, base_quats_dict, joint_idx_map,
     writes to the same device pointer so the CUDA graph picks up new values
     without recapture.
     """
-    if DESIGN_SPACE != "angles":
+    if DESIGN_SPACE in ("ke", "kd", "effort"):
         return _apply_actuator_uniform(model, theta_np, num_worlds, DESIGN_SPACE)
+    if DESIGN_SPACE == "length":
+        return _apply_length_uniform(model, theta_np, num_worlds)
 
     joints_per_world = model.joint_count // num_worlds
     joint_X_p_np = model.joint_X_p.numpy()
@@ -1156,6 +1208,166 @@ def _apply_actuator_population(model, candidates, num_worlds, worlds_per_pert,
                     new_full[global_indices] = base[global_indices] * factor
     _resolve_actuator_target(model, kind).assign(new_full)
     wp.synchronize()
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: link-length perturbation (joint_X_p position + body_mass +
+# body_inertia + body_com, coupled)
+# ---------------------------------------------------------------------------
+# Probed in probe_newton_arrays.py (Phase 0): body_mass + body_inertia
+# propagate in-place via .assign() — same mechanism as joint_X_p (already used
+# for angles) and joint_target_ke (Phase 1). theta in length mode is a per-
+# link log-multiplier: applied[link_i] uses factor = exp(theta[i]) on a
+# uniform-rod scaling law. All writes are relative to a snapshotted baseline
+# (taken once in extract_joint_info), so theta=0 means factor=1.0 exactly and
+# theta drift between iters doesn't compound numerical error.
+
+def _compute_length_info(model, num_worlds):
+    """Build body / child-joint index maps for link-length perturbation.
+
+    Returns (body_idx_map, child_joint_idx_map, bodies_per_world,
+    joints_per_world). The "child joint" of a link body is the joint
+    downstream of it in the kinematic tree, whose joint_X_p position offset
+    encodes the link length.
+    """
+    body_keys = model.body_key
+    joint_keys = model.joint_key
+    bodies_per_world = model.body_count // num_worlds
+    joints_per_world = model.joint_count // num_worlds
+    body_name_to_local = {body_keys[i]: i for i in range(bodies_per_world)}
+    joint_name_to_local = {joint_keys[i]: i for i in range(joints_per_world)}
+
+    body_idx, child_joint_idx = {}, {}
+    for group in DESIGN_GROUPS:
+        for body_name in group:
+            if body_name not in body_name_to_local:
+                raise ValueError(
+                    f"Body '{body_name}' not in Newton model. Available: "
+                    f"{sorted(body_name_to_local.keys())[:10]}...")
+            child_joint_name = LINK_CHILD_JOINT_FOR_BODY.get(body_name)
+            if child_joint_name is None:
+                raise ValueError(
+                    f"No LINK_CHILD_JOINT_FOR_BODY entry for '{body_name}'. "
+                    f"Add it to g1_mjcf_modifier.py.")
+            if child_joint_name not in joint_name_to_local:
+                raise ValueError(
+                    f"Child joint '{child_joint_name}' not in Newton model "
+                    f"for body '{body_name}'.")
+            body_idx[body_name] = body_name_to_local[body_name]
+            child_joint_idx[body_name] = joint_name_to_local[child_joint_name]
+    return body_idx, child_joint_idx, bodies_per_world, joints_per_world
+
+
+def _length_apply_for_world_slab(new_jX, new_m, new_I, new_com,
+                                  new_im, new_iI, theta_p, worlds):
+    """Inner loop: apply factor = exp(theta_p[i]) to all four coupled fields
+    for every DESIGN_GROUP body across the given world indices."""
+    for i, group in enumerate(DESIGN_GROUPS):
+        f = float(np.exp(theta_p[i]))
+        f3 = f ** 3
+        for body_name in group:
+            if body_name not in _LENGTH_BODY_IDX:
+                continue
+            b_local = _LENGTH_BODY_IDX[body_name]
+            j_local = _LENGTH_CHILD_JOINT_IDX[body_name]
+            b_glob = worlds * _LENGTH_BODIES_PER_WORLD + b_local
+            j_glob = worlds * _LENGTH_JOINTS_PER_WORLD + j_local
+            new_jX[j_glob, 0:3] = _BASE_JOINT_X_P[j_glob, 0:3] * f
+            new_m[b_glob]      = _BASE_BODY_MASS[b_glob]       * f
+            new_I[b_glob]      = _BASE_BODY_INERTIA[b_glob]    * f3
+            if new_com is not None:
+                new_com[b_glob] = _BASE_BODY_COM[b_glob]       * f
+            if new_im is not None:
+                new_im[b_glob]  = _BASE_BODY_INV_MASS[b_glob]  / f
+            if new_iI is not None:
+                new_iI[b_glob]  = _BASE_BODY_INV_INERTIA[b_glob] / f3
+
+
+def _length_commit_to_model(model, new_jX, new_m, new_I, new_com,
+                             new_im, new_iI):
+    """One round-trip of .assign() writes + wp.synchronize()."""
+    model.joint_X_p.assign(new_jX)
+    model.body_mass.assign(new_m)
+    model.body_inertia.assign(new_I)
+    if new_com is not None:
+        model.body_com.assign(new_com)
+    if new_im is not None:
+        model.body_inv_mass.assign(new_im)
+    if new_iI is not None:
+        model.body_inv_inertia.assign(new_iI)
+    wp.synchronize()
+
+
+def _length_fresh_buffers():
+    """Snapshot copies of every baseline array. Returns 6-tuple."""
+    if _BASE_JOINT_X_P is None:
+        raise ValueError("_BASE_JOINT_X_P not populated; "
+                         "call extract_joint_info under DESIGN_SPACE=length first")
+    new_jX  = _BASE_JOINT_X_P.copy()
+    new_m   = _BASE_BODY_MASS.copy()
+    new_I   = _BASE_BODY_INERTIA.copy()
+    new_com = _BASE_BODY_COM.copy()        if _BASE_BODY_COM is not None else None
+    new_im  = _BASE_BODY_INV_MASS.copy()   if _BASE_BODY_INV_MASS is not None else None
+    new_iI  = _BASE_BODY_INV_INERTIA.copy() if _BASE_BODY_INV_INERTIA is not None else None
+    return new_jX, new_m, new_I, new_com, new_im, new_iI
+
+
+def _apply_length_partitioned(model, theta_log, eps, n_params, num_worlds,
+                               worlds_per_pert, directions):
+    """Per-partition coupled in-place write of joint_X_p position +
+    body_mass + body_inertia + body_com (+ inv variants).
+
+    Partition layout identical to _apply_actuator_partitioned:
+      partition 0:     center (theta_log)
+      partition 2m+1:  theta_log + eps * directions[m]
+      partition 2m+2:  theta_log - eps * directions[m]
+    """
+    if directions is None:
+        directions = np.eye(n_params)
+    M = directions.shape[0]
+    n_pert = 1 + 2 * M
+    new_jX, new_m, new_I, new_com, new_im, new_iI = _length_fresh_buffers()
+
+    for p in range(n_pert):
+        if p == 0:
+            theta_p = theta_log
+        else:
+            m = (p - 1) // 2
+            sign = 1.0 if (p % 2 == 1) else -1.0
+            theta_p = theta_log + sign * eps * directions[m]
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+        worlds = np.arange(w_start, w_end)
+        _length_apply_for_world_slab(new_jX, new_m, new_I, new_com,
+                                      new_im, new_iI, theta_p, worlds)
+
+    _length_commit_to_model(model, new_jX, new_m, new_I, new_com,
+                             new_im, new_iI)
+
+
+def _apply_length_uniform(model, theta_log, num_worlds):
+    """All-worlds coupled in-place write for current theta_log."""
+    new_jX, new_m, new_I, new_com, new_im, new_iI = _length_fresh_buffers()
+    worlds = np.arange(num_worlds)
+    _length_apply_for_world_slab(new_jX, new_m, new_I, new_com,
+                                  new_im, new_iI, theta_log, worlds)
+    _length_commit_to_model(model, new_jX, new_m, new_I, new_com,
+                             new_im, new_iI)
+
+
+def _apply_length_population(model, candidates, num_worlds, worlds_per_pert):
+    """Per-candidate coupled in-place write for CMA-ES population eval."""
+    new_jX, new_m, new_I, new_com, new_im, new_iI = _length_fresh_buffers()
+    popsize = candidates.shape[0]
+    for p in range(popsize):
+        theta_p = candidates[p]
+        w_start = p * worlds_per_pert
+        w_end = (p + 1) * worlds_per_pert
+        worlds = np.arange(w_start, w_end)
+        _length_apply_for_world_slab(new_jX, new_m, new_I, new_com,
+                                      new_im, new_iI, theta_p, worlds)
+    _length_commit_to_model(model, new_jX, new_m, new_I, new_com,
+                             new_im, new_iI)
 
 
 # ---------------------------------------------------------------------------
@@ -1688,10 +1900,14 @@ def apply_partitioned_morphologies(model, theta_np, eps, n_params,
     Each partition spans worlds [p * wpp, (p+1) * wpp).
     Worlds beyond n_pert * wpp are left untouched (they won't be read).
     """
-    if DESIGN_SPACE != "angles":
+    if DESIGN_SPACE in ("ke", "kd", "effort"):
         return _apply_actuator_partitioned(model, theta_np, eps, n_params,
                                             num_worlds, worlds_per_pert,
                                             directions, DESIGN_SPACE)
+    if DESIGN_SPACE == "length":
+        return _apply_length_partitioned(model, theta_np, eps, n_params,
+                                          num_worlds, worlds_per_pert,
+                                          directions)
 
     if directions is None:
         directions = np.eye(n_params)
@@ -1745,9 +1961,12 @@ def apply_population_morphologies(model, candidates, base_quats_dict,
         candidates: (popsize, n_params) array of theta vectors (NOT deltas).
         Worlds beyond popsize * wpp are left untouched.
     """
-    if DESIGN_SPACE != "angles":
+    if DESIGN_SPACE in ("ke", "kd", "effort"):
         return _apply_actuator_population(model, candidates, num_worlds,
                                            worlds_per_pert, DESIGN_SPACE)
+    if DESIGN_SPACE == "length":
+        return _apply_length_population(model, candidates, num_worlds,
+                                         worlds_per_pert)
 
     popsize = candidates.shape[0]
     joints_per_world = model.joint_count // num_worlds
@@ -2630,13 +2849,21 @@ def _init_gbc_worker(rank, num_procs, device, master_port, args):
     # never runs in the child. Re-bind here based on the pickled args before
     # any downstream call reads DESIGN_GROUPS / NUM_DESIGN_PARAMS / DESIGN_SPACE.
     global DESIGN_GROUPS, NUM_DESIGN_PARAMS, DESIGN_SPACE, THETA_BOUNDS
-    DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
-    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
     DESIGN_SPACE = args.design_space
+    if DESIGN_SPACE == "length":
+        # Phase 2: link-length groups are leg+arm-focused (4 pairs), the
+        # --design-scope flag doesn't change the parameterization.
+        DESIGN_GROUPS = LINK_LENGTH_GROUPS_BY_SCOPE[args.design_scope]
+    else:
+        DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
+    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
     # Bounds depend on space: angles in radians (+/-30 deg), actuator
-    # multipliers in log space (+/-0.7 ~ factor 0.5x..2x).
+    # multipliers in log space (+/-0.7 ~ factor 0.5x..2x), length log-mult
+    # (+/-0.4 ~ factor 0.67x..1.5x; uniform-rod scaling stays accurate).
     if DESIGN_SPACE == "angles":
         THETA_BOUNDS = (-np.radians(30), np.radians(30))
+    elif DESIGN_SPACE == "length":
+        THETA_BOUNDS = (-0.4, 0.4)
     else:
         THETA_BOUNDS = (-0.7, 0.7)
 
@@ -4342,19 +4569,25 @@ if __name__ == "__main__":
                              "singletons + 7 arm pairs). Going to 'full' multiplies "
                              "SPSA cost per gradient estimate ~2.7x. Default: lower.")
     parser.add_argument("--design-space",
-                        choices=["angles", "ke", "kd", "effort"],
+                        choices=["angles", "ke", "kd", "effort", "length"],
                         default="angles",
                         help="Design-parameter interpretation. 'angles' (default): "
                              "theta is body-quaternion X-axis rotation in radians "
                              "(joint-angle co-design). 'ke'/'kd'/'effort': theta is "
                              "log-space multiplier on joint_target_ke / "
                              "joint_target_kd / joint_effort_limit, applied per "
-                             "DESIGN_GROUPS joint (actuator co-design). Same "
-                             "--design-scope group structure regardless. Bounds "
-                             "auto-switch to +/-0.7 (factor ~0.5x..2x). MJCF "
-                             "morphology is NOT modified in non-angle modes; "
-                             "perturbations are applied to live model arrays "
-                             "(verified in probe_newton_arrays.py).")
+                             "DESIGN_GROUPS joint (actuator co-design). Bounds "
+                             "auto-switch to +/-0.7 (factor ~0.5x..2x). "
+                             "'length': theta is log-mult on link length L, "
+                             "coupled write to joint_X_p position (factor L), "
+                             "body_mass (factor L, uniform-rod), body_inertia "
+                             "(factor L^3, perpendicular-axis), body_com (factor "
+                             "L). Bounds +/-0.4 (factor ~0.67x..1.5x). Param set "
+                             "= 4 link pairs (thigh, shin, upper arm, forearm) "
+                             "regardless of --design-scope. Hardware morphology "
+                             "co-design. MJCF morphology is NOT modified in non-"
+                             "angle modes; perturbations land on live model "
+                             "arrays (verified in probe_newton_arrays.py).")
     parser.add_argument("--num-spsa-seeds", type=int, default=30,
                         help="Number of paired seeds per SPSA evaluation (K)")
     parser.add_argument("--spsa-epsilon", type=float, default=0.05,
@@ -4636,11 +4869,16 @@ if __name__ == "__main__":
     # update_training_joint_X_p, apply_partitioned_morphologies) read these
     # module-level names at call time, so setting them here — before any call
     # — is sufficient. Spawned workers re-bind in _init_gbc_worker.
-    DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
-    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
     DESIGN_SPACE = args.design_space
+    if DESIGN_SPACE == "length":
+        DESIGN_GROUPS = LINK_LENGTH_GROUPS_BY_SCOPE[args.design_scope]
+    else:
+        DESIGN_GROUPS = DESIGN_GROUPS_BY_SCOPE[args.design_scope]
+    NUM_DESIGN_PARAMS = len(DESIGN_GROUPS)
     if DESIGN_SPACE == "angles":
         THETA_BOUNDS = (-np.radians(30), np.radians(30))
+    elif DESIGN_SPACE == "length":
+        THETA_BOUNDS = (-0.4, 0.4)
     else:
         THETA_BOUNDS = (-0.7, 0.7)
 

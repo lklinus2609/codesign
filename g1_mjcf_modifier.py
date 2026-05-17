@@ -52,6 +52,39 @@ DESIGN_GROUPS_BY_SCOPE = {
     "full": FULL_SYMMETRIC_GROUPS,
 }
 
+# Phase 2: link-length co-design groups. Each entry pairs L/R bodies that
+# share a single scalar theta interpreted as a log-multiplier on link length.
+# Same set for both 'lower' and 'full' scopes -- legs+arms cover the
+# meaningful link-length axes regardless of joint-angle scope. v1 = 4 params
+# (thigh, shin, upper arm, forearm). Foot/wrist excluded as they are terminal.
+LINK_LENGTH_GROUPS_LOWER = [
+    ["left_hip_yaw_link",      "right_hip_yaw_link"],       # thigh
+    ["left_knee_link",         "right_knee_link"],          # shin
+    ["left_shoulder_yaw_link", "right_shoulder_yaw_link"],  # upper arm
+    ["left_elbow_link",        "right_elbow_link"],         # forearm
+]
+LINK_LENGTH_GROUPS_FULL = LINK_LENGTH_GROUPS_LOWER
+
+LINK_LENGTH_GROUPS_BY_SCOPE = {
+    "lower": LINK_LENGTH_GROUPS_LOWER,
+    "full":  LINK_LENGTH_GROUPS_FULL,
+}
+
+# For each parameterized body, the joint whose position offset relative to
+# the body's parent encodes the link length. NOTE: this is the CHILD joint
+# (the one downstream of the body in the kinematic tree), not the joint
+# hosted BY the body (which is what body_to_joint_name returns).
+LINK_CHILD_JOINT_FOR_BODY = {
+    "left_hip_yaw_link":       "left_knee_joint",
+    "right_hip_yaw_link":      "right_knee_joint",
+    "left_knee_link":          "left_ankle_pitch_joint",
+    "right_knee_link":         "right_ankle_pitch_joint",
+    "left_shoulder_yaw_link":  "left_elbow_joint",
+    "right_shoulder_yaw_link": "right_elbow_joint",
+    "left_elbow_link":         "left_wrist_roll_joint",
+    "right_elbow_link":        "right_wrist_roll_joint",
+}
+
 # Some G1 bodies host a joint whose name doesn't match the
 # body_name.replace("_link","_joint") convention. Map exceptions here.
 BODY_TO_JOINT = {
